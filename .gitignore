@@ -1,0 +1,10 @@
+/target
+/Cargo.lock
+*.kdbx.tmp.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

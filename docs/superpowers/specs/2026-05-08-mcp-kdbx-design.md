@@ -1,0 +1,1068 @@
+# mcp-kdbx: MCP server for KDBX vaults
+
+**Project:** mcp-kdbx (bridge member of the *-kdbx ecosystem)
+**Date:** 2026-05-08
+**Author:** Alexander Towell
+**Status:** Design (pending implementation plan)
+**Supersedes:** none (this is the v0.1 design)
+
+## Goal
+
+A local Model Context Protocol (MCP) server that exposes a KeePass `.kdbx` file to AI agents. v0.1 is a stdio MCP server: an LLM agent can list groups and entries, find by title or URL, reveal protected fields with per-secret consent gating, generate TOTP codes, list and download attachments, and (when explicitly enabled) add new entries and update fields. Writes are staged in memory and committed atomically on save, with the diff visible via diff-kdbx.
+
+The server is a single Rust binary spawned by an MCP host (Claude Desktop, Claude Code, Cursor). It reads its configuration from environment variables, opens the vault at startup (encrypted bytes only), and unlocks on first request via env-var password or shell-out to a secret manager.
+
+## Position in the *-kdbx ecosystem
+
+mcp-kdbx is a **bridge** member: it exposes KDBX to AI agents. Relationship to other members:
+
+| Member | Role | How mcp-kdbx relates |
+|---|---|---|
+| `keepass-rs` | Substrate | Direct dependency. Provides parsing, encryption, write API. |
+| `diff-kdbx` | Sibling | Library dependency for `kdbx_diff_pending` (semantic-diff between canonical and working_db). |
+| `web-kdbx` | Sibling | Independent. Both consume `keepass-rs`. Different consumer (browser users vs LLM agents). |
+| `hugo-kdbx`, `arkiv-kdbx`, `longecho-kdbx` | Bridges, planned | Out of scope for v0.1. |
+
+The shared substrate for the whole ecosystem is `keepass-rs`. mcp-kdbx contributes back by being the first agent-facing consumer at scale, surfacing API gaps that emerge from a tool-call-shaped surface.
+
+## Motivation
+
+Three problems converge to make this v0.1 worth building:
+
+### 1. AI agents are credential-shaped consumers
+
+A large class of agentic workflows needs credentials: signing into a service, fetching a TOTP, retrieving an API key from a saved vault entry, saving a new credential after a signup flow. Today the agent either (a) asks the human to paste the secret, breaking the agent's flow, (b) fetches from environment variables that pre-load every secret without granular consent, or (c) integrates with one specific cloud password manager via SDK. None of these compose well with a static, local, single-file vault format.
+
+mcp-kdbx is the integration that lets LLM-host UIs gate per-secret access in a way the user can audit afterwards.
+
+### 2. KDBX is the right substrate for AI-managed credentials
+
+KDBX is encrypted at rest with the user's master password. It's portable (KeePassXC, OmniKee, web-kdbx all read it). It supports attachments (key files, recovery codes, certificate PEMs). It has a built-in TOTP convention that downstream tooling already understands. And it's not a SaaS lock-in.
+
+Most importantly, KDBX supports the **per-field protected flag**, which directly maps to mcp-kdbx's consent-gating model: the lib's notion of "this field is protected" tells the MCP layer "this requires an explicit per-call reveal."
+
+### 3. The agent-facing trust model is genuinely different
+
+Browser-based vault UIs (web-kdbx, OmniKee PWA) optimize for human users who decide what to view at click-time. CLI vaults optimize for shell pipelines. AI agents are something new: an autonomous program with imperfect judgment that needs **graduated** access (bulk metadata is cheap; secrets are expensive) and **reviewable** writes (proposed changes shouldn't auto-commit). v0.1 is an opinionated take on what that gradient looks like.
+
+## Architectural decisions
+
+These decisions were settled during the 2026-05-06 brainstorm (sections 1-8 below detail them):
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Scope of MCP exposure | Per-vault server (Q1) | One mcp-kdbx instance manages exactly one vault. Multi-vault aggregation is a higher-layer concern. |
+| Value model | Single-vault (Q2) | Matches stdio MCP host lifecycle; user runs one mcp-kdbx per vault if multiple are needed. |
+| Auth + lifecycle | Env var with secret-manager fallback, 15-min idle TTL (Q3 = A+C) | LLM-host-friendly default (env var); secret-manager users get `KDBX_UNLOCK_CMD`. Per-call password override via `kdbx_unlock`. |
+| Write capability | Read + limited write, gated by `KDBX_ALLOW_WRITES=true` (Q4) | Read-only is too restrictive for the credential-lifecycle use case; full read+write opens too much blast radius. Limited writes (`add_entry`, `update_field`; no delete/move) behind a startup flag is the conservative-useful midpoint. |
+| Implementation approach | Approach 1 + diff-kdbx slice | stdio MCP server, single Rust binary, direct `keepass-rs` for vault ops, `diff-kdbx` library dep for stage diffs. ~2000 LOC. |
+
+The complete specification follows in eight sections.
+
+---
+
+# Section 1: MCP protocol surface
+
+## Naming and namespace
+
+All tools prefixed with `kdbx_`, snake_case. Matches Anthropic's first-party MCP servers and the broader plugin ecosystem.
+
+## Tool inventory
+
+| Tool | Category |
+|---|---|
+| `kdbx_unlock` | Lifecycle |
+| `kdbx_lock` | Lifecycle |
+| `kdbx_status` | Lifecycle |
+| `kdbx_list_groups` | Read |
+| `kdbx_list_entries` | Read |
+| `kdbx_list_attachments` | Read |
+| `kdbx_get_entry` | Read |
+| `kdbx_find_entry` | Read |
+| `kdbx_reveal_password` | Reveal (consent-gated) |
+| `kdbx_reveal_protected` | Reveal (consent-gated) |
+| `kdbx_download_attachment` | Reveal (consent-gated) |
+| `kdbx_get_otp` | Reveal (consent-gated) |
+| `kdbx_add_entry` | Write (gated by `KDBX_ALLOW_WRITES`) |
+| `kdbx_update_field` | Write (gated by `KDBX_ALLOW_WRITES`) |
+| `kdbx_diff_pending` | Stage/commit (gated) |
+| `kdbx_save_pending` | Stage/commit (gated) |
+| `kdbx_discard_pending` | Stage/commit (gated) |
+
+17 tools total.
+
+## Output format
+
+Every tool returns a JSON object as a text-content block. Structure:
+
+```json
+{ "ok": true, "data": { /* tool-specific payload */ } }
+```
+
+Or on error:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "VAULT_LOCKED",
+    "message": "Vault is locked. Call kdbx_unlock first.",
+    "details": { /* optional, error-specific */ }
+  }
+}
+```
+
+Rationale: the structured-result-with-`ok`-flag is consistently parseable from prompt text without the LLM needing to know about MCP-protocol-level error semantics. It is also amenable to an audit trail (one shape to log) and easier to extend (add fields without breaking parsers).
+
+## Path conventions
+
+Paths use forward slashes, rooted at `/`. Group separator is `/`. Entry titles are case-sensitive, NFC-normalized.
+
+```
+/                              root group
+/Web                           group "Web" under root
+/Web/Banking                   group "Banking" under "Web"
+/Web/Banking/MyBank            entry "MyBank" in group "Web/Banking"
+```
+
+**Slashes in titles:** `\/` escapes a literal slash; `\\` escapes a literal backslash. Output paths emit the necessary escapes; LLMs pass them back verbatim.
+
+**Disambiguation:** when two siblings have the same name, suffix with `:N` (1-based ordinal by KDBX iteration order):
+
+```
+/Web/MyBank        first MyBank
+/Web/MyBank:2      second MyBank
+```
+
+Ordinals are stable within a session, can shift across sessions. UUIDs (returned in every response) are the cross-session-stable identifier.
+
+**Trailing slash:** `/Web/Banking` and `/Web/Banking/` are equivalent on input. Output paths are canonical (no trailing slash).
+
+## Tool schemas
+
+### Lifecycle
+
+```ts
+// kdbx_unlock
+input:  { password?: string, keyfile_bytes?: string /* base64 */ }
+output: { ok: true, data: { vault_name: string, locked: false, has_pending_changes: boolean } }
+errors: AUTH_FAILED, VAULT_NOT_FOUND, VAULT_ALREADY_UNLOCKED, UNLOCK_SOURCE_MISSING
+
+// kdbx_lock
+input:  {}
+output: { ok: true, data: { locked: true, pending_discarded: number } }
+
+// kdbx_status
+input:  {}
+output: {
+  ok: true,
+  data: {
+    locked: boolean,
+    vault_name: string | null,
+    vault_path: string,                                  // absolute
+    idle_timeout_remaining_seconds: number | null,        // null if locked
+    has_pending_changes: boolean | null,                  // null if locked
+    writes_allowed: boolean,
+    server_version: string,
+    keepass_rs_version: string
+  }
+}
+```
+
+### Reads
+
+```ts
+// kdbx_list_groups
+input:  { parent_path?: string }                         // default "/"
+output: {
+  ok: true,
+  data: {
+    groups: [{
+      name: string,
+      path: string,
+      uuid: string,
+      num_entries: number,
+      num_subgroups: number,
+      notes: string | null
+    }]
+  }
+}
+
+// kdbx_list_entries
+input:  { group_path: string }
+output: {
+  ok: true,
+  data: {
+    entries: [{
+      title: string,
+      path: string,
+      uuid: string,
+      username: string | null,
+      url: string | null,
+      notes_preview: string | null,                       // first 200 chars
+      custom_field_names: { name: string, protected: boolean }[],
+      has_attachments: boolean,
+      has_otp: boolean,
+      modified_at: string                                 // ISO 8601
+    }]
+  }
+}
+
+// kdbx_list_attachments
+input:  { entry_path: string }
+output: {
+  ok: true,
+  data: {
+    attachments: [{ name: string, size_bytes: number, sha256: string /* hex */ }]
+  }
+}
+
+// kdbx_get_entry
+input:  { path: string }
+output: {
+  ok: true,
+  data: {
+    title, path, uuid, username, url, notes,              // notes full, not preview
+    custom_field_names: { name: string, protected: boolean }[],
+    has_attachments: boolean,
+    has_otp: boolean,
+    created_at: string,
+    modified_at: string,
+    accessed_at: string
+    // No password, no protected values, no attachment bytes.
+  }
+}
+
+// kdbx_find_entry
+input:  {
+  query: string,
+  fields?: ("title" | "username" | "url" | "notes")[]    // default ["title", "username", "url"]
+}
+output: {
+  ok: true,
+  data: {
+    entries: [ /* same shape as kdbx_list_entries */ ],
+    matched_count: number,
+    truncated: boolean                                     // true if >100 matches
+  }
+}
+```
+
+### Reveals (consent-gated)
+
+```ts
+// kdbx_reveal_password
+input:  { path: string }
+output: { ok: true, data: { password: string } }
+
+// kdbx_reveal_protected
+input:  { path: string, field_name: string }
+output: { ok: true, data: { value: string } }
+
+// kdbx_download_attachment
+input:  { entry_path: string, name: string }
+output: { ok: true, data: { name, size_bytes, sha256, base64: string } }
+
+// kdbx_get_otp
+input:  { path: string, time_unix?: number }              // default now
+output: { ok: true, data: { code: string, valid_for_seconds: number, period_seconds: number } }
+```
+
+### Writes (gated by KDBX_ALLOW_WRITES)
+
+```ts
+// kdbx_add_entry
+input: {
+  group_path: string,
+  title: string,
+  fields?: { [name: string]: { value: string, protected: boolean } },
+  attachments?: { [name: string]: { base64: string } },
+  created_at?: string,                                   // ISO 8601, optional, for fixtures
+  modified_at?: string                                    // ISO 8601, optional, for fixtures
+}
+output: { ok: true, data: { staged: true, path: string, uuid: string } }
+
+// kdbx_update_field
+input: { path: string, field_name: string, value: string, protected?: boolean }
+output: { ok: true, data: { staged: true, path: string, field_name: string } }
+```
+
+### Stage/commit (gated)
+
+```ts
+// kdbx_diff_pending
+input:  {}
+output: {
+  ok: true,
+  data: {
+    added: [{ path, uuid, title, group_path, field_count, has_attachments, has_otp }],
+    modified: [{
+      path, uuid, title,
+      field_changes: [
+        { field_name, before, after, protected: false } |
+        { field_name, changed: true, protected: true }    // protected fields redacted
+      ],
+      attachment_changes: [{ name, change: "added" | "removed" | "modified" }]
+    }],
+    removed: [],                                          // reserved for future
+    summary: { num_added: number, num_modified: number, num_removed: number }
+  }
+}
+
+// kdbx_save_pending
+input:  {}
+output: { ok: true, data: { saved: true, num_changes, vault_path, written_at } }
+
+// kdbx_discard_pending
+input:  {}
+output: { ok: true, data: { discarded: true, num_dropped: number } }
+```
+
+## Error code enumeration
+
+| Code | When |
+|---|---|
+| `VAULT_LOCKED` | Tool requires unlocked vault, vault is locked |
+| `VAULT_ALREADY_UNLOCKED` | `kdbx_unlock` called when already unlocked |
+| `VAULT_NOT_FOUND` | Vault file path doesn't resolve |
+| `AUTH_FAILED` | Wrong password / keyfile |
+| `UNLOCK_SOURCE_MISSING` | `kdbx_unlock` called with no password and no env source configured |
+| `GROUP_NOT_FOUND` | Path doesn't resolve to a group |
+| `ENTRY_NOT_FOUND` | Path doesn't resolve to an entry |
+| `FIELD_NOT_FOUND` | Entry has no field by that name |
+| `FIELD_NOT_PROTECTED` | Reveal called on a non-protected field |
+| `ATTACHMENT_NOT_FOUND` | Entry has no attachment by that name |
+| `NO_OTP_CONFIGURED` | Entry has no `otp` field or no valid TOTP URI |
+| `WRITES_DISABLED` | Write tool called when `KDBX_ALLOW_WRITES != true` |
+| `NO_PENDING_CHANGES` | `kdbx_save_pending` called with empty stage |
+| `WRITE_FAILED` | Disk write failed |
+| `VAULT_FILE_MODIFIED` | mtime changed since unlock |
+| `ENTRY_TITLE_INVALID` | Title is empty or contains literal `/` |
+| `FIELD_NAME_INVALID` | Field name is empty or has reserved characters |
+
+## Versioning
+
+Server version surfaces via `kdbx_status.server_version`. Tool schemas follow semver: breaking input/output changes bump the major. The `keepass_rs_version` is reported separately because the MCP layer can be stable across keepass-rs upgrades.
+
+---
+
+# Section 2: Auth + lifecycle
+
+## Configuration surface
+
+Environment variables only in v0.1. No CLI flags, no config file.
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `KDBX_VAULT_PATH` | Absolute path to the .kdbx file | **Required** |
+| `KDBX_KEYFILE_PATH` | Optional keyfile for two-factor unlock | unset |
+| `KDBX_PASSWORD` | Master password (env-injected) | unset |
+| `KDBX_UNLOCK_CMD` | Shell command whose stdout is the master password | unset |
+| `KDBX_UNLOCK_CMD_TIMEOUT_SECONDS` | Timeout for the unlock command | 30 |
+| `KDBX_ALLOW_WRITES` | Must be exactly `"true"` to enable any write tool | unset (read-only) |
+| `KDBX_IDLE_TIMEOUT_SECONDS` | Auto-lock after N seconds of inactivity | 900 (15 min) |
+| `KDBX_AUTO_CLEAN_ORPHANS` | Auto-clean orphan `*.tmp.*` files at startup | unset (off) |
+| `KDBX_LOG_LEVEL` | `error`, `warn`, `info`, `debug`, `trace` | `info` |
+| `KDBX_LOG_FILE` | Append-only audit log path. Empty means stderr only | unset |
+
+## Startup sequence
+
+```
+1. Read env vars.
+2. Validate KDBX_VAULT_PATH (resolve absolute, file must exist + be readable).
+   On failure: exit(1) with stderr message.
+3. Validate KDBX_ALLOW_WRITES (must be "" or "true"). Reject other values.
+4. Validate KDBX_IDLE_TIMEOUT_SECONDS (parse 0..86400; 0 = no idle lock).
+5. Open log destination if KDBX_LOG_FILE is set.
+6. Read encrypted vault bytes into memory (no decryption yet).
+7. Capture vault file mtime as file_mtime_at_unlock.
+8. If KDBX_AUTO_CLEAN_ORPHANS=true: scan vault dir for *.tmp.<pid>.* files
+   older than 1 hour, unlink.
+9. Initialize state: Locked.
+10. Start MCP server on stdio.
+```
+
+## State machine
+
+```
+                       [Locked]  ← initial
+                          │
+                  kdbx_unlock(...)
+                          │
+                          ▼
+                       [Unlocked {
+                         key,
+                         canonical_db,
+                         working_db,
+                         last_activity,
+                         file_mtime_at_unlock
+                       }]
+                          │
+       ┌──────────────────┼──────────────────────┐
+       │                  │                      │
+   kdbx_lock         idle_timeout            shutdown
+       │                  │                      │
+       ▼                  ▼                      ▼
+   [Locked]           [Locked]                 (drop)
+
+  Tool calls in Unlocked state update last_activity.
+  Lock transitions: zero key, drop both dbs, discard stage,
+                    log lock_reason.
+```
+
+## Unlock sequence
+
+```
+1. Tool call: kdbx_unlock(password?, keyfile_bytes?).
+2. Resolve unlock source, in priority order:
+     a. password from tool input, if provided
+     b. KDBX_PASSWORD env var, if set
+     c. KDBX_UNLOCK_CMD env var: exec via /bin/sh -c, timeout
+        KDBX_UNLOCK_CMD_TIMEOUT_SECONDS, capture trimmed stdout.
+        Non-zero exit -> AUTH_FAILED.
+     d. None set and no input password -> UNLOCK_SOURCE_MISSING.
+3. Build keepass DatabaseKey from password + optional keyfile.
+4. Attempt decryption.
+     - Failure -> AUTH_FAILED, vault stays Locked.
+     - Success -> transition to Unlocked, populate state, start idle timer.
+5. Return success.
+```
+
+Windows is out of scope for v0.1. Detect and exit cleanly with a clear message.
+
+## Lock sequence
+
+```
+1. Either kdbx_lock, idle timer, or SIGTERM/SIGINT.
+2. Capture lock_reason and pending_discarded count.
+3. Zero the master key.
+4. Drop the parsed databases (Rust drop semantics).
+5. Discard pending stage.
+6. Stop the idle timer.
+7. Transition to Locked.
+8. Append audit log entry.
+9. If kdbx_lock tool: return { locked: true, pending_discarded: N }.
+```
+
+## Pending changes on lock
+
+**Discard on any lock transition.** The next tool call after an idle-lock returns a VAULT_LOCKED error including the discarded changes summary so the agent can re-stage if appropriate:
+
+```json
+{
+  "error": {
+    "code": "VAULT_LOCKED",
+    "details": {
+      "lock_reason": "idle_timeout",
+      "pending_discarded_count": 2,
+      "pending_discarded_summary": [
+        { "kind": "add_entry", "title": "MyNewService" },
+        { "kind": "update_field", "path": "/Web/Banking/MyBank", "field_name": "URL" }
+      ]
+    }
+  }
+}
+```
+
+## External-modification detection
+
+```
+At unlock:    capture vault_file.mtime as file_mtime_at_unlock
+At save:      re-stat the file, compare to stored mtime
+              If now > file_mtime_at_unlock + 1s:
+                refuse with VAULT_FILE_MODIFIED
+              Else:
+                write atomically (temp + fsync + rename + fsync_dir)
+                update file_mtime_at_unlock to new mtime
+```
+
+## Idle timer mechanics
+
+Periodic check (interval = idle_timeout / 10, min 5s, max 60s) of `now - last_activity`. Any tool call in Unlocked state updates `last_activity`, including `kdbx_status` (legitimate keep-alive).
+
+---
+
+# Section 3: Tool semantics
+
+## Path resolution algorithm
+
+```
+1. Reject if path doesn't start with "/".
+2. Split on "/" (respecting backslash escapes).
+3. Discard empty leading segment.
+4. Walk segments left-to-right from root.
+5. For each non-final segment: must resolve to a Group.
+6. Final segment: resolves to a Group (if path ends with "/") or an Entry.
+7. Match by exact name (case-sensitive, Unicode-NFC-normalized).
+8. ":N" ordinal disambiguates collisions (1-based, KDBX iteration order).
+9. Return handle, or NOT_FOUND error.
+```
+
+## Working-copy model
+
+The stage exists as an in-memory shadow database, not as a list of operations.
+
+```
+At unlock:
+  canonical_db = parse(decrypt(vault_bytes))
+  working_db   = clone(canonical_db)
+
+Read tools query against working_db.
+Write tools mutate working_db in place; canonical_db is untouched.
+
+kdbx_diff_pending: diff-kdbx semantic-diff(canonical_db, working_db).
+kdbx_save_pending: serialize working_db, atomic-write,
+                   canonical_db = clone(working_db).
+kdbx_discard_pending: working_db = clone(canonical_db).
+
+At lock: drop both databases.
+```
+
+Two pleasant properties:
+1. No separate stage data structure. The stage is `diff(canonical, working)`. diff-kdbx already knows how to compute this.
+2. Reads see writes immediately. After `kdbx_add_entry`, the next `kdbx_list_entries` includes the new entry.
+
+Memory cost: 2x the parsed database. Negligible for typical KDBX vaults.
+
+## Field semantics
+
+**Standard fields** (KDBX-canonical): `Title`, `UserName`, `Password` (default protected), `URL`, `Notes`.
+**Custom fields:** arbitrary user-defined with explicit `protected` flag.
+
+`kdbx_update_field` rules:
+- Standard or custom field names accepted.
+- `value` required; empty string allowed (clears the field).
+- `protected` optional; if omitted, preserves existing protection state.
+- Updating Password to empty string is allowed (regenerate workflows).
+
+Field name validation:
+- Length 1..256
+- No ASCII control characters (< 0x20)
+- No leading/trailing whitespace
+- Unicode and spaces in middle accepted
+
+Returns `FIELD_NAME_INVALID` on rejection.
+
+## Entry title validation
+
+- Length 1..4096
+- No ASCII control characters
+- Unicode, spaces, and (escaped) slashes accepted
+
+Returns `ENTRY_TITLE_INVALID` on rejection.
+
+## Search semantics
+
+`kdbx_find_entry`:
+- Lowercase via Unicode case folding (not ASCII-only).
+- Substring match against the configured field-list (default: title, username, url).
+- Stable sort by `(group_path, title)`.
+- Cap at 100 results; set `truncated: true` if more match.
+- Plain substring only. No regex, no boolean operators, no globs.
+
+## TOTP semantics
+
+`kdbx_get_otp`:
+1. Resolve entry by path.
+2. Look for OTP source: modern `otp` field with `otpauth://` URI, fallback to legacy `TOTP Seed` + `TOTP Settings`.
+3. Compute TOTP at requested time (default: now).
+4. Return `{ code, valid_for_seconds, period_seconds }`.
+
+The TOTP secret never crosses the MCP boundary. Only the current code is exposed.
+
+## Attachment semantics
+
+KDBX deduplicates attachments at the database level. Entries reference attachments by ID; the same attachment can appear under multiple entries.
+
+`kdbx_add_entry` with attachments: decode base64, compute SHA-256, insert into database (let keepass-rs handle dedup), link to entry under the input-provided name.
+
+`kdbx_download_attachment`: resolve entry, find attachment by name, fetch bytes, return `{ name, size_bytes, sha256, base64 }`. No hard size cap (KDBX is unlimited; we accept what KDBX accepts). Sizes above 10MB get a `warn` log entry but are not rejected.
+
+## Save atomicity
+
+```
+1. Stat vault file. mtime check; refuse if conflict.
+2. Serialize working_db to encrypted bytes (in memory).
+3. Write to temp file: $vault_path.tmp.$pid.$rand
+4. fsync(temp)
+5. Atomic rename: temp -> vault_path
+6. fsync(parent dir)                              # POSIX durability
+7. Re-stat; capture new mtime.
+8. canonical_db = clone(working_db).
+9. Update file_mtime_at_unlock.
+10. Return { saved: true, num_changes, written_at }.
+```
+
+If steps 4-7 fail: temp file unlinked, no changes to vault, working_db preserved. Return `WRITE_FAILED`.
+
+---
+
+# Section 4: Stage/commit workflow
+
+## kdbx_diff_pending output
+
+```json
+{
+  "ok": true,
+  "data": {
+    "added": [{ "path", "uuid", "title", "group_path", "field_count", "has_attachments", "has_otp" }],
+    "modified": [{
+      "path", "uuid", "title",
+      "field_changes": [
+        { "field_name", "before", "after", "protected": false } |
+        { "field_name", "changed": true, "protected": true }
+      ],
+      "attachment_changes": [{ "name", "change": "added" | "removed" | "modified" }]
+    }],
+    "removed": [],
+    "summary": { "num_added", "num_modified", "num_removed" }
+  }
+}
+```
+
+**Protected-field redaction:** for `protected: true` fields, `before` and `after` are NOT included; only `{ field_name, changed: true, protected: true }`. Bulk diff queries don't reveal secrets even when secrets have changed.
+
+**Stable ordering:** entries within each list sorted by `(group_path, title)`.
+
+**No-op state:** empty arrays + zero summary; not an error.
+
+## kdbx_save_pending flow
+
+Pre-conditions: vault unlocked, `KDBX_ALLOW_WRITES=true`, at least one pending change.
+
+Steps as in Section 3 (save atomicity). On any failure: stage preserved, specific error code surfaces failure mode.
+
+## VAULT_FILE_MODIFIED recovery
+
+```json
+{
+  "error": {
+    "code": "VAULT_FILE_MODIFIED",
+    "details": {
+      "file_mtime_at_unlock": "2026-05-08T10:00:00Z",
+      "file_mtime_now": "2026-05-08T10:15:30Z",
+      "pending_changes": 3
+    }
+  }
+}
+```
+
+Recovery options for the agent:
+1. Discard pending and re-unlock (lose staged changes; re-read disk).
+2. No `force: true` in v0.1 (locked decision).
+3. Manual merge (out of scope; user exits to KeePassXC).
+
+## kdbx_discard_pending flow
+
+```
+1. count = number of staged changes.
+2. working_db = clone(canonical_db).
+3. Append audit log entry.
+4. Return { discarded: true, num_dropped: count }.
+```
+
+Discarding when there are no pending changes is a no-op success.
+
+## Stage size
+
+No explicit cap. Memory cost is 2x parsed database. Documented limitation for pathologically large vaults (1GB+ with attachments).
+
+## Stage on lock
+
+Per Section 2: idle-lock and manual lock both discard stage. The next tool call's VAULT_LOCKED error includes the discarded summary.
+
+## Edge cases catalog
+
+| Case | Behavior |
+|---|---|
+| Save with no changes | NO_PENDING_CHANGES |
+| Discard with no changes | Success, num_dropped: 0 |
+| Save with vault file deleted externally | WRITE_FAILED |
+| Save with disk full | WRITE_FAILED (stage preserved) |
+| Multiple writes to same field | Last value wins |
+| Stage references nonexistent group | Error at tool-call time |
+| Concurrent mcp-kdbx instances | First save wins; second VAULT_FILE_MODIFIED |
+| Save then immediate diff_pending | Empty diff |
+| Discard then immediate diff_pending | Empty diff |
+| Process killed mid-save | Temp file orphan; cleaned on next startup if `KDBX_AUTO_CLEAN_ORPHANS=true` |
+
+---
+
+# Section 5: Configuration
+
+## Source
+
+Environment variables only in v0.1. No CLI flags, no config file. Reasons:
+
+1. MCP host config friendliness (most hosts inject env vars per JSON config).
+2. Avoid precedence ambiguity (single source = no precedence rules).
+3. Future extensibility (config files can be added later via wrapper scripts).
+
+## Validation rules
+
+Stricter than typical env-var parsing. The full table is in Section 2's configuration surface; key rules:
+
+- `KDBX_ALLOW_WRITES` MUST be exactly `"true"` (case-sensitive, no whitespace) or unset. Other values like `"yes"`, `"1"`, `"TRUE"` are rejected with exit(1). Strict matching prevents silent disabling of write enablement.
+- `KDBX_AUTO_CLEAN_ORPHANS` follows the same strict rule.
+- Integer values: parse as integer with explicit range; reject malformed.
+- Required paths: resolved absolute, existence + readability checked at startup.
+
+Validation failures: `exit(1)` with differentiated stderr messages (no different exit codes; differentiation is in the message).
+
+## Defaults rationale
+
+| Default | Why |
+|---|---|
+| `IDLE_TIMEOUT_SECONDS=900` (15 min) | Matches 1Password CLI session feel. |
+| `ALLOW_WRITES` off | Conservative read-only by default. |
+| `UNLOCK_CMD_TIMEOUT_SECONDS=30` | Generous for typical secret-manager round trips. |
+| `AUTO_CLEAN_ORPHANS` off | Filesystem hygiene varies; opinionated. |
+| `LOG_LEVEL=info` | Captures lifecycle and reveal events. |
+
+## Introspection via kdbx_status
+
+Returns operationally relevant config (vault_name, vault_path, locked, writes_allowed, idle_timeout, log_level, server_version, keepass_rs_version, has_pending_changes). **Excludes** `KDBX_PASSWORD`, `KDBX_UNLOCK_CMD`, `KDBX_KEYFILE_PATH` (server never echoes secrets or their sources).
+
+## Mid-session change behavior
+
+Most env vars read once at startup. Change config -> restart server.
+
+| Variable | Reread? |
+|---|---|
+| `KDBX_VAULT_PATH`, `KDBX_ALLOW_WRITES`, `KDBX_IDLE_TIMEOUT_SECONDS`, `KDBX_LOG_LEVEL`, etc. | No |
+| `KDBX_PASSWORD`, `KDBX_UNLOCK_CMD` | **Yes**, on each unlock attempt |
+
+The split: operationally-fixed config is restart-only; password sources are cycle-able to support secret rotation.
+
+## .env file support
+
+Deferred for v0.1. Wrapper script suffices:
+
+```bash
+#!/bin/sh
+set -a
+. /path/to/.env
+set +a
+exec mcp-kdbx
+```
+
+This pattern composes with any existing dotenv tooling and keeps mcp-kdbx itself dotenv-agnostic.
+
+---
+
+# Section 6: Audit trail
+
+## Format
+
+JSON-lines (JSONL): one JSON object per line, UTF-8. No human-readable text mode for v0.1.
+
+## Destinations
+
+| Setting | Target |
+|---|---|
+| `KDBX_LOG_FILE` unset | stderr only |
+| `KDBX_LOG_FILE=/path/to/log` | Append to file AND emit to stderr |
+
+No log rotation in v0.1 (use `logrotate` or similar externally).
+
+## Log levels
+
+| Level | Used for |
+|---|---|
+| `error` | WRITE_FAILED, AUTH_FAILED with cmd-exit details, internal panics |
+| `warn` | Idle-timer firing late, file mtime drift, KDBX_UNLOCK_CMD timeout, quota |
+| `info` | Lifecycle and reveal events. **Default.** |
+| `debug` | Tool-entry/exit logs with parameters and timing |
+| `trace` | Protocol-level: full JSON-RPC payloads. **MAY contain sensitive data; explicit opt-in.** |
+
+## Event envelope
+
+```json
+{
+  "timestamp": "2026-05-08T10:00:00Z",   // ISO 8601 UTC
+  "level": "info",
+  "event": "vault_unlocked",
+  "pid": 12345,
+  "details": { /* event-specific */ }
+}
+```
+
+## Logged events
+
+| Event | Level | Details |
+|---|---|---|
+| `server_started` | info | server_version, vault_path, writes_allowed, idle_timeout_seconds |
+| `vault_unlocked` | info | unlock_source ("input" \| "env" \| "cmd"), file_mtime |
+| `vault_locked` | info | reason, pending_discarded_count |
+| `auth_failed` | error | source, error_code |
+| `write_staged` | info | tool, target_path, target_uuid, field_name (if applicable) |
+| `stage_discarded` | info | reason, num_dropped, summary (paths only) |
+| `save_committed` | info | num_changes, before_mtime, after_mtime |
+| `save_refused` | warn | before_mtime, conflict_mtime, pending_changes |
+| `save_failed` | error | failure_step, error_message, pending_changes |
+| `reveal_password` | info | target_path, target_uuid, sha256 |
+| `reveal_protected` | info | target_path, target_uuid, field_name, sha256 |
+| `download_attachment` | info | target_path, attachment_name, size_bytes, sha256 |
+| `get_otp` | info | target_path, target_uuid (no code logged) |
+| `tool_call` | debug | tool, params (sensitive fields redacted), duration_ms, error_code |
+| `mcp_message` | trace | direction, full JSON-RPC payload |
+
+## Privacy invariants
+
+These are non-negotiable:
+
+- **Never log plaintext values.** No password, no protected field, no OTP code, no attachment bytes ever appears in any log entry except at `trace` level.
+- **Reveal events log SHA-256 hash, not value.** Hash computed as `sha256("kdbx-reveal-v1\0" || value)` for domain-separation against rainbow-table attacks.
+- **Path segments and field names ARE logged.** They're metadata, not secrets. Users with paranoid threat models can disable info-level logging by setting `KDBX_LOG_LEVEL=warn`.
+- **Master password and unlock-command output never appear anywhere.** Specifically scrubbed in `mcp_message` capture (`password` parameter replaced with `"<redacted>"`).
+- **`KDBX_PASSWORD` env var is not logged.** `server_started` event captures vault_path and idle_timeout_seconds but no env-var-derived secrets.
+
+## Operational uses
+
+- Audit reveal events: `grep '"event":"reveal_' log`
+- Forensics: hash-match log against known sensitive entries
+- Debug VAULT_LOCKED reasons: combine `vault_locked` events with idle_timeout
+- Compliance reports: trivially convert JSONL to whatever ingest format
+
+---
+
+# Section 7: Threat model
+
+## Trust boundaries
+
+mcp-kdbx **trusts**:
+- Local OS (filesystem, process isolation, memory)
+- The MCP host process (Claude Desktop, etc.)
+- The keepass-rs library and dependencies
+- The user's filesystem layout
+
+mcp-kdbx **does NOT trust**:
+- Tool-call inputs from the agent (paths, field names, UUIDs validated)
+- The vault file's mtime across save (mtime check before write)
+- `KDBX_UNLOCK_CMD` output (timeout-bounded; fails closed on non-zero exit)
+- The network: there is no network surface in v0.1 (stdio only)
+
+## Threats addressed by design
+
+### Adversarial agent (primary threat)
+
+A misbehaving or hostile LLM agent. Defenses:
+
+- **Bulk reads metadata-only.** `kdbx_list_entries`, `kdbx_get_entry`, `kdbx_find_entry`, `kdbx_list_attachments` never include protected values, attachment bytes, or OTP codes.
+- **Per-call consent-gated reveals.** Each `kdbx_reveal_*` and `kdbx_download_attachment` is a separate audited event. The MCP host can show a confirm UI per call.
+- **Minimal write surface.** No delete or move tools. Writes require `KDBX_ALLOW_WRITES=true`. Stage-then-commit pattern allows review before disk write.
+- **Audit log of every reveal and write.** sha256-hashed values let the user verify access without storing secrets.
+
+### External vault modification
+
+mtime check refuses save with VAULT_FILE_MODIFIED.
+
+### Concurrent mcp-kdbx instances
+
+First save wins; second's mtime check fires.
+
+### Path injection
+
+In-memory tree-walk, not filesystem traversal. `/../../../../etc/passwd` -> GROUP_NOT_FOUND.
+
+### Idle exposure
+
+15-minute default idle-lock zeroes the master key.
+
+## Threats partially addressed
+
+### Process memory dump
+
+While unlocked, master key + decrypted vault live in Rust heap.
+
+| Defense | Status |
+|---|---|
+| Zero key on lock | Yes (explicit overwrite) |
+| Drop parsed DB on lock | Yes (Rust drop; freed memory not actively zeroed) |
+| `mlock` to prevent swap | **No** (deferred; would require `cap_ipc_lock` or root) |
+| Hardware enclave | No |
+
+If your threat model includes "attacker can dump my process memory or read swap," mcp-kdbx is not the right tool.
+
+### Audit log tampering
+
+Plaintext file on disk; an attacker with write access can rewrite history.
+
+| Defense | Status |
+|---|---|
+| File permissions guidance (0600) | Documented |
+| Append-only signed chain | **No** (deferred) |
+| Remote append-only sink | Document workaround (syslog, journald) |
+
+### Configuration via env
+
+`KDBX_PASSWORD` in process env is readable via `/proc/$pid/environ` on Linux. **Defense: prefer `KDBX_UNLOCK_CMD`.**
+
+## Threats NOT addressed
+
+- **Compromised MCP host.** If the host is compromised, attacker has same access as user.
+- **Cryptographic side channels.** Delegated to keepass-rs.
+- **Denial-of-service.** No rate limiting in v0.1.
+- **Hardware attacks.** Out of scope for any software-only tool.
+- **Browser-side threats.** Not applicable (mcp-kdbx is a server, not a browser app).
+
+## Recommended posture for cautious users
+
+1. Use `KDBX_UNLOCK_CMD` instead of `KDBX_PASSWORD` (avoid env-leak)
+2. Set `KDBX_LOG_FILE` to a private path with 0600 permissions
+3. Set `KDBX_IDLE_TIMEOUT_SECONDS=300` (5 min) for paranoid; default 900 for typical
+4. Leave `KDBX_ALLOW_WRITES` unset unless writes are needed
+5. Run mcp-kdbx in a per-vault MCP host config
+6. Periodically grep the audit log for unexpected reveal events
+
+---
+
+# Section 8: Testing strategy
+
+## Test layers
+
+| Layer | What | Speed | Focus |
+|---|---|---|---|
+| Layer 1 | Rust unit tests (`cargo test --lib`) | < 5s | Pure functions: path resolution, validation, search, TOTP, error formatting |
+| Layer 2 | Integration tests against KDBX fixtures | ~ 10s | State machine: open, mutate, save, lock, reopen |
+| Layer 3 | MCP protocol conformance | ~ 30s | Spawn binary, communicate via stdio JSON-RPC, exercise tool surface |
+| Layer 4 | Manual cross-MCP-host smoke | manual | Real Claude Desktop, Claude Code, Cursor |
+
+## Layer 1 coverage
+
+In `src/*.rs` `#[cfg(test)] mod test {}`:
+
+- Path resolution: backslash escape, `:N` ordinal, error codes
+- Field/title validation: empty, control-char, Unicode
+- Search: case-insensitive, field filter, cap-and-truncate, sort
+- TOTP: known-vector tests
+- Error formatting: every error code maps to structured response
+
+No real KDBX files needed.
+
+## Layer 2 coverage
+
+In `tests/integration/*.rs`:
+
+1. Copy fixture KDBX to temp dir
+2. Start in-process server
+3. Exercise tool surface
+4. Assert outcomes
+
+Fixture set in `tests/fixtures/`:
+
+| Fixture | Contents |
+|---|---|
+| `empty.kdbx` | Zero entries |
+| `flat.kdbx` | 5 entries in root |
+| `nested.kdbx` | 3 levels of group nesting |
+| `with_attachments.kdbx` | 2 entries + 1 attachment each |
+| `with_otp.kdbx` | 1 entry with TOTP URI |
+| `duplicates.kdbx` | 2 entries with same title in same group |
+
+Password for all fixtures: `test-password-do-not-use` (matches web-kdbx and diff-kdbx).
+
+Coverage: every tool, success and error paths, idle-lock, audit-log appending, VAULT_FILE_MODIFIED conflict.
+
+## Layer 3 coverage
+
+Rust integration test using `tokio::process::Command`:
+
+- Spawn `mcp-kdbx` binary
+- Communicate via JSON-RPC over stdin/stdout
+- Verify `tools/list` schemas match Section 1
+- Exercise every tool's happy-path response shape
+- Trigger every error code in the enumeration
+- Round-trip serialization (non-ASCII strings, base64 binary, integer ranges)
+
+This layer catches wire-format drift invisible to unit tests.
+
+## Layer 4 manual smoke
+
+Per-release checklist in `docs/manual-testing.md`:
+- Claude Desktop: configure mcp-kdbx, exercise unlock/list/reveal/save/lock
+- Claude Code: same
+- Cursor: same (if available)
+- mcp-cli or similar: same
+
+## Test fixture management
+
+Generate via `gen-fixtures` binary in `[[bin]]` table, gated by `cli` feature (matches diff-kdbx, web-kdbx convention). Fixed UUIDs and timestamps where keepass allows for byte-stability. `MANIFEST.md` documents each fixture's contents; Layer 2 tests assert against observed contents to catch manifest drift.
+
+## CI gates
+
+```yaml
+jobs:
+  rust-test:                                  # Layer 1 + Layer 2
+    - cargo test --all-features
+    - cargo clippy --all-targets -- -D warnings
+    - cargo fmt --check
+  protocol-conformance:                       # Layer 3
+    - cargo test --test protocol_conformance
+  audit:
+    - bash scripts/ci-audit.sh                # path traversal, log redaction, env-var policy
+```
+
+## Property tests (deferred to v0.2)
+
+`proptest` integrations for:
+- Path round-trip: `parse(format(path)) == path`
+- Save round-trip: `open(save_to_bytes(open(bytes))) == open(bytes)`
+- Search relevance: matched entries contain query
+
+Roughly 100 LOC of setup buys substantial coverage in v0.2.
+
+## Coverage targets for v0.1
+
+| Area | Target |
+|---|---|
+| Path resolution | Every branch |
+| Tool handlers | Every tool: 1+ happy-path + 1+ error-path |
+| Auth/lifecycle | Each unlock source, each lock cause |
+| Stage/commit | Success and conflict paths |
+| Audit log | Every event type emitted |
+| Error codes | Every code in enumeration triggered |
+| Cryptography | Out of scope (delegated) |
+
+---
+
+# Out of scope (v0.1)
+
+These are explicitly NOT in v0.1. Each is a known and intentional gap; revisit per v0.2 demand.
+
+| Out-of-scope item | Reason |
+|---|---|
+| HTTP/SSE transport | stdio is sufficient for the dominant deployment shape (MCP host as parent process). HTTP adds auth surface (bearer, mTLS) and lifecycle complexity. |
+| Multi-vault support | One mcp-kdbx instance per vault. Aggregation is a higher-layer concern. |
+| Delete/move/rename tools | Writes are read+limited (add_entry, update_field). Destructive ops require manual KeePassXC for v0.1. |
+| Force-overwrite on save conflict | `kdbx_save_pending(force: true)` is dangerous without merge support. v0.1 says "discard your stage, re-read, redo." |
+| Snapshot-based diff | `kdbx_diff_since(timestamp)` requires snapshot storage. v0.1 has only canonical-vs-working diff. |
+| `mlock` memory pinning | Capability requirements; minimal user benefit relative to complexity. |
+| Tamper-evident audit log | Append-only signed chain is its own design problem. |
+| Rate limiting on save | Premature; no observed need. |
+| `KDBX_PARANOID=true` shorthand | Document the recipe instead. |
+| Property tests | Infrastructure for v0.2. |
+| Built-in `.env` support | Wrapper script suffices. |
+| Windows support | POSIX-shell `/bin/sh` assumed for `KDBX_UNLOCK_CMD`. |
+| Cross-tool ecosystem integration with web-kdbx | Both projects need to mature first. |
+
+# Future work (v0.2 directions)
+
+| Direction | Trigger |
+|---|---|
+| HTTP/SSE transport | Demand for "MCP server runs on home server, accessed via Tailscale" |
+| Snapshot-based diff | Demand for "show me what changed since yesterday" |
+| `mlock` support | User with high-paranoid threat model |
+| Tamper-evident audit log | Compliance requirements |
+| Property tests | API stabilizes; ~100 LOC of setup for substantial coverage |
+| Windows support | Demand from Windows users |
+| Force-overwrite with merge | Concurrent-edit demand emerges |
+
+# References
+
+- 2026-04-29-web-kdbx-design.md: web-kdbx L0 spec (sibling project)
+- 2026-05-06-web-kdbx-l1-storage-design.md: web-kdbx L1 spec (canonical mental-model document for the URL-as-vault story)
+- diff-kdbx: github.com/queelius/diff-kdbx (library dependency for stage diffing)
+- keepass-rs: github.com/sseemayer/keepass-rs (substrate library)
+- OmniKee: github.com/OmniKee/OmniKee (sibling KeePass-compatible app; informed the consent-gating design)
+- MCP specification: https://modelcontextprotocol.io
