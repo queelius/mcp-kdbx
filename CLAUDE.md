@@ -10,7 +10,17 @@ User-facing summary: `README.md`. Full v0.1 design (motivation, threat model, pr
 
 ## Status
 
-**Pre-implementation.** The repo currently contains the v0.1 spec, README, and this CLAUDE.md. No source code yet; no Cargo.toml. Before writing code, an implementation plan should land at `docs/superpowers/plans/2026-05-08-mcp-kdbx.md`, mirroring the spec/plan/execute flow used for `web-kdbx` and `diff-kdbx`.
+**Phase 1 complete (the `kdbx_core` foundation), on branch `feat/v0.1`, not yet merged or pushed.**
+
+The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). Phase 1 (tasks 1 through 9) is implemented and green: the `kdbx_core` module (`error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`) plus `Cargo.toml` and a binary version stub. 119 unit tests pass; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean.
+
+Two deliberate deviations from the plan's letter: the module is named `kdbx_core` (not `core`, which would shadow the std crate for unqualified paths and which also matches the spec's audit-invariant wording), and the `diff-kdbx` dependency is deferred to Phase 2, where `stage.rs` first calls `diff_kdbx::compute`.
+
+Pending:
+- Phase 2 (stage-then-commit, tasks 10 to 13): wires in `diff-kdbx` for `kdbx_diff_pending`; adds the atomic-save flow, idle timer, and mtime conflict check.
+- Phase 3 (MCP adapter and stdio transport, tasks 14 to 18): the `rmcp`-vs-hand-rolled-stdio framework choice is made here (current lean: `rmcp`, since the `kdbx_core`/adapter split already isolates the coupling to `src/adapter/transport.rs`).
+- Phase 4 (fixtures, integration and protocol-conformance tests, tasks 19 to 22).
+- Phase 5 (CI gates and docs, tasks 23 to 26).
 
 ## Position in the ecosystem
 
