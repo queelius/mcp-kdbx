@@ -10,15 +10,20 @@ User-facing summary: `README.md`. Full v0.1 design (motivation, threat model, pr
 
 ## Status
 
-**Phase 1 complete (the `kdbx_core` foundation), on branch `feat/v0.1`, not yet merged or pushed.**
+**Phases 1 and 2 complete (the whole `kdbx_core` layer), on branch `feat/v0.1`, not yet merged or pushed.**
 
-The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). Phase 1 (tasks 1 through 9) is implemented and green: the `kdbx_core` module (`error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`) plus `Cargo.toml` and a binary version stub. 119 unit tests pass; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean.
+The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 165 unit tests pass; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean.
 
-Two deliberate deviations from the plan's letter: the module is named `kdbx_core` (not `core`, which would shadow the std crate for unqualified paths and which also matches the spec's audit-invariant wording), and the `diff-kdbx` dependency is deferred to Phase 2, where `stage.rs` first calls `diff_kdbx::compute`.
+Phase 1 (tasks 1 to 9), the foundation: `error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`, plus `Cargo.toml` and a binary version stub.
+
+Phase 2 (tasks 10, 12, 13), stage-then-commit: `stage` (working-copy writes, the diff-kdbx stage diff with protected-field redaction, and the atomic save) and `orphan` (startup temp-file cleanup). `diff-kdbx` is wired in as a path dependency. `path` gained the inverse builders (`vault_path_to_entry`/`vault_path_to_group`/`VaultPath::parent`), and `vault` gained the save-support accessors and the idle predicate.
+
+Task 11 (idle timer) is split deliberately: the decision logic is `Vault::should_lock(now, idle_timeout)`, a pure tested predicate. The tokio task that calls it on a timer, and cancels on lock or shutdown, is wired in Phase 3, where the server loop owns the `Vault`.
+
+Two deviations from the plan's letter, both deliberate: the module is named `kdbx_core` (not `core`, which would shadow the std crate for unqualified paths), and the diff-kdbx dependency lands in Phase 2 (where `stage` first uses it) rather than Phase 1.
 
 Pending:
-- Phase 2 (stage-then-commit, tasks 10 to 13): wires in `diff-kdbx` for `kdbx_diff_pending`; adds the atomic-save flow, idle timer, and mtime conflict check.
-- Phase 3 (MCP adapter and stdio transport, tasks 14 to 18): the `rmcp`-vs-hand-rolled-stdio framework choice is made here (current lean: `rmcp`, since the `kdbx_core`/adapter split already isolates the coupling to `src/adapter/transport.rs`).
+- Phase 3 (MCP adapter and stdio transport, tasks 14 to 18): the 17 tools, the `{ ok, data } | { ok, error }` envelope, the idle-timer task, and the framework choice (`rmcp` vs hand-rolled stdio: current lean `rmcp`, since the `kdbx_core`/adapter split already isolates the coupling to `src/adapter/transport.rs`). This is where the consent-gating, KDBX_ALLOW_WRITES enforcement, and audit emission are wired to the core.
 - Phase 4 (fixtures, integration and protocol-conformance tests, tasks 19 to 22).
 - Phase 5 (CI gates and docs, tasks 23 to 26).
 
