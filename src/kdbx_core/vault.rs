@@ -318,6 +318,42 @@ impl Vault {
         }
     }
 
+    /// Borrow the canonical and working dbs together, in that order, for the
+    /// stage diff. Both are shared borrows, which the single-field accessors
+    /// cannot hand out at the same time.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn canonical_and_working(&self) -> CoreResult<(&keepass::Database, &keepass::Database)> {
+        match &self.state {
+            VaultState::Unlocked {
+                canonical_db,
+                working_db,
+                ..
+            } => Ok((canonical_db, working_db)),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// Discard the staged changes: reset the working db to a fresh clone of the
+    /// canonical baseline. Returns the prior pending state as a count (boolean
+    /// in Phase 1: 0 or 1; the precise count is a diff-kdbx concern).
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn discard_working(&mut self) -> CoreResult<usize> {
+        let pending = if self.has_pending_changes() { 1 } else { 0 };
+        match &mut self.state {
+            VaultState::Unlocked {
+                canonical_db,
+                working_db,
+                ..
+            } => {
+                *working_db = canonical_db.clone();
+                Ok(pending)
+            }
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
     /// Record that the working db was successfully written to disk: adopt it as
     /// the new canonical baseline (so `has_pending_changes` settles to false) and
     /// update the external-modification mtime to the freshly written file's.

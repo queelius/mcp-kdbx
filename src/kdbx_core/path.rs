@@ -170,6 +170,19 @@ impl VaultPath {
         self.segments.is_empty()
     }
 
+    /// The path of the containing group: this path with its last segment
+    /// dropped, always a group path. The parent of the root path is the root
+    /// path. The stage diff uses this to report an entry's `group_path`
+    /// alongside its full `path`.
+    pub fn parent(&self) -> VaultPath {
+        let mut segments = self.segments.clone();
+        segments.pop();
+        VaultPath {
+            segments,
+            is_group: true,
+        }
+    }
+
     /// Render the path back to its canonical string form.
     ///
     /// Round-trips with [`VaultPath::parse`]: re-emits the `\/` and `\\` escapes
@@ -1253,6 +1266,17 @@ mod tests {
         let path = vault_path_to_entry(&db, id).unwrap();
         let id_in_clone = path.resolve_entry(&clone).unwrap();
         assert_eq!(id.uuid(), id_in_clone.uuid());
+    }
+
+    #[test]
+    fn parent_drops_last_segment_as_group_path() {
+        let entry = VaultPath::parse("/Web/Banking/MyBank").unwrap();
+        let parent = entry.parent();
+        assert!(parent.is_group_path());
+        assert_eq!(parent.format(), "/Web/Banking");
+        // Parent of a top-level entry is the root; parent of root is root.
+        assert_eq!(VaultPath::parse("/MyBank").unwrap().parent().format(), "/");
+        assert!(VaultPath::parse("/").unwrap().parent().is_root());
     }
 
     #[test]
