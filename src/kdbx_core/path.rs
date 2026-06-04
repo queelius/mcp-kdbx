@@ -506,6 +506,174 @@ fn nfc_normalize(input: &str) -> String {
     input.nfc().collect::<String>()
 }
 
+/// Build the canonical [`VaultPath`] of the entry `target` in `db`, or `None`
+/// when no entry with that id exists.
+///
+/// This is the inverse of [`VaultPath::resolve_entry`]: the path it returns
+/// resolves back to `target` against the same database and against any clone of
+/// it, because same-named siblings receive the same UUID-ordered `:N` ordinal
+/// the resolver applies. The read tools and the stage diff use this to report
+/// the path of a record they hold by id.
+pub fn vault_path_to_entry(db: &Database, target: EntryId) -> Option<VaultPath> {
+    let root = db.root().id();
+    let mut segments = Vec::new();
+    if collect_entry_segments(db, root, target, &mut segments) {
+        Some(VaultPath {
+            segments,
+            is_group: false,
+        })
+    } else {
+        None
+    }
+}
+
+/// Build the canonical [`VaultPath`] of the group `target` in `db`, or `None`
+/// when no group with that id exists. The root group maps to the bare root path
+/// `/`. Inverse of [`VaultPath::resolve_group`]; see [`vault_path_to_entry`].
+pub fn vault_path_to_group(db: &Database, target: GroupId) -> Option<VaultPath> {
+    let root = db.root().id();
+    if target == root {
+        return Some(VaultPath {
+            segments: Vec::new(),
+            is_group: true,
+        });
+    }
+    let mut segments = Vec::new();
+    if collect_group_segments(db, root, target, &mut segments) {
+        Some(VaultPath {
+            segments,
+            is_group: true,
+        })
+    } else {
+        None
+    }
+}
+
+/// Depth-first search from `group_id` for the entry `target`. Pushes the segment
+/// for each group descended into, plus the entry's own segment when found.
+/// Returns true with `segments` holding the path on success, or restores
+/// `segments` and returns false.
+fn collect_entry_segments(
+    db: &Database,
+    group_id: GroupId,
+    target: EntryId,
+    segments: &mut Vec<Segment>,
+) -> bool {
+    let group = match db.group(group_id) {
+        Some(g) => g,
+        None => return false,
+    };
+
+    let entry_ids: Vec<EntryId> = group.entry_ids().collect();
+    if entry_ids.contains(&target) {
+        if let Some(entry) = db.entry(target) {
+            let title = entry.get_title().unwrap_or("").to_string();
+            let ordinal = entry_ordinal(db, &group, target, &title);
+            segments.push(Segment {
+                name: title,
+                ordinal,
+            });
+            return true;
+        }
+    }
+
+    let child_ids: Vec<GroupId> = group.group_ids().collect();
+    for cid in child_ids {
+        let name = match db.group(cid) {
+            Some(child) => child.name.clone(),
+            None => continue,
+        };
+        let ordinal = group_ordinal(db, &group, cid, &name);
+        segments.push(Segment { name, ordinal });
+        if collect_entry_segments(db, cid, target, segments) {
+            return true;
+        }
+        segments.pop();
+    }
+    false
+}
+
+/// Depth-first search from `group_id` for the group `target`, pushing a segment
+/// per group descended into. Same success and backtrack contract as
+/// [`collect_entry_segments`].
+fn collect_group_segments(
+    db: &Database,
+    group_id: GroupId,
+    target: GroupId,
+    segments: &mut Vec<Segment>,
+) -> bool {
+    let group = match db.group(group_id) {
+        Some(g) => g,
+        None => return false,
+    };
+
+    let child_ids: Vec<GroupId> = group.group_ids().collect();
+    for cid in child_ids {
+        let name = match db.group(cid) {
+            Some(child) => child.name.clone(),
+            None => continue,
+        };
+        let ordinal = group_ordinal(db, &group, cid, &name);
+        segments.push(Segment { name, ordinal });
+        if cid == target || collect_group_segments(db, cid, target, segments) {
+            return true;
+        }
+        segments.pop();
+    }
+    false
+}
+
+/// The 1-based ordinal of entry `target` among same-titled siblings of `group`,
+/// ordered by record UUID (matching [`VaultPath::match_entry`]). `None` when
+/// `target` is the only entry with its title, so the formatted path omits the
+/// ordinal.
+fn entry_ordinal(
+    db: &Database,
+    group: &keepass::db::GroupRef<'_>,
+    target: EntryId,
+    title: &str,
+) -> Option<usize> {
+    let wanted = nfc_normalize(title);
+    let mut ids: Vec<EntryId> = group
+        .entry_ids()
+        .filter(|id| {
+            db.entry(*id)
+                .map(|e| nfc_normalize(e.get_title().unwrap_or("")) == wanted)
+                .unwrap_or(false)
+        })
+        .collect();
+    ids.sort_by_key(|id| id.uuid());
+    if ids.len() <= 1 {
+        return None;
+    }
+    ids.iter().position(|id| *id == target).map(|i| i + 1)
+}
+
+/// The 1-based ordinal of group `target` among same-named sibling groups of
+/// `group`, ordered by record UUID (matching [`VaultPath::step_into_group`]).
+/// `None` when `target` is the only group with its name.
+fn group_ordinal(
+    db: &Database,
+    group: &keepass::db::GroupRef<'_>,
+    target: GroupId,
+    name: &str,
+) -> Option<usize> {
+    let wanted = nfc_normalize(name);
+    let mut ids: Vec<GroupId> = group
+        .group_ids()
+        .filter(|id| {
+            db.group(*id)
+                .map(|g| nfc_normalize(&g.name) == wanted)
+                .unwrap_or(false)
+        })
+        .collect();
+    ids.sort_by_key(|id| id.uuid());
+    if ids.len() <= 1 {
+        return None;
+    }
+    ids.iter().position(|id| *id == target).map(|i| i + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,5 +1178,100 @@ mod tests {
         assert_ne!(decomposed, precomposed, "differ before normalization");
         assert_eq!(nfc_normalize(decomposed), nfc_normalize(precomposed));
         assert_eq!(nfc_normalize(decomposed), precomposed);
+    }
+
+    // Inverse builders: vault_path_to_entry / vault_path_to_group.
+
+    #[test]
+    fn vault_path_to_entry_round_trips_and_resolves_back() {
+        let db = build_db();
+        // Resolve a known entry to its id, build its path, and confirm the path
+        // both formats canonically and resolves back to the same id.
+        let id = VaultPath::parse("/Web/Banking/MyBank")
+            .unwrap()
+            .resolve_entry(&db)
+            .unwrap();
+        let path = vault_path_to_entry(&db, id).expect("entry has a path");
+        assert_eq!(path.format(), "/Web/Banking/MyBank");
+        assert!(!path.is_group_path());
+        assert_eq!(path.resolve_entry(&db).unwrap(), id);
+    }
+
+    #[test]
+    fn vault_path_to_group_round_trips_and_root_is_slash() {
+        let db = build_db();
+        let banking = VaultPath::parse("/Web/Banking/")
+            .unwrap()
+            .resolve_group(&db)
+            .unwrap();
+        let path = vault_path_to_group(&db, banking).expect("group has a path");
+        assert_eq!(path.format(), "/Web/Banking");
+        assert!(path.is_group_path());
+        assert_eq!(path.resolve_group(&db).unwrap(), banking);
+
+        // The root group maps to the bare root path.
+        let root_path = vault_path_to_group(&db, db.root().id()).expect("root path");
+        assert!(root_path.is_root());
+        assert_eq!(root_path.format(), "/");
+    }
+
+    #[test]
+    fn vault_path_to_entry_disambiguates_duplicate_siblings() {
+        let db = build_db();
+        // The two "Dup" entries under /Web each get a distinct ordinal path that
+        // resolves back to its own id, and the two paths differ.
+        let first = VaultPath::parse("/Web/Dup:1")
+            .unwrap()
+            .resolve_entry(&db)
+            .unwrap();
+        let second = VaultPath::parse("/Web/Dup:2")
+            .unwrap()
+            .resolve_entry(&db)
+            .unwrap();
+        assert_ne!(first, second);
+
+        let p1 = vault_path_to_entry(&db, first).unwrap();
+        let p2 = vault_path_to_entry(&db, second).unwrap();
+        assert_ne!(p1.format(), p2.format());
+        assert_eq!(p1.resolve_entry(&db).unwrap(), first);
+        assert_eq!(p2.resolve_entry(&db).unwrap(), second);
+        // Each formatted path carries an ordinal (the siblings are ambiguous).
+        assert!(p1.format().starts_with("/Web/Dup:"));
+        assert!(p2.format().starts_with("/Web/Dup:"));
+    }
+
+    #[test]
+    fn vault_path_is_clone_consistent() {
+        let db = build_db();
+        let clone = db.clone();
+        // A path built against one database resolves to the same record in a
+        // clone, because ordinals are UUID-ordered and clone preserves UUIDs.
+        let id = VaultPath::parse("/Web/Dup:2")
+            .unwrap()
+            .resolve_entry(&db)
+            .unwrap();
+        let path = vault_path_to_entry(&db, id).unwrap();
+        let id_in_clone = path.resolve_entry(&clone).unwrap();
+        assert_eq!(id.uuid(), id_in_clone.uuid());
+    }
+
+    #[test]
+    fn vault_path_to_entry_unknown_id_is_none() {
+        let db = build_db();
+        // A group id is not an entry id, so building an entry path from a group
+        // id (or any id not present as an entry) yields None.
+        let group = db.root().id();
+        // Construct an entry-typed lookup that cannot match: the root group's id
+        // reinterpreted is not in the entry store. We instead use a fresh db's
+        // entry id to guarantee absence.
+        let other = {
+            let mut d = Database::new();
+            d.root_mut()
+                .add_entry()
+                .edit(|e| e.set_unprotected(fields::TITLE, "Lonely"));
+            d.iter_all_entries().next().unwrap().id()
+        };
+        assert!(vault_path_to_entry(&db, other).is_none());
+        assert!(vault_path_to_group(&db, group).is_some());
     }
 }

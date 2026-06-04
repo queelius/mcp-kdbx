@@ -16,6 +16,11 @@ categories = ["command-line-utilities", "cryptography"]
 # carries EntryRef::attachments_named() (upstream PR #321). save_kdbx4 enables
 # the write path (Database::save).
 keepass = { version = "0.12.5", features = ["serialization", "save_kdbx4"] }
+# Sibling ecosystem member, used as a library for the semantic stage diff
+# (kdbx_diff_pending). Path dependency for local development; publishing v0.1
+# needs diff-kdbx on crates.io or a git URL. diff_kdbx::compute::compute takes
+# two keepass::Database values and is I/O-free, so it composes cleanly here.
+diff-kdbx = { path = "../diff-kdbx" }
 # Async runtime: tokio drives the unlock-command shell-out (timeout-bounded),
 # the idle timer (Phase 2), and the stdio transport (Phase 3).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "process", "io-util"] }

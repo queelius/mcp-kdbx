@@ -23,7 +23,7 @@
 
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use zeroize::Zeroize;
 
 /// Why a lock happened. Passed into [`Vault::lock`] so the caller can record it
@@ -267,6 +267,77 @@ impl Vault {
             VaultState::Locked => false,
         }
     }
+
+    /// Whether the idle timer should lock the vault now.
+    ///
+    /// True when the vault is unlocked, `idle_timeout` is non-zero, and at least
+    /// `idle_timeout` has elapsed since the last [`touch`](Self::touch). A zero
+    /// timeout means "never idle-lock" (spec: `KDBX_IDLE_TIMEOUT_SECONDS=0`).
+    ///
+    /// This is a pure predicate so it is testable without a running clock. The
+    /// Phase 3 server owns the actual tokio timer task: it periodically calls
+    /// this with `Instant::now()` and the configured timeout, and calls
+    /// [`lock`](Self::lock) with [`LockReason::IdleTimeout`] when it returns true.
+    pub fn should_lock(&self, now: Instant, idle_timeout: Duration) -> bool {
+        if idle_timeout.is_zero() {
+            return false;
+        }
+        match &self.state {
+            VaultState::Unlocked { last_activity, .. } => {
+                now.saturating_duration_since(*last_activity) >= idle_timeout
+            }
+            VaultState::Locked => false,
+        }
+    }
+
+    /// The vault file's mtime as captured at unlock. The save path compares the
+    /// current on-disk mtime against this to detect external modification.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn mtime_at_unlock(&self) -> CoreResult<SystemTime> {
+        match &self.state {
+            VaultState::Unlocked {
+                file_mtime_at_unlock,
+                ..
+            } => Ok(*file_mtime_at_unlock),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// Borrow the working db and the master key together, for serializing the
+    /// vault to disk. The save path needs both at once, which the individual
+    /// accessors cannot give without a second mutable borrow.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn working_db_and_key(&self) -> CoreResult<(&keepass::Database, &keepass::DatabaseKey)> {
+        match &self.state {
+            VaultState::Unlocked {
+                working_db, key, ..
+            } => Ok((working_db, key)),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// Record that the working db was successfully written to disk: adopt it as
+    /// the new canonical baseline (so `has_pending_changes` settles to false) and
+    /// update the external-modification mtime to the freshly written file's.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn mark_saved(&mut self, new_mtime: SystemTime) -> CoreResult<()> {
+        match &mut self.state {
+            VaultState::Unlocked {
+                canonical_db,
+                working_db,
+                file_mtime_at_unlock,
+                ..
+            } => {
+                *canonical_db = working_db.clone();
+                *file_mtime_at_unlock = new_mtime;
+                Ok(())
+            }
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -453,5 +524,73 @@ mod tests {
         vault.unlock(TEST_PASSWORD, None).expect("unlock");
         // working_db is a fresh clone of canonical_db, so serialized bytes match.
         assert!(!vault.has_pending_changes());
+    }
+
+    // Phase 2 additions: idle predicate and save support.
+
+    #[test]
+    fn should_lock_is_false_when_locked() {
+        let vault = Vault::new(PathBuf::from("/nonexistent/vault.kdbx"));
+        assert!(!vault.should_lock(Instant::now(), Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn should_lock_zero_timeout_never_locks() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        // A zero timeout means "never idle-lock", even far in the future.
+        let far_future = Instant::now() + Duration::from_secs(86_400);
+        assert!(!vault.should_lock(far_future, Duration::ZERO));
+    }
+
+    #[test]
+    fn should_lock_fires_after_timeout_elapses() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        let now = Instant::now();
+        // Not yet: only a moment has passed since unlock set last_activity.
+        assert!(!vault.should_lock(now, Duration::from_secs(60)));
+        // Yes: pretend a minute has gone by with no touch.
+        let later = now + Duration::from_secs(61);
+        assert!(vault.should_lock(later, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn mtime_and_key_accessors_error_when_locked() {
+        let vault = Vault::new(PathBuf::from("/nonexistent/vault.kdbx"));
+        assert_eq!(
+            vault.mtime_at_unlock().unwrap_err().code_enum(),
+            ErrorCode::VaultLocked
+        );
+        assert_eq!(
+            vault.working_db_and_key().unwrap_err().code_enum(),
+            ErrorCode::VaultLocked
+        );
+    }
+
+    #[test]
+    fn mark_saved_settles_pending_and_updates_mtime() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+
+        // Stage a change so the vault is dirty.
+        {
+            let db = vault.working_db_mut().expect("unlocked");
+            let id = db.iter_all_entries().next().expect("an entry").id();
+            db.entry_mut(id)
+                .expect("entry")
+                .edit(|e| e.set_unprotected(keepass::db::fields::URL, "https://example.com"));
+        }
+        assert!(vault.has_pending_changes());
+
+        // Marking saved adopts working as the new canonical baseline and updates
+        // the external-modification mtime.
+        let new_mtime = SystemTime::now() + Duration::from_secs(5);
+        vault.mark_saved(new_mtime).expect("mark saved");
+        assert!(!vault.has_pending_changes());
+        assert_eq!(vault.mtime_at_unlock().expect("unlocked"), new_mtime);
     }
 }

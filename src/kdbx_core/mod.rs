@@ -14,12 +14,17 @@
 //! - `audit`: the JSONL audit-log events and sha256 reveal hashing.
 //! - `totp`: otpauth URI parsing and TOTP code computation.
 //! - `search`: substring entry search across configurable fields.
+//! - `stage`: working-copy write operations, the diff-kdbx stage diff, and the
+//!   atomic save (Phase 2).
+//! - `orphan`: startup cleanup of leftover `*.tmp.*` save files (Phase 2).
 
 pub mod audit;
 pub mod config;
 pub mod error;
+pub mod orphan;
 pub mod path;
 pub mod search;
+pub mod stage;
 pub mod totp;
 pub mod unlock;
 pub mod vault;
