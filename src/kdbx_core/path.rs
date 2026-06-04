@@ -8,12 +8,16 @@
 //!
 //! Grammar in brief:
 //! - Paths start with `/`. The leading empty segment is discarded.
-//! - `/` separates segments. Inside a segment, `\/` is a literal slash and
-//!   `\\` is a literal backslash.
+//! - `/` separates segments. Inside a segment, `\/` is a literal slash,
+//!   `\\` is a literal backslash, and `\:` is a literal colon that is not an
+//!   ordinal separator.
 //! - A trailing slash marks the path as a group path. The root path `/` is
 //!   always a group path. Canonical formatted output carries no trailing slash.
 //! - A segment may carry a `:N` suffix (1-based ordinal) to disambiguate
-//!   siblings that share a name, following KDBX iteration order.
+//!   siblings that share a name. Siblings with the same name are ordered by
+//!   record UUID (not by KDBX hash-set iteration order), so a given ordinal
+//!   resolves to the same record within a session, across sessions, and across
+//!   the canonical and working clones of one database.
 //!
 //! Names compare case-sensitively after Unicode NFC normalization, so a
 //! precomposed accented name and its decomposed equivalent resolve the same.
@@ -27,6 +31,7 @@
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 use keepass::Database;
 use keepass::db::{EntryId, GroupId};
+use unicode_normalization::UnicodeNormalization;
 
 /// A parsed vault path: an ordered list of segments plus a flag recording
 /// whether the input ended with a trailing slash (which marks a group path).
@@ -45,11 +50,13 @@ pub struct VaultPath {
 /// One path segment: a record name plus an optional 1-based ordinal.
 ///
 /// The ordinal disambiguates siblings that share a name. `None` is treated the
-/// same as `Some(1)`: pick the first sibling with that name.
+/// same as `Some(1)`. Siblings are ordered by record UUID, so a given ordinal
+/// is stable and identical across clones of one database (see [`step_into_group`]
+/// and [`match_entry`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Segment {
-    /// The record name, with any `\/` and `\\` escapes already decoded and the
-    /// `:N` ordinal suffix already stripped off.
+    /// The record name, with any `\/`, `\\`, and `\:` escapes already decoded
+    /// and the `:N` ordinal suffix already stripped off.
     name: String,
     /// The 1-based ordinal from a `:N` suffix, or `None` when absent.
     ordinal: Option<usize>,
@@ -87,10 +94,14 @@ impl VaultPath {
                 .with_details(serde_json::json!({ "path": input })));
         }
 
-        // Split into raw segments while honoring backslash escapes. A `\` makes
-        // the next character literal, so `\/` does not split and `\\` is one
-        // backslash. A trailing unescaped `/` produces a final empty raw
-        // segment, which we read as the group-path marker.
+        // Split into raw segments at unescaped `/`. A `\` makes the next
+        // character literal for splitting purposes, so `\/` does not split and
+        // `\\/` is a literal backslash followed by a separator. We keep the
+        // escape sequences verbatim in the raw segment (we do not decode them
+        // here): decoding happens later, in `Segment::parse`, so that the
+        // ordinal scan can tell an escaped colon (`\:`, a literal colon) from
+        // an ordinal-separator colon. A trailing unescaped `/` produces a final
+        // empty raw segment, which we read as the group-path marker.
         let mut raw_segments: Vec<String> = Vec::new();
         let mut current = String::new();
         let mut chars = input.chars();
@@ -100,9 +111,11 @@ impl VaultPath {
         let mut escaped = false;
         for ch in chars {
             if escaped {
-                // Only `\/` and `\\` are meaningful escapes. We pass through any
-                // other escaped character literally rather than rejecting it, so
-                // a stray backslash before an ordinary character is forgiving.
+                // Keep the backslash and the escaped character together so the
+                // raw segment still carries the escape. `Segment::parse` decodes
+                // `\/`, `\\`, and `\:`; any other escaped character is decoded to
+                // the bare character there, matching the forgiving older behavior.
+                current.push('\\');
                 current.push(ch);
                 escaped = false;
             } else if ch == '\\' {
@@ -235,6 +248,14 @@ impl VaultPath {
 
     /// Find the child group of `parent` named by `seg`, honoring the ordinal.
     /// Returns `GroupNotFound` when no matching child group exists.
+    ///
+    /// keepass 0.12 backs `group_ids()` onto a `HashSet` seeded by a per-process
+    /// random hasher, so its iteration order is neither stable across processes
+    /// nor identical between two clones of one database. We therefore collect all
+    /// name matches and sort them by record UUID before applying the 1-based
+    /// ordinal. `clone()` preserves UUIDs, so this makes a given ordinal resolve
+    /// to the same group within a session, across sessions, and across the
+    /// canonical and working clones.
     fn step_into_group(
         &self,
         db: &Database,
@@ -249,16 +270,21 @@ impl VaultPath {
 
         let target = nfc_normalize(&seg.name);
         let wanted = seg.ordinal.unwrap_or(1);
-        let mut seen = 0usize;
-        for child_id in parent_ref.group_ids() {
-            if let Some(child) = db.group(child_id) {
-                if nfc_normalize(&child.name) == target {
-                    seen += 1;
-                    if seen == wanted {
-                        return Ok(child_id);
-                    }
-                }
-            }
+
+        let mut matches: Vec<GroupId> = parent_ref
+            .group_ids()
+            .filter(|id| {
+                db.group(*id)
+                    .map(|child| nfc_normalize(&child.name) == target)
+                    .unwrap_or(false)
+            })
+            .collect();
+        // Stable order: sort by UUID so the ordinal is reproducible and clone
+        // consistent.
+        matches.sort_by_key(|id| id.uuid());
+
+        if let Some(id) = matches.get(wanted - 1) {
+            return Ok(*id);
         }
 
         Err(CoreError::new(ErrorCode::GroupNotFound)
@@ -273,6 +299,11 @@ impl VaultPath {
     /// Find the entry of `parent` named by `seg`, honoring the ordinal. An entry
     /// matches on its title. Returns `EntryNotFound` when no matching entry
     /// exists.
+    ///
+    /// Same determinism concern as `step_into_group`: `entry_ids()` iterates a
+    /// `HashSet`, so we collect all title matches and sort them by record UUID
+    /// before applying the ordinal. This keeps ":N" reproducible and identical
+    /// across the canonical and working clones.
     fn match_entry(&self, db: &Database, parent: GroupId, seg: &Segment) -> CoreResult<EntryId> {
         let parent_ref = db.group(parent).ok_or_else(|| {
             CoreError::new(ErrorCode::EntryNotFound)
@@ -282,17 +313,21 @@ impl VaultPath {
 
         let target = nfc_normalize(&seg.name);
         let wanted = seg.ordinal.unwrap_or(1);
-        let mut seen = 0usize;
-        for entry_id in parent_ref.entry_ids() {
-            if let Some(entry) = db.entry(entry_id) {
-                let title = entry.get_title().unwrap_or("");
-                if nfc_normalize(title) == target {
-                    seen += 1;
-                    if seen == wanted {
-                        return Ok(entry_id);
-                    }
-                }
-            }
+
+        let mut matches: Vec<EntryId> = parent_ref
+            .entry_ids()
+            .filter(|id| {
+                db.entry(*id)
+                    .map(|entry| nfc_normalize(entry.get_title().unwrap_or("")) == target)
+                    .unwrap_or(false)
+            })
+            .collect();
+        // Stable order: sort by UUID so the ordinal is reproducible and clone
+        // consistent.
+        matches.sort_by_key(|id| id.uuid());
+
+        if let Some(id) = matches.get(wanted - 1) {
+            return Ok(*id);
         }
 
         Err(CoreError::new(ErrorCode::EntryNotFound)
@@ -312,12 +347,15 @@ impl std::fmt::Display for VaultPath {
 }
 
 impl Segment {
-    /// Parse one already-unsplit raw segment string into a name and ordinal.
+    /// Parse one raw segment string (escapes still present) into a name and
+    /// ordinal.
     ///
-    /// `raw` has had its slash escapes resolved by the splitter, so it may
-    /// contain literal `/` and `\` characters. The `:N` ordinal suffix is
-    /// recognized only when `N` is a sequence of ASCII digits forming a value of
-    /// at least 1. `full_path` is threaded through only for error context.
+    /// `raw` still carries the `\/`, `\\`, and `\:` escape sequences the splitter
+    /// left in place. The `:N` ordinal suffix is recognized only on an unescaped
+    /// trailing colon followed by ASCII digits forming a value of at least 1; an
+    /// escaped colon (`\:`) is a literal colon and never an ordinal separator.
+    /// The name portion is unescaped here. `full_path` is threaded through only
+    /// for error context.
     fn parse(raw: &str, full_path: &str) -> CoreResult<Segment> {
         if let Some((name, ord_str)) = split_ordinal_suffix(raw) {
             let ordinal: usize = ord_str.parse().map_err(|_| {
@@ -331,12 +369,12 @@ impl Segment {
                     .with_details(serde_json::json!({ "path": full_path, "segment": raw })));
             }
             Ok(Segment {
-                name: name.to_string(),
+                name: unescape_segment(name),
                 ordinal: Some(ordinal),
             })
         } else {
             Ok(Segment {
-                name: raw.to_string(),
+                name: unescape_segment(raw),
                 ordinal: None,
             })
         }
@@ -346,6 +384,12 @@ impl Segment {
     /// suffix when present.
     fn format(&self) -> String {
         let mut out = escape_segment(&self.name);
+        if self.ordinal.is_none() && name_reparses_with_ordinal(&self.name) {
+            // The name (with no ordinal) ends in ":<digits>", so emitting it
+            // verbatim would re-parse as carrying an ordinal. Escape the
+            // disambiguator colon so the round-trip preserves the literal name.
+            escape_last_unescaped_colon(&mut out);
+        }
         if let Some(n) = self.ordinal {
             out.push(':');
             out.push_str(&n.to_string());
@@ -354,14 +398,19 @@ impl Segment {
     }
 }
 
-/// Split a raw segment into `(name, ordinal_digits)` when it ends in `:N` with
-/// `N` a non-empty run of ASCII digits and a non-empty name. Returns `None` when
-/// there is no such suffix, so a bare name like `Banking` or a name that simply
-/// contains a colon (`http:8080`) without a trailing digit run is left intact.
+/// Split a raw (still-escaped) segment into `(name, ordinal_digits)` when it ends
+/// in `:N` with `N` a non-empty run of ASCII digits, a non-empty name, and an
+/// unescaped colon. Returns `None` otherwise, so a bare name like `Banking`, a
+/// name that simply contains a colon without a trailing digit run (`http:port`),
+/// or a name whose colon is escaped (`Build\:2`) is left intact.
 fn split_ordinal_suffix(raw: &str) -> Option<(&str, &str)> {
     let colon = raw.rfind(':')?;
     // Need a name before the colon and digits after it.
     if colon == 0 {
+        return None;
+    }
+    // The colon must be unescaped: an escaped colon (`\:`) is a literal colon.
+    if colon_is_escaped(raw, colon) {
         return None;
     }
     let digits = &raw[colon + 1..];
@@ -371,9 +420,68 @@ fn split_ordinal_suffix(raw: &str) -> Option<(&str, &str)> {
     Some((&raw[..colon], digits))
 }
 
+/// True when the colon byte at `colon` in `raw` is escaped, that is, preceded by
+/// an odd run of backslashes. An even run (including zero) leaves the colon
+/// unescaped.
+fn colon_is_escaped(raw: &str, colon: usize) -> bool {
+    let mut backslashes = 0usize;
+    for b in raw[..colon].bytes().rev() {
+        if b == b'\\' {
+            backslashes += 1;
+        } else {
+            break;
+        }
+    }
+    backslashes % 2 == 1
+}
+
+/// Decode a raw segment's escapes into the literal name. `\/`, `\\`, and `\:`
+/// decode to `/`, `\`, and `:`; any other `\x` decodes to the bare `x`, matching
+/// the forgiving pass-through the splitter used before.
+fn unescape_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                // A trailing lone backslash cannot occur: the splitter rejects a
+                // dangling escape. Keep it literal if it ever does.
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// True when `name`, formatted with no ordinal and then re-parsed, would be read
+/// as carrying an ordinal: that is, the name ends in ":<one-or-more-digits>".
+fn name_reparses_with_ordinal(name: &str) -> bool {
+    let Some(colon) = name.rfind(':') else {
+        return false;
+    };
+    if colon == 0 {
+        return false;
+    }
+    let digits = &name[colon + 1..];
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Escape the last unescaped colon in an already-escaped segment string, turning
+/// it into `\:`. Used by formatting to protect a literal trailing ":<digits>"
+/// from re-parsing as an ordinal.
+fn escape_last_unescaped_colon(escaped: &mut String) {
+    if let Some(colon) = escaped.rfind(':') {
+        escaped.insert(colon, '\\');
+    }
+}
+
 /// Escape a segment name for output: a literal `\` becomes `\\` and a literal
-/// `/` becomes `\/`. Other characters pass through. This is the inverse of the
-/// unescaping the splitter does during parse.
+/// `/` becomes `\/`. Other characters pass through (the colon is handled
+/// separately during formatting, only when needed to avoid an ordinal re-parse).
+/// This is the inverse of the unescaping done during parse.
 fn escape_segment(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -389,120 +497,13 @@ fn escape_segment(name: &str) -> String {
 /// Normalize a string to Unicode NFC (canonical decomposition followed by
 /// canonical composition) for name comparison.
 ///
-/// We do not pull in a full Unicode normalization crate here; the dependency set
-/// is fixed for v0.1. Instead we apply canonical composition over the combining
-/// marks that show up in real record names: a base character followed by one or
-/// more combining diacritical marks (the U+0300..U+036F block) is composed into
-/// its precomposed form where one exists. Strings already in precomposed form
-/// pass through unchanged, so a precomposed name and its decomposed equivalent
-/// compare equal. Characters outside this common case are left as-is.
-///
-/// This is enough for the v0.1 path-resolution contract (precomposed vs
-/// decomposed accented Latin names resolve the same). A later version can swap
-/// in a full normalizer without changing the call sites.
+/// Backed by the `unicode-normalization` crate, so this is full NFC: canonical
+/// reordering of combining marks and composition across the whole Unicode
+/// repertoire, not just Latin. Two names that are canonically equivalent
+/// normalize to the same string and compare equal, including non-Latin scripts
+/// and multi-combining-mark sequences.
 fn nfc_normalize(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(base) = chars.next() {
-        let mut composed = base;
-        // Fold any run of trailing combining marks into the base where a
-        // canonical composition exists.
-        while let Some(&mark) = chars.peek() {
-            if let Some(next) = compose_pair(composed, mark) {
-                composed = next;
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        out.push(composed);
-    }
-    out
-}
-
-/// Canonically compose a base character and a single combining mark into a
-/// precomposed character, when a canonical equivalent exists. Returns `None`
-/// when there is no composition for the pair.
-///
-/// This table covers the common Latin precomposed letters used in names. It is
-/// deliberately small: the goal is correct comparison of the accented names that
-/// occur in practice, not full Unicode coverage.
-fn compose_pair(base: char, mark: char) -> Option<char> {
-    let composed = match (base, mark) {
-        // Combining grave accent U+0300.
-        ('A', '\u{0300}') => 'À',
-        ('E', '\u{0300}') => 'È',
-        ('I', '\u{0300}') => 'Ì',
-        ('O', '\u{0300}') => 'Ò',
-        ('U', '\u{0300}') => 'Ù',
-        ('a', '\u{0300}') => 'à',
-        ('e', '\u{0300}') => 'è',
-        ('i', '\u{0300}') => 'ì',
-        ('o', '\u{0300}') => 'ò',
-        ('u', '\u{0300}') => 'ù',
-        // Combining acute accent U+0301.
-        ('A', '\u{0301}') => 'Á',
-        ('E', '\u{0301}') => 'É',
-        ('I', '\u{0301}') => 'Í',
-        ('O', '\u{0301}') => 'Ó',
-        ('U', '\u{0301}') => 'Ú',
-        ('Y', '\u{0301}') => 'Ý',
-        ('a', '\u{0301}') => 'á',
-        ('e', '\u{0301}') => 'é',
-        ('i', '\u{0301}') => 'í',
-        ('o', '\u{0301}') => 'ó',
-        ('u', '\u{0301}') => 'ú',
-        ('y', '\u{0301}') => 'ý',
-        ('n', '\u{0301}') => 'ń',
-        ('c', '\u{0301}') => 'ć',
-        ('s', '\u{0301}') => 'ś',
-        ('z', '\u{0301}') => 'ź',
-        // Combining circumflex U+0302.
-        ('A', '\u{0302}') => 'Â',
-        ('E', '\u{0302}') => 'Ê',
-        ('I', '\u{0302}') => 'Î',
-        ('O', '\u{0302}') => 'Ô',
-        ('U', '\u{0302}') => 'Û',
-        ('a', '\u{0302}') => 'â',
-        ('e', '\u{0302}') => 'ê',
-        ('i', '\u{0302}') => 'î',
-        ('o', '\u{0302}') => 'ô',
-        ('u', '\u{0302}') => 'û',
-        // Combining tilde U+0303.
-        ('A', '\u{0303}') => 'Ã',
-        ('N', '\u{0303}') => 'Ñ',
-        ('O', '\u{0303}') => 'Õ',
-        ('a', '\u{0303}') => 'ã',
-        ('n', '\u{0303}') => 'ñ',
-        ('o', '\u{0303}') => 'õ',
-        // Combining diaeresis U+0308.
-        ('A', '\u{0308}') => 'Ä',
-        ('E', '\u{0308}') => 'Ë',
-        ('I', '\u{0308}') => 'Ï',
-        ('O', '\u{0308}') => 'Ö',
-        ('U', '\u{0308}') => 'Ü',
-        ('a', '\u{0308}') => 'ä',
-        ('e', '\u{0308}') => 'ë',
-        ('i', '\u{0308}') => 'ï',
-        ('o', '\u{0308}') => 'ö',
-        ('u', '\u{0308}') => 'ü',
-        ('y', '\u{0308}') => 'ÿ',
-        // Combining ring above U+030A.
-        ('A', '\u{030A}') => 'Å',
-        ('a', '\u{030A}') => 'å',
-        // Combining cedilla U+0327.
-        ('C', '\u{0327}') => 'Ç',
-        ('c', '\u{0327}') => 'ç',
-        // Combining caron U+030C.
-        ('C', '\u{030C}') => 'Č',
-        ('S', '\u{030C}') => 'Š',
-        ('Z', '\u{030C}') => 'Ž',
-        ('c', '\u{030C}') => 'č',
-        ('s', '\u{030C}') => 'š',
-        ('z', '\u{030C}') => 'ž',
-        _ => return None,
-    };
-    Some(composed)
+    input.nfc().collect::<String>()
 }
 
 #[cfg(test)]
@@ -778,12 +779,12 @@ mod tests {
     #[test]
     fn duplicate_sibling_ordinal_picks_a_distinct_entry() {
         let db = build_db();
-        // The underlying keepass iteration order is a HashSet, so which of the
-        // two "Dup" entries is :1 versus :2 is stable within a process but not
-        // predictable across processes (see the uncertainty note on this in the
-        // summary). The deterministic contract we assert: a bare name and ":1"
-        // both pick the first sibling, ":2" picks a different sibling, and the
-        // two together cover both usernames.
+        // Siblings that share a name are ordered by record UUID, so which "Dup"
+        // is :1 versus :2 is fixed (not subject to keepass HashSet iteration
+        // order). The contract we assert here: a bare name and ":1" both pick the
+        // first sibling, ":2" picks a different sibling, and the two together
+        // cover both usernames. The clone-consistency and fixed-UUID guarantees
+        // are asserted in `ordinals_are_uuid_ordered_and_clone_consistent`.
         let bare = VaultPath::parse("/Web/Dup")
             .unwrap()
             .resolve_entry(&db)
@@ -841,5 +842,173 @@ mod tests {
             .resolve_group(&db)
             .expect("decomposed name resolves to precomposed group");
         assert_eq!(db.group(gid).unwrap().name, "Caf\u{00e9}");
+    }
+
+    #[test]
+    fn ordinals_are_uuid_ordered_and_clone_consistent() {
+        // Two same-named sibling entries: ":1" must map to the smaller UUID and
+        // ":2" to the larger, and that mapping must be identical against a clone
+        // of the database (clone preserves UUIDs). This is the property that
+        // keeps "name:N" resolving to the same record in the canonical and
+        // working clones of the stage/commit model.
+        let mut db = Database::new();
+        {
+            let mut root = db.root_mut();
+            root.add_entry()
+                .edit(|e| e.set_unprotected(fields::TITLE, "Twin"));
+            root.add_entry()
+                .edit(|e| e.set_unprotected(fields::TITLE, "Twin"));
+        }
+
+        // The two UUIDs, sorted, give the fixed expected mapping.
+        let mut uuids: Vec<uuid::Uuid> = db
+            .iter_all_entries()
+            .filter(|e| e.get_title() == Some("Twin"))
+            .map(|e| e.id().uuid())
+            .collect();
+        assert_eq!(uuids.len(), 2, "two twins seeded");
+        uuids.sort();
+        let (smaller, larger) = (uuids[0], uuids[1]);
+
+        let first = VaultPath::parse("/Twin:1")
+            .unwrap()
+            .resolve_entry(&db)
+            .expect("Twin:1 resolves");
+        let second = VaultPath::parse("/Twin:2")
+            .unwrap()
+            .resolve_entry(&db)
+            .expect("Twin:2 resolves");
+        assert_eq!(first.uuid(), smaller, ":1 maps to the smaller UUID");
+        assert_eq!(second.uuid(), larger, ":2 maps to the larger UUID");
+
+        // A clone has the same UUIDs, so the same ordinal maps to the same UUID.
+        let clone = db.clone();
+        let first_clone = VaultPath::parse("/Twin:1")
+            .unwrap()
+            .resolve_entry(&clone)
+            .expect("Twin:1 resolves in clone");
+        let second_clone = VaultPath::parse("/Twin:2")
+            .unwrap()
+            .resolve_entry(&clone)
+            .expect("Twin:2 resolves in clone");
+        assert_eq!(
+            first_clone.uuid(),
+            first.uuid(),
+            ":1 is identical across the clone"
+        );
+        assert_eq!(
+            second_clone.uuid(),
+            second.uuid(),
+            ":2 is identical across the clone"
+        );
+    }
+
+    #[test]
+    fn literal_colon_digit_title_round_trips() {
+        // A title that literally ends in ":<digits>" must survive format/parse:
+        // the disambiguator colon is escaped so it does not re-parse as an
+        // ordinal. The literal is written with an escaped colon on input.
+        for (input, want_name) in [
+            ("/A/Build\\:2", "Build:2"),
+            ("/Server\\:8080", "Server:8080"),
+        ] {
+            let once = VaultPath::parse(input).expect("parse");
+            let last = once.segments.last().expect("a segment");
+            assert_eq!(last.name, want_name);
+            assert!(
+                last.ordinal.is_none(),
+                "a literal name is not read as an ordinal: {input}"
+            );
+            // format then re-parse is identity on the parsed value.
+            let formatted = once.format();
+            let twice = VaultPath::parse(&formatted).expect("re-parse formatted");
+            assert_eq!(once, twice, "round-trips: {input} -> {formatted}");
+        }
+    }
+
+    #[test]
+    fn escaped_colon_is_a_literal_colon_not_an_ordinal() {
+        // Explicit "\:" input is a literal colon, never an ordinal separator.
+        let p = VaultPath::parse("/Build\\:2").expect("parse escaped colon");
+        assert_eq!(p.segments.len(), 1);
+        assert_eq!(p.segments[0].name, "Build:2");
+        assert_eq!(p.segments[0].ordinal, None);
+        // And it formats back to the escaped form.
+        assert_eq!(p.format(), "/Build\\:2");
+    }
+
+    #[test]
+    fn literal_colon_digit_title_resolves_to_that_entry_not_an_ordinal() {
+        // A group "A" with an entry literally titled "Build:2" plus two "Build"
+        // siblings. "/A/Build:2" must find the literal "Build:2" entry, while
+        // "/A/Build\:2" written as the explicit ordinal path "/A/Build:2" is the
+        // literal. The ordinal form is reachable by an unescaped colon.
+        let mut db = Database::new();
+        let a_id = db
+            .root_mut()
+            .add_group()
+            .edit(|g| g.name = "A".to_string())
+            .id();
+        db.group_mut(a_id).unwrap().add_entry().edit(|e| {
+            e.set_unprotected(fields::TITLE, "Build:2");
+            e.set_unprotected(fields::USERNAME, "literal");
+        });
+        db.group_mut(a_id).unwrap().add_entry().edit(|e| {
+            e.set_unprotected(fields::TITLE, "Build");
+            e.set_unprotected(fields::USERNAME, "first-build");
+        });
+        db.group_mut(a_id).unwrap().add_entry().edit(|e| {
+            e.set_unprotected(fields::TITLE, "Build");
+            e.set_unprotected(fields::USERNAME, "second-build");
+        });
+
+        // "/A/Build:2" parses with a trailing unescaped ":2", so it is the
+        // ordinal path: it selects the second "Build" sibling, not the literal.
+        let ordinal_hit = VaultPath::parse("/A/Build:2")
+            .unwrap()
+            .resolve_entry(&db)
+            .expect("ordinal Build:2 resolves");
+        assert_eq!(
+            db.entry(ordinal_hit).unwrap().get_title(),
+            Some("Build"),
+            "unescaped :2 is the second Build sibling"
+        );
+
+        // The escaped form "/A/Build\:2" is the literal entry titled "Build:2".
+        let literal_hit = VaultPath::parse("/A/Build\\:2")
+            .unwrap()
+            .resolve_entry(&db)
+            .expect("literal Build:2 resolves");
+        assert_eq!(
+            db.entry(literal_hit).unwrap().get_title(),
+            Some("Build:2"),
+            "escaped :2 is the literal title"
+        );
+        assert_eq!(
+            db.entry(literal_hit).unwrap().get("UserName"),
+            Some("literal")
+        );
+    }
+
+    #[test]
+    fn nfc_handles_non_latin_and_multi_mark_cases() {
+        // Cases the old hand-rolled Latin-only table missed.
+        //
+        // 1. Canonical ordering of two combining marks: "q" + dot-below (U+0323)
+        //    + acute (U+0301) and the same marks in the other input order both
+        //    normalize to the same NFC string. The old table only folded a single
+        //    mark over an ASCII base, so it left these two unequal.
+        let a = "q\u{0323}\u{0301}";
+        let b = "q\u{0301}\u{0323}";
+        assert_ne!(a, b, "inputs differ before normalization");
+        assert_eq!(nfc_normalize(a), nfc_normalize(b));
+
+        // 2. A non-Latin script: Greek alpha + combining acute (U+0301) composes
+        //    to precomposed alpha-with-tonos (U+03AC). The old table had no Greek.
+        let decomposed = "\u{03B1}\u{0301}";
+        let precomposed = "\u{03AC}";
+        assert_ne!(decomposed, precomposed, "differ before normalization");
+        assert_eq!(nfc_normalize(decomposed), nfc_normalize(precomposed));
+        assert_eq!(nfc_normalize(decomposed), precomposed);
     }
 }

@@ -21,6 +21,9 @@ keepass = { version = "0.12.5", features = ["serialization", "save_kdbx4"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "process", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Unicode NFC normalization for case-sensitive, normalization-aware path name
+# comparison. Small, single-purpose crate.
+unicode-normalization = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
