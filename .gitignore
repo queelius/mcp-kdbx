@@ -1,5 +1,4 @@
 /target
-/Cargo.lock
 *.kdbx.tmp.*
 
 # Editor / OS

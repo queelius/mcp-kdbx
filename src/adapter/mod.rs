@@ -16,7 +16,7 @@ pub mod responses;
 use crate::kdbx_core::config::Config;
 use crate::kdbx_core::vault::Vault;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -101,11 +101,17 @@ impl KdbxServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KdbxServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "mcp-kdbx exposes a single KeePass KDBX vault. Read groups and entries and find by \
-             title or url with the list and find tools; protected fields and attachments require \
-             a separate consent-gated reveal. Writes (when enabled) are staged in memory and \
-             committed atomically with kdbx_save_pending.",
-        )
+        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(
+                "mcp-kdbx exposes a single KeePass KDBX vault. Read groups and entries and find \
+                 by title or url with the list and find tools; protected fields and attachments \
+                 require a separate consent-gated reveal. Writes (when enabled) are staged in \
+                 memory and committed atomically with kdbx_save_pending.",
+            );
+        // Report mcp-kdbx as the server, not rmcp's default implementation name.
+        // from_build_env reads CARGO_PKG_NAME and CARGO_PKG_VERSION. ServerInfo
+        // is non-exhaustive, so set the field after construction.
+        info.server_info = Implementation::from_build_env();
+        info
     }
 }
