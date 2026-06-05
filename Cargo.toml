@@ -43,6 +43,7 @@ anyhow = "1"
 # Audit log emission.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io"] }
 
 [features]
 # Gates the gen-fixtures helper binary (added in Phase 4). Matches the

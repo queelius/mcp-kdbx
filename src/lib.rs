@@ -6,4 +6,5 @@
 //! JSON-RPC. The dependency direction is one-way: the adapter depends on the
 //! core, never the reverse.
 
+pub mod adapter;
 pub mod kdbx_core;
