@@ -10,21 +10,24 @@ User-facing summary: `README.md`. Full v0.1 design (motivation, threat model, pr
 
 ## Status
 
-**Phases 1 and 2 complete (the whole `kdbx_core` layer), on branch `feat/v0.1`, not yet merged or pushed.**
+**Phases 1, 2, and 3 complete (the full server), on branch `feat/v0.1`, not yet merged or pushed.**
 
-The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 165 unit tests pass; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean.
+The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 179 unit tests pass; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean. The server runs: all 17 tools register and respond over real stdio MCP.
 
-Phase 1 (tasks 1 to 9), the foundation: `error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`, plus `Cargo.toml` and a binary version stub.
+Phase 1 (tasks 1 to 9), the `kdbx_core` foundation: `error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`.
 
-Phase 2 (tasks 10, 12, 13), stage-then-commit: `stage` (working-copy writes, the diff-kdbx stage diff with protected-field redaction, and the atomic save) and `orphan` (startup temp-file cleanup). `diff-kdbx` is wired in as a path dependency. `path` gained the inverse builders (`vault_path_to_entry`/`vault_path_to_group`/`VaultPath::parent`), and `vault` gained the save-support accessors and the idle predicate.
+Phase 2 (tasks 10, 12, 13), stage-then-commit: `stage` (working-copy writes, the diff-kdbx stage diff with protected-field redaction, the atomic save) and `orphan` (startup temp-file cleanup). `diff-kdbx` is a path dependency.
 
-Task 11 (idle timer) is split deliberately: the decision logic is `Vault::should_lock(now, idle_timeout)`, a pure tested predicate. The tokio task that calls it on a timer, and cancels on lock or shutdown, is wired in Phase 3, where the server loop owns the `Vault`.
+Phase 3 (tasks 14 to 18), the MCP adapter over `rmcp` 1.7.0, all in `src/adapter/`: `responses` (the `{ ok, data } | { ok, error }` text envelope), `mod` (the `KdbxServer` handler, shared state, level-filtered audit emission, the writes gate, and the idle-timer task), `views` (read-shape builders), and the four tool groups `lifecycle` / `reads` / `reveals` / `writes`. `main.rs` reads config, opens the audit file, cleans orphans, announces start, spawns the idle timer, and serves stdio. Consent-gating, `KDBX_ALLOW_WRITES` enforcement, and sha256-not-plaintext audit are all wired and validated end to end (zero plaintext leak confirmed by smoke test).
 
-Two deviations from the plan's letter, both deliberate: the module is named `kdbx_core` (not `core`, which would shadow the std crate for unqualified paths), and the diff-kdbx dependency lands in Phase 2 (where `stage` first uses it) rather than Phase 1.
+Framework decision (settled): `rmcp` 1.7.0, the official Rust MCP SDK. It owns the protocol plumbing; the `kdbx_core`/adapter split keeps all rmcp coupling inside `src/adapter/`. Tools return the `{ ok, data }` string as a text content block, so the spec's envelope is preserved.
+
+Three deliberate deviations from the plan's letter: the module is `kdbx_core` (not `core`, which would shadow the std crate); diff-kdbx lands in Phase 2 (where `stage` first uses it); and the tool surface is split across `src/adapter/{lifecycle,reads,reveals,writes}.rs` as combined `#[tool_router]` blocks rather than one `tools.rs`.
+
+Minor deferred item: explicit SIGTERM/SIGINT lock-on-shutdown (Task 18 step 4) is not wired, but `keepass::DatabaseKey` is `ZeroizeOnDrop`, so normal shutdown (stdin close) zeroizes the key on drop; abrupt signals rely on OS memory reclaim.
 
 Pending:
-- Phase 3 (MCP adapter and stdio transport, tasks 14 to 18): the 17 tools, the `{ ok, data } | { ok, error }` envelope, the idle-timer task, and the framework choice (`rmcp` vs hand-rolled stdio: current lean `rmcp`, since the `kdbx_core`/adapter split already isolates the coupling to `src/adapter/transport.rs`). This is where the consent-gating, KDBX_ALLOW_WRITES enforcement, and audit emission are wired to the core.
-- Phase 4 (fixtures, integration and protocol-conformance tests, tasks 19 to 22).
+- Phase 4 (fixtures, integration and protocol-conformance tests, tasks 19 to 22). The live smoke tests done so far are manual; this phase makes them an automated suite (a `gen-fixtures` binary under the `cli` feature, per-tool integration tests, and a protocol-conformance harness that spawns the binary).
 - Phase 5 (CI gates and docs, tasks 23 to 26).
 
 ## Position in the ecosystem
