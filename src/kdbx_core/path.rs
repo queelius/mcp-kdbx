@@ -237,26 +237,48 @@ impl VaultPath {
         }
     }
 
-    /// Resolve and require a group. Returns `GroupNotFound` when the path
-    /// resolves to an entry or to nothing.
+    /// Resolve and require a group, forcing the final segment to resolve as a
+    /// group regardless of a trailing slash.
+    ///
+    /// This does NOT go through [`resolve`](Self::resolve), because a caller
+    /// asking for a group means it: `/Web` and `/Web/` are equivalent on input
+    /// (spec section 1), so a group path need not carry a trailing slash. Every
+    /// segment, including the last, is walked as a group step, so a missing
+    /// group at any level is `GroupNotFound`.
     pub fn resolve_group(&self, db: &Database) -> CoreResult<GroupId> {
-        match self.resolve(db)? {
-            Resolved::Group(id) => Ok(id),
-            Resolved::Entry(_) => Err(CoreError::new(ErrorCode::GroupNotFound)
-                .with_message("path resolves to an entry, not a group")
-                .with_details(serde_json::json!({ "path": self.format() }))),
+        let root_id = db.root().id();
+        if self.segments.is_empty() {
+            return Ok(root_id);
         }
+        let mut current_group = root_id;
+        let last = self.segments.len() - 1;
+        for seg in &self.segments[..last] {
+            current_group = self.step_into_group(db, current_group, seg)?;
+        }
+        self.step_into_group(db, current_group, &self.segments[last])
     }
 
-    /// Resolve and require an entry. Returns `EntryNotFound` when the path
-    /// resolves to a group or to nothing.
+    /// Resolve and require an entry, forcing the final segment to resolve as an
+    /// entry regardless of a trailing slash.
+    ///
+    /// Like [`resolve_group`](Self::resolve_group), this forces the final-segment
+    /// kind rather than depending on the `is_group` flag. The intermediate
+    /// segments are group steps (`GroupNotFound` if one is missing); only the
+    /// last must be an entry (`EntryNotFound` if not). The root path has no
+    /// entry, so it is `EntryNotFound`.
     pub fn resolve_entry(&self, db: &Database) -> CoreResult<EntryId> {
-        match self.resolve(db)? {
-            Resolved::Entry(id) => Ok(id),
-            Resolved::Group(_) => Err(CoreError::new(ErrorCode::EntryNotFound)
-                .with_message("path resolves to a group, not an entry")
-                .with_details(serde_json::json!({ "path": self.format() }))),
+        let root_id = db.root().id();
+        if self.segments.is_empty() {
+            return Err(CoreError::new(ErrorCode::EntryNotFound)
+                .with_message("the root path is a group, not an entry")
+                .with_details(serde_json::json!({ "path": self.format() })));
         }
+        let mut current_group = root_id;
+        let last = self.segments.len() - 1;
+        for seg in &self.segments[..last] {
+            current_group = self.step_into_group(db, current_group, seg)?;
+        }
+        self.match_entry(db, current_group, &self.segments[last])
     }
 
     /// Find the child group of `parent` named by `seg`, honoring the ordinal.
@@ -887,16 +909,58 @@ mod tests {
     #[test]
     fn group_without_trailing_slash_still_resolves_via_resolve_group() {
         let db = build_db();
-        // No trailing slash means resolve() tries an entry first and fails;
-        // resolve_group is the explicit accessor for groups.
+        // The generic resolve() respects the trailing-slash flag: a path without
+        // one tries an entry first and fails for a group name.
         let path = VaultPath::parse("/Web/Banking").unwrap();
         let err = path.resolve(&db).expect_err("no entry named Banking");
         assert_eq!(err.code_enum(), ErrorCode::EntryNotFound);
-        let gid = VaultPath::parse("/Web/Banking/")
-            .unwrap()
-            .resolve_group(&db)
-            .expect("group resolves");
-        assert_eq!(db.group(gid).unwrap().name, "Banking");
+
+        // But resolve_group forces a group regardless of the trailing slash:
+        // `/Web`, `/Web/`, `/Web/Banking`, and `/Web/Banking/` all resolve. This
+        // is the contract add_entry relies on (group_path has no trailing slash).
+        for p in ["/Web", "/Web/", "/Web/Banking", "/Web/Banking/"] {
+            let gid = VaultPath::parse(p)
+                .unwrap()
+                .resolve_group(&db)
+                .unwrap_or_else(|_| panic!("{p} should resolve to a group"));
+            let name = db.group(gid).unwrap().name.clone();
+            assert!(name == "Web" || name == "Banking", "{p} resolved to {name}");
+        }
+        // The root path resolves to the root group.
+        assert_eq!(
+            VaultPath::parse("/").unwrap().resolve_group(&db).unwrap(),
+            db.root().id()
+        );
+    }
+
+    #[test]
+    fn resolve_entry_forces_entry_kind_without_trailing_slash() {
+        let db = build_db();
+        // resolve_entry forces the final segment to an entry. A group name fails
+        // as ENTRY_NOT_FOUND; the actual entry resolves.
+        assert_eq!(
+            VaultPath::parse("/Web")
+                .unwrap()
+                .resolve_entry(&db)
+                .unwrap_err()
+                .code_enum(),
+            ErrorCode::EntryNotFound
+        );
+        assert!(
+            VaultPath::parse("/Web/Banking/MyBank")
+                .unwrap()
+                .resolve_entry(&db)
+                .is_ok()
+        );
+        // The root path has no entry.
+        assert_eq!(
+            VaultPath::parse("/")
+                .unwrap()
+                .resolve_entry(&db)
+                .unwrap_err()
+                .code_enum(),
+            ErrorCode::EntryNotFound
+        );
     }
 
     #[test]
