@@ -129,7 +129,11 @@ pub enum AuditEvent {
         field_name: String,
         sha256: String,
     },
-    /// An attachment was downloaded. `sha256` is [`hash_revealed`] of the bytes.
+    /// An attachment was downloaded. `sha256` is a plain SHA-256 content
+    /// fingerprint of the bytes (lowercase hex), the same digest the
+    /// `kdbx_list_attachments` view reports, not the domain-separated
+    /// [`hash_revealed`] (which is for string secrets). It identifies which
+    /// attachment was taken without storing its content.
     DownloadAttachment {
         target_path: String,
         attachment_name: String,

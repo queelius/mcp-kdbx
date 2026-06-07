@@ -253,6 +253,30 @@ pub fn no_otp_configured() -> CoreError {
     ErrorCode::NoOtpConfigured.into()
 }
 
+/// Resolve a [`TotpConfig`] from an entry's fields, preferring the modern
+/// otpauth `otp` field and falling back to the legacy `TOTP Seed` + `TOTP
+/// Settings` pair. Returns `None` when neither yields a usable config.
+///
+/// This is the single source of truth for "does this entry have usable TOTP".
+/// `kdbx_get_otp` calls it to compute a code, and the read views call it (and
+/// check `.is_some()`) to set the `has_otp` capability flag. Routing both
+/// through one function keeps the advertised capability and the actual behavior
+/// from drifting: an entry's `has_otp` is true exactly when `kdbx_get_otp`
+/// would succeed.
+pub fn resolve_config(
+    otp: Option<&str>,
+    legacy_seed: Option<&str>,
+    legacy_settings: Option<&str>,
+) -> Option<TotpConfig> {
+    if let Some(config) = otp.and_then(TotpConfig::parse) {
+        return Some(config);
+    }
+    match (legacy_seed, legacy_settings) {
+        (Some(seed), Some(settings)) => TotpConfig::from_legacy(seed, settings),
+        _ => None,
+    }
+}
+
 /// Resolve a [`TotpConfig`] into a code, or report [`ErrorCode::NoOtpConfigured`]
 /// when the option is empty. A convenience for callers that already hold an
 /// `Option<TotpConfig>` from the parse step.
@@ -434,5 +458,33 @@ mod tests {
             .expect("parse");
         let code = code_or_error(Some(cfg), 59).expect("code");
         assert_eq!(code.code, "287082");
+    }
+
+    #[test]
+    fn resolve_config_prefers_modern_then_legacy_then_none() {
+        // Modern otpauth field resolves.
+        assert!(
+            resolve_config(
+                Some("otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP"),
+                None,
+                None
+            )
+            .is_some()
+        );
+        // Legacy seed + settings pair resolves when there is no modern field.
+        assert!(resolve_config(None, Some("JBSWY3DPEHPK3PXP"), Some("30;6")).is_some());
+        // Seed without settings does not resolve.
+        assert!(resolve_config(None, Some("JBSWY3DPEHPK3PXP"), None).is_none());
+        // Nothing resolves when all sources are absent.
+        assert!(resolve_config(None, None, None).is_none());
+        // A malformed modern field falls through to the legacy pair.
+        assert!(
+            resolve_config(
+                Some("not-an-otpauth-uri"),
+                Some("JBSWY3DPEHPK3PXP"),
+                Some("30;6")
+            )
+            .is_some()
+        );
     }
 }
