@@ -6,19 +6,59 @@ encrypted KeePass vault, with per-secret consent gating and a full audit
 trail.
 
 A bridge member of the [`*-kdbx` ecosystem](https://github.com/queelius?tab=repositories&q=kdbx).
-The other members are `keepass-rs` (substrate library), `diff-kdbx`
-(semantic-diff CLI), and `web-kdbx` (browser-side UI).
+The sibling members are `diff-kdbx` (semantic-diff CLI and library) and
+`web-kdbx` (browser-side UI); all of them build on
+[`keepass-rs`](https://github.com/sseemayer/keepass-rs), the substrate library.
 
 ## Status
 
-**Pre-implementation.** v0.1 design is settled and lives at
-`docs/superpowers/specs/2026-05-08-mcp-kdbx-design.md`. The spec covers
-the MCP protocol surface, auth and lifecycle, tool semantics, the
-stage-then-commit write flow, configuration, audit trail, threat model,
-and testing strategy.
+**Working server, pre-release.** Phases 1-3 of the v0.1 plan are complete
+on branch `feat/v0.1`: all 17 tools register and respond over real stdio
+MCP (built on `rmcp` 1.7.0), 179 library tests pass, `cargo fmt` and
+`cargo clippy -D warnings` are clean, and consent gating, the
+`KDBX_ALLOW_WRITES` gate, and the sha256-not-plaintext audit trail were
+validated end to end against a live MCP host with zero plaintext leakage.
+Remaining before release: Phase 4 (fixtures, integration tests,
+protocol-conformance harness) and Phase 5 (CI gates and docs).
 
-The implementation plan is the next document, followed by subagent-driven
-development. The flow mirrors the one used for `web-kdbx` and `diff-kdbx`.
+The v0.1 design lives at `docs/superpowers/specs/2026-05-08-mcp-kdbx-design.md`;
+the implementation plan at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md`.
+
+## Known limitations
+
+- **KDBX 4.1 vaults from KeePassXC may fail to open.** The substrate
+  library `keepass-rs` (0.12.x) rejects the KDBX 4.1 `PreviousParentGroup`
+  element ([keepass-rs #303](https://github.com/sseemayer/keepass-rs/issues/303),
+  open upstream), and KeePassXC saves KDBX 4.1 by default. A vault whose
+  XML carries `PreviousParentGroup` (e.g. after moving entries or groups)
+  will fail to parse. Workaround until the upstream fix lands: have
+  KeePassXC write the vault as KDBX 4.0 (Database > Database Settings >
+  Security > Encryption Settings > Database format).
+
+## Quick start
+
+Build from source (Rust 1.85+, edition 2024). `diff-kdbx` is currently a
+path dependency, so check out the sibling repo at `../diff-kdbx` first:
+
+```sh
+cargo build --release   # produces target/release/mcp-kdbx
+```
+
+Register with an MCP host, for example Claude Code:
+
+```sh
+claude mcp add kdbx \
+  --env KDBX_VAULT_PATH=/path/to/vault.kdbx \
+  --env KDBX_PASSWORD=correct-horse-battery-staple \
+  -- /path/to/mcp-kdbx/target/release/mcp-kdbx
+```
+
+Configuration is environment-variable only. `KDBX_VAULT_PATH` is the one
+required variable. Common options: `KDBX_PASSWORD` or `KDBX_UNLOCK_CMD`
+(master password source; omit both to pass the password per-session via
+`kdbx_unlock`), `KDBX_KEYFILE_PATH`, `KDBX_ALLOW_WRITES=true` (writes are
+off by default), `KDBX_IDLE_TIMEOUT_SECONDS` (default 900), `KDBX_LOG_FILE`
+(JSONL audit trail; stderr when unset), `KDBX_LOG_LEVEL` (default `info`).
 
 ## Design summary
 
@@ -49,8 +89,10 @@ without explicit opt-in.
 ## Reading order for new contributors
 
 1. `docs/superpowers/specs/2026-05-08-mcp-kdbx-design.md` (the v0.1 design)
-2. `~/github/kdbx/CLAUDE.md` (ecosystem-level conventions)
-3. The sibling repo specs at `~/github/kdbx/web-kdbx/docs/superpowers/specs/`
+2. `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (the 26-task
+   implementation plan; Phases 1-3 done, 4-5 pending)
+3. `~/github/kdbx/CLAUDE.md` (ecosystem-level conventions)
+4. The sibling repo specs at `~/github/kdbx/web-kdbx/docs/superpowers/specs/`
    for reference on the spec/plan/execute flow
 
 ## License

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `mcp-kdbx`: a Model Context Protocol server for KeePass KDBX vaults, written in Rust. Spawned by an MCP host (Claude Desktop, Claude Code, Cursor) as a child process; communicates over stdio JSON-RPC. Exposes 17 tools across four categories (lifecycle, read, reveal, write). Bridge member of the `*-kdbx` ecosystem.
 
-User-facing summary: `README.md`. Full v0.1 design (motivation, threat model, protocol surface, auth, semantics, audit trail, threat model, testing): `docs/superpowers/specs/2026-05-08-mcp-kdbx-design.md`.
+User-facing summary: `README.md`. Full v0.1 design (motivation, protocol surface, auth, semantics, audit trail, threat model, testing): `docs/superpowers/specs/2026-05-08-mcp-kdbx-design.md`.
 
 ## Status
 
@@ -43,7 +43,7 @@ Pending:
 
 - `~/github/kdbx/CLAUDE.md`: ecosystem-level conventions for all `*-kdbx` repos.
 - `~/github/kdbx/web-kdbx/`: the most mature sibling. Its spec/plan pair (`2026-04-29-web-kdbx-design.md` + `2026-04-29-web-kdbx.md`, plus `2026-05-06-web-kdbx-l1-storage-design.md` + `2026-05-06-web-kdbx-l1.md`) is the canonical example of the workflow.
-- `~/github/kdbx/diff-kdbx/`: the dependency that mcp-kdbx will pull in for stage diffing. Read its CLAUDE.md and spec to understand its public Rust API.
+- `~/github/kdbx/diff-kdbx/`: path dependency (see Cargo.toml) used by `kdbx_core::stage` for the `kdbx_diff_pending` semantic diff. Read its CLAUDE.md and spec to understand its public Rust API.
 - `~/github/bugfixes/track1-issues/keepass-rs/`: local fork used for upstream contributions.
 
 ## Architectural decisions (settled in the v0.1 spec)
@@ -82,7 +82,7 @@ These are non-negotiable from the spec; flag any change that violates them as a 
 
 - Follow the soul skill (canonical list: `~/github/repos/soul/skills/soul/SKILL.md`). Key rules: no em-dashes (use commas, periods, colons, parentheses); no corporate hype phrases; direct, plain, humble.
 - Conventional commits with lowercase scope: `feat(vault):`, `docs(spec):`, `ci:`, `test(integration):`, etc.
-- Include `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` on AI-assisted commits.
+- Include a `Co-Authored-By: Claude <model name> <noreply@anthropic.com>` trailer on AI-assisted commits, naming whatever model actually did the work. Do not hardcode a specific model name in this file; models change between sessions.
 
 ## Test fixture convention (when fixtures land)
 

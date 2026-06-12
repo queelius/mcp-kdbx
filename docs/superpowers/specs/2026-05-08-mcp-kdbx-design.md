@@ -3,7 +3,7 @@
 **Project:** mcp-kdbx (bridge member of the *-kdbx ecosystem)
 **Date:** 2026-05-08
 **Author:** Alexander Towell
-**Status:** Design (pending implementation plan)
+**Status:** Implemented through Phase 3 of the v0.1 plan (`docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md`) on branch `feat/v0.1`; Phases 4-5 (tests, CI, docs) pending. The design below is the historical v0.1 record; see CLAUDE.md for the three deliberate deviations from its letter.
 **Supersedes:** none (this is the v0.1 design)
 
 ## Goal
