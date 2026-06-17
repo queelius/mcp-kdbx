@@ -16,6 +16,7 @@
 //! stage API expects, decoding each attachment's base64 here in the adapter (the
 //! stage module takes raw bytes, not base64).
 
+use crate::adapter::views::format_system_time;
 use crate::adapter::{KdbxServer, responses};
 use crate::kdbx_core::audit::AuditEvent;
 use crate::kdbx_core::error::{CoreError, ErrorCode};
@@ -92,7 +93,7 @@ impl KdbxServer {
 
         let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&CoreError::new(ErrorCode::VaultLocked));
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
         let group_path = match VaultPath::parse(&params.group_path) {
@@ -102,7 +103,8 @@ impl KdbxServer {
 
         // Convert the field and attachment maps into the ordered Vec inputs the
         // stage API expects. The attachment base64 is decoded here; bad base64 is
-        // a FIELD_NAME_INVALID with a clear message rather than a generic error.
+        // INVALID_INPUT (a malformed value, not a bad field name) with a clear
+        // message.
         let mut fields: Vec<stage::FieldInput> = params
             .fields
             .into_iter()
@@ -126,7 +128,7 @@ impl KdbxServer {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     return responses::err(
-                        &CoreError::new(ErrorCode::FieldNameInvalid)
+                        &CoreError::new(ErrorCode::InvalidInput)
                             .with_message(format!("attachment '{name}' is not valid base64"))
                             .with_details(serde_json::json!({ "attachment": name })),
                     );
@@ -184,7 +186,7 @@ impl KdbxServer {
 
         let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&CoreError::new(ErrorCode::VaultLocked));
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
         let path = match VaultPath::parse(&params.path) {
@@ -242,9 +244,9 @@ impl KdbxServer {
             return responses::err(&CoreError::new(ErrorCode::WritesDisabled));
         }
 
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&CoreError::new(ErrorCode::VaultLocked));
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
         let (canonical, working) = match vault.canonical_and_working() {
@@ -270,7 +272,7 @@ impl KdbxServer {
 
         let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&CoreError::new(ErrorCode::VaultLocked));
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
         // Capture the pre-save mtime and the pending count into owned values
@@ -281,7 +283,7 @@ impl KdbxServer {
             .ok()
             .map(format_system_time)
             .unwrap_or_default();
-        let pending_before = if vault.has_pending_changes() { 1 } else { 0 };
+        let pending_before = vault.pending_count() as u64;
 
         match stage::save_pending(&mut vault) {
             Ok(outcome) => {
@@ -338,8 +340,23 @@ impl KdbxServer {
 
         let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&CoreError::new(ErrorCode::VaultLocked));
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
+
+        // Capture the discarded changes' paths before the working copy is reset.
+        // The immutable diff borrow ends once the owned paths are collected, so
+        // the mutable discard borrow that follows does not conflict.
+        let summary: Vec<String> = match vault.canonical_and_working() {
+            Ok((canonical, working)) => {
+                let diff = stage::diff_pending(canonical, working);
+                diff.added
+                    .iter()
+                    .map(|a| a.path.clone())
+                    .chain(diff.modified.iter().map(|m| m.path.clone()))
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
 
         let num_dropped = match stage::discard_pending(&mut vault) {
             Ok(n) => n,
@@ -349,8 +366,7 @@ impl KdbxServer {
         self.emit(AuditEvent::StageDiscarded {
             reason: "manual".to_string(),
             num_dropped: num_dropped as u64,
-            // Paths-only summary; an empty list is acceptable for v0.1.
-            summary: Vec::new(),
+            summary,
         });
 
         responses::ok(serde_json::json!({
@@ -358,11 +374,4 @@ impl KdbxServer {
             "num_dropped": num_dropped,
         }))
     }
-}
-
-/// Format a `SystemTime` as `YYYY-MM-DDTHH:MM:SSZ` (UTC), for the save audit
-/// events' mtime fields. Mirrors the formatter in `lifecycle.rs`.
-fn format_system_time(time: std::time::SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Utc> = time.into();
-    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }

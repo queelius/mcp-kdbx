@@ -74,9 +74,9 @@ impl KdbxServer {
         description = "List the direct child groups of a group. Provide parent_path (defaults to '/', the root). Returns each child group's name, path, uuid, entry and subgroup counts, and notes. Metadata only."
     )]
     async fn kdbx_list_groups(&self, Parameters(params): Parameters<ListGroupsParams>) -> String {
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&ErrorCode::VaultLocked.into());
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
         let db = match vault.working_db() {
             Ok(db) => db,
@@ -108,9 +108,9 @@ impl KdbxServer {
         description = "List the direct entries of a group. Provide group_path. Returns each entry's title, path, uuid, username, url, a notes preview, custom field names with protected flags, attachment and otp flags, and the modified timestamp. Metadata only: no passwords or protected values."
     )]
     async fn kdbx_list_entries(&self, Parameters(params): Parameters<ListEntriesParams>) -> String {
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&ErrorCode::VaultLocked.into());
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
         let db = match vault.working_db() {
             Ok(db) => db,
@@ -143,9 +143,9 @@ impl KdbxServer {
         &self,
         Parameters(params): Parameters<ListAttachmentsParams>,
     ) -> String {
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&ErrorCode::VaultLocked.into());
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
         let db = match vault.working_db() {
             Ok(db) => db,
@@ -172,9 +172,9 @@ impl KdbxServer {
         description = "Fetch the full detail of an entry. Provide path. Returns title, path, uuid, username, url, full notes, custom field names with protected flags, attachment and otp flags, and the created, modified, and accessed timestamps. No password, protected values, or attachment bytes."
     )]
     async fn kdbx_get_entry(&self, Parameters(params): Parameters<GetEntryParams>) -> String {
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&ErrorCode::VaultLocked.into());
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
         let db = match vault.working_db() {
             Ok(db) => db,
@@ -200,9 +200,9 @@ impl KdbxServer {
         description = "Find entries whose fields contain a substring. Provide query and optionally fields (a subset of title, username, url, notes; default title, username, url). Returns matching entries in list-entry shape, the total matched_count, and a truncated flag set when more than 100 entries matched. Metadata only."
     )]
     async fn kdbx_find_entry(&self, Parameters(params): Parameters<FindEntryParams>) -> String {
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&ErrorCode::VaultLocked.into());
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
         let db = match vault.working_db() {
             Ok(db) => db,

@@ -128,7 +128,11 @@ pub enum ConfigError {
 /// The fully validated server configuration, derived from the environment at
 /// startup. Every field corresponds to one row of the spec section 2
 /// configuration surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is implemented by hand (see below) so that the two secret fields,
+/// `password` and `unlock_cmd`, never render their values. Deriving `Debug`
+/// would let a stray `tracing::debug!(?config)` leak the master password.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     /// Absolute path to the .kdbx vault. Required, and validated to exist and
     /// be a readable regular file.
@@ -168,6 +172,36 @@ pub struct Config {
     /// Append-only audit log path (`KDBX_LOG_FILE`). When unset, logs go to
     /// stderr only.
     pub log_file: Option<PathBuf>,
+}
+
+/// Hand-written `Debug` that redacts the two secret fields. `password` and
+/// `unlock_cmd` render as `Some("<redacted>")` when set and `None` when unset,
+/// so debug output reveals whether a secret source is configured without ever
+/// printing the secret itself. Every other field, including the path fields
+/// `keyfile_path` and `log_file` (paths, not secrets), prints normally. This is
+/// defense in depth: it makes `tracing::debug!(?config)` safe by construction.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Map each secret to a redaction marker that preserves only its
+        // set/unset shape, then format with the standard derived layout.
+        let password = self.password.as_ref().map(|_| "<redacted>");
+        let unlock_cmd = self.unlock_cmd.as_ref().map(|_| "<redacted>");
+        f.debug_struct("Config")
+            .field("vault_path", &self.vault_path)
+            .field("keyfile_path", &self.keyfile_path)
+            .field("password", &password)
+            .field("unlock_cmd", &unlock_cmd)
+            .field(
+                "unlock_cmd_timeout_seconds",
+                &self.unlock_cmd_timeout_seconds,
+            )
+            .field("allow_writes", &self.allow_writes)
+            .field("idle_timeout_seconds", &self.idle_timeout_seconds)
+            .field("auto_clean_orphans", &self.auto_clean_orphans)
+            .field("log_level", &self.log_level)
+            .field("log_file", &self.log_file)
+            .finish()
+    }
 }
 
 impl Config {
@@ -637,6 +671,40 @@ mod tests {
         );
         let err = Config::from_map(&vars).expect_err("should reject directory");
         assert!(matches!(err, ConfigError::VaultPathNotAFile { .. }));
+    }
+
+    #[test]
+    fn debug_redacts_password_and_unlock_cmd_when_set() {
+        let cfg = Config {
+            password: Some("hunter2".to_string()),
+            unlock_cmd: Some("pass show vault".to_string()),
+            ..Config::default()
+        };
+        let rendered = format!("{cfg:?}");
+        // The secret values must not appear anywhere in the debug output.
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("pass show vault"));
+        // Both secrets render as a set marker, showing presence without value.
+        assert!(rendered.contains("password: Some(\"<redacted>\")"));
+        assert!(rendered.contains("unlock_cmd: Some(\"<redacted>\")"));
+    }
+
+    #[test]
+    fn debug_shows_none_for_unset_secrets_and_keeps_paths() {
+        let cfg = Config {
+            password: None,
+            unlock_cmd: None,
+            keyfile_path: Some(PathBuf::from("/keys/vault.key")),
+            log_file: Some(PathBuf::from("/var/log/mcp-kdbx.jsonl")),
+            ..Config::default()
+        };
+        let rendered = format!("{cfg:?}");
+        // Unset secrets render as None: the shape is visible, no value to hide.
+        assert!(rendered.contains("password: None"));
+        assert!(rendered.contains("unlock_cmd: None"));
+        // Path fields are not secret and must still render their values.
+        assert!(rendered.contains("/keys/vault.key"));
+        assert!(rendered.contains("/var/log/mcp-kdbx.jsonl"));
     }
 
     #[test]

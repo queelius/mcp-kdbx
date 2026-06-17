@@ -35,6 +35,10 @@ pub enum ErrorCode {
     VaultFileModified,
     EntryTitleInvalid,
     FieldNameInvalid,
+    /// A caller-supplied value was malformed in a way the other codes do not
+    /// name (for example, an attachment whose base64 fails to decode). Distinct
+    /// from `FIELD_NAME_INVALID`, which is specifically about a bad field name.
+    InvalidInput,
 }
 
 impl ErrorCode {
@@ -58,6 +62,7 @@ impl ErrorCode {
             ErrorCode::VaultFileModified => "VAULT_FILE_MODIFIED",
             ErrorCode::EntryTitleInvalid => "ENTRY_TITLE_INVALID",
             ErrorCode::FieldNameInvalid => "FIELD_NAME_INVALID",
+            ErrorCode::InvalidInput => "INVALID_INPUT",
         }
     }
 
@@ -88,6 +93,7 @@ impl ErrorCode {
             ErrorCode::VaultFileModified => "The vault file changed on disk since it was unlocked.",
             ErrorCode::EntryTitleInvalid => "The entry title is invalid.",
             ErrorCode::FieldNameInvalid => "The field name is invalid.",
+            ErrorCode::InvalidInput => "A supplied value is invalid.",
         }
     }
 }
@@ -197,6 +203,7 @@ mod tests {
         (ErrorCode::VaultFileModified, "VAULT_FILE_MODIFIED"),
         (ErrorCode::EntryTitleInvalid, "ENTRY_TITLE_INVALID"),
         (ErrorCode::FieldNameInvalid, "FIELD_NAME_INVALID"),
+        (ErrorCode::InvalidInput, "INVALID_INPUT"),
     ];
 
     #[test]

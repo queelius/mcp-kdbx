@@ -416,7 +416,17 @@ fn map_added_entry(working: &Database, uuid: uuid::Uuid) -> Option<AddedEntry> {
     let title = entry_ref.get_title().unwrap_or("").to_string();
     let field_count = entry_ref.fields.len();
     let has_attachments = entry_ref.attachments_named().next().is_some();
-    let has_otp = entry_ref.get(fields::OTP).is_some();
+    // Route has_otp through the same resolver the read views use
+    // (src/adapter/views.rs), so kdbx_diff_pending and kdbx_list_entries agree on
+    // whether an entry has a usable TOTP source. This covers the modern `otp`
+    // field and the legacy "TOTP Seed" + "TOTP Settings" pair, not just a bare
+    // `otp` presence check.
+    let has_otp = crate::kdbx_core::totp::resolve_config(
+        entry_ref.get(fields::OTP),
+        entry_ref.get("TOTP Seed"),
+        entry_ref.get("TOTP Settings"),
+    )
+    .is_some();
 
     Some(AddedEntry {
         path,
@@ -700,6 +710,15 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> CoreResult<SystemTi
             .with_message(format!("writing the temp file failed: {e}")));
     }
 
+    // Preserve the user's file hardening across the rename. create_new opens the
+    // temp with the umask-default mode (typically 0644), which would silently
+    // downgrade a vault the user chmod'ed 0600. Copy the existing vault file's
+    // mode onto the temp before the rename when the vault file exists; for a
+    // brand-new vault (no existing file) fall back to 0600. A failure to read or
+    // set the mode is non-fatal: the save proceeds with the temp's default mode
+    // rather than refusing to write.
+    preserve_temp_permissions(path, &temp_path);
+
     // Atomic rename over the vault file.
     if let Err(e) = std::fs::rename(&temp_path, path) {
         let _ = std::fs::remove_file(&temp_path);
@@ -723,6 +742,29 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> CoreResult<SystemTi
 
     Ok(new_mtime)
 }
+
+/// Copy the existing vault file's permission bits onto the temp file so the
+/// atomic rename preserves the user's hardening. When the vault file does not
+/// yet exist (a first save), fall back to 0600 so a new vault is owner-only
+/// rather than world-readable. POSIX-only: it uses the Unix permission model
+/// directly. Any error reading or setting permissions is swallowed: the save is
+/// more important than the mode tweak, and the temp keeps its default mode.
+#[cfg(unix)]
+fn preserve_temp_permissions(vault_path: &std::path::Path, temp_path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let perms = match std::fs::metadata(vault_path) {
+        Ok(meta) => meta.permissions(),
+        // No existing vault file (first save): default to owner-only 0600.
+        Err(_) => std::fs::Permissions::from_mode(0o600),
+    };
+    let _ = std::fs::set_permissions(temp_path, perms);
+}
+
+/// Non-Unix fallback: there is no portable POSIX permission model to copy, so
+/// leave the temp file's default permissions in place.
+#[cfg(not(unix))]
+fn preserve_temp_permissions(_vault_path: &std::path::Path, _temp_path: &std::path::Path) {}
 
 /// A per-call suffix for the temp file name. There is no `rand` crate in the
 /// dependency set, so derive a value from the current time's nanos. Combined
@@ -1373,6 +1415,81 @@ mod tests {
         save_pending(&mut vault).expect("first save");
         let err = save_pending(&mut vault).expect_err("second save, nothing pending");
         assert_eq!(err.code_enum(), ErrorCode::NoPendingChanges);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_pending_preserves_0600_vault_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let db = build_db();
+        let (tmp, p) = write_fixture(&db);
+
+        // Harden the on-disk fixture to owner-only 0600 before unlock, the mode a
+        // security-conscious user would chmod a vault to. Setting permissions does
+        // not change the file's mtime, so the save-time mtime conflict check stays
+        // satisfied.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod fixture to 0600");
+        let before = std::fs::metadata(&p).expect("stat before").permissions();
+        assert_eq!(before.mode() & 0o777, 0o600, "fixture starts at 0600");
+
+        let mut vault = Vault::new(p.clone());
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+
+        // Stage a change and save: the atomic temp+rename must not downgrade the
+        // mode back to the umask default (typically 0644).
+        {
+            let working = vault.working_db_mut().expect("working");
+            add_entry(working, &path("/"), &simple_input("Hardened")).expect("stage add");
+        }
+        save_pending(&mut vault).expect("save");
+
+        let after = std::fs::metadata(&p).expect("stat after").permissions();
+        assert_eq!(
+            after.mode() & 0o777,
+            0o600,
+            "vault mode preserved across save_pending"
+        );
+
+        drop(tmp);
+    }
+
+    #[test]
+    fn diff_added_entry_with_legacy_otp_pair_sets_has_otp() {
+        // The modern-otp case is covered by diff_added_entry_with_otp_sets_has_otp.
+        // This pins the legacy "TOTP Seed" + "TOTP Settings" pair so the diff's
+        // has_otp agrees with the read views, which also route through
+        // totp::resolve_config.
+        let canonical = build_db();
+        let mut working = canonical.clone();
+        let input = EntryInput {
+            title: "Legacy OTP".to_string(),
+            fields: vec![
+                FieldInput {
+                    name: "TOTP Seed".to_string(),
+                    value: "JBSWY3DPEHPK3PXP".to_string(),
+                    protected: true,
+                },
+                FieldInput {
+                    name: "TOTP Settings".to_string(),
+                    value: "30;6".to_string(),
+                    protected: false,
+                },
+            ],
+            attachments: Vec::new(),
+        };
+        add_entry(&mut working, &path("/"), &input).expect("add legacy otp entry");
+        let d = diff_pending(&canonical, &working);
+        let a = d
+            .added
+            .iter()
+            .find(|a| a.title == "Legacy OTP")
+            .expect("legacy otp entry");
+        assert!(
+            a.has_otp,
+            "has_otp should be true for a legacy TOTP Seed + Settings pair"
+        );
     }
 
     // A small test-only helper on the output type, to keep assertions readable.
