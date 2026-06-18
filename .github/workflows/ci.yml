@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-test:
+    name: build, test, clippy, fmt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp-kdbx
+    steps:
+      # diff-kdbx is a path dependency (../diff-kdbx). Lay the two repos out as
+      # siblings under the workspace so the path dep resolves. This is the v0.1
+      # stopgap until diff-kdbx is published to crates.io; CI tracks diff-kdbx's
+      # default branch, which must carry the API mcp-kdbx builds against.
+      - name: Check out mcp-kdbx
+        uses: actions/checkout@v4
+        with:
+          path: mcp-kdbx
+      - name: Check out diff-kdbx (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: queelius/diff-kdbx
+          path: diff-kdbx
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mcp-kdbx
+      - name: Format check
+        run: cargo fmt --check
+      - name: Build
+        run: cargo build --all-features --verbose
+      # --all-features turns on `cli`, so clippy also lints the gen-fixtures
+      # helper binary.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-features --verbose
+
+  protocol-conformance:
+    name: protocol conformance
+    runs-on: ubuntu-latest
+    needs: rust-test
+    defaults:
+      run:
+        working-directory: mcp-kdbx
+    steps:
+      - name: Check out mcp-kdbx
+        uses: actions/checkout@v4
+        with:
+          path: mcp-kdbx
+      - name: Check out diff-kdbx (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: queelius/diff-kdbx
+          path: diff-kdbx
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mcp-kdbx
+      - name: Run the protocol-conformance suite against the real binary
+        run: cargo test --test protocol_conformance --verbose
+
+  audit:
+    name: source security audit
+    runs-on: ubuntu-latest
+    steps:
+      # The audit is a source grep; it needs no build and no sibling repo.
+      - name: Check out mcp-kdbx
+        uses: actions/checkout@v4
+      - name: Run the source security audit
+        run: bash scripts/ci-audit.sh

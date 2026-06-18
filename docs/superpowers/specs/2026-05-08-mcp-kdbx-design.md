@@ -3,7 +3,7 @@
 **Project:** mcp-kdbx (bridge member of the *-kdbx ecosystem)
 **Date:** 2026-05-08
 **Author:** Alexander Towell
-**Status:** Design (pending implementation plan)
+**Status:** Implemented through Phase 3 of the v0.1 plan (`docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md`) on branch `feat/v0.1`; Phases 4-5 (tests, CI, docs) pending. The design below is the historical v0.1 record; see CLAUDE.md for the three deliberate deviations from its letter.
 **Supersedes:** none (this is the v0.1 design)
 
 ## Goal
@@ -1066,3 +1066,43 @@ These are explicitly NOT in v0.1. Each is a known and intentional gap; revisit p
 - keepass-rs: github.com/sseemayer/keepass-rs (substrate library)
 - OmniKee: github.com/OmniKee/OmniKee (sibling KeePass-compatible app; informed the consent-gating design)
 - MCP specification: https://modelcontextprotocol.io
+
+---
+
+# Implementation notes (v0.1, 2026-06-15)
+
+Deviations from the design above, settled during the security-review fix batch.
+These are the authoritative wire contract for v0.1; the conformance tests assert
+against them.
+
+- **Error enumeration: added `INVALID_INPUT`.** A caller-supplied value that is
+  malformed in a way the listed codes do not name (specifically, an attachment
+  whose base64 fails to decode in `kdbx_add_entry`) returns `INVALID_INPUT`, not
+  `FIELD_NAME_INVALID` (which is reserved for a bad field name). A malformed
+  per-call `keyfile_bytes`, or an unreadable configured keyfile, stays
+  `AUTH_FAILED` (it is an authentication credential) and emits `auth_failed`.
+
+- **`kdbx_add_entry`: `created_at` / `modified_at` deferred.** The optional
+  timestamp inputs in the section 1 schema are not implemented for v0.1. The
+  `gen-fixtures` binary, their intended consumer, sets times through the keepass
+  API directly, so the tool path does not need them yet. Revisit if a real
+  caller needs to set entry times.
+
+- **`tool_call` (debug) and `mcp_message` (trace) audit events deferred.** Those
+  rows of the section 6 logged-events table are not emitted in v0.1, and the
+  redaction helper they would have used was removed. Payload leakage at
+  debug/trace is prevented instead by capping rmcp's tracing verbosity
+  (`rmcp=warn`) in `main.rs`, so `KDBX_LOG_LEVEL=debug` no longer prints raw
+  JSON-RPC payloads (which contain the master password and revealed secrets).
+  A redaction layer must be restored if this capture is wired later (the HTTP
+  adapter is the likely place).
+
+- **`KDBX_KEYFILE_PATH` precedence.** When both a per-call `keyfile_bytes` and a
+  configured `KDBX_KEYFILE_PATH` are present, the per-call value wins (mirroring
+  the password source order). When only the configured path is set, it is read
+  at unlock.
+
+- **`kdbx_status.idle_timeout_remaining_seconds`** reports the live countdown
+  when unlocked (status counts as activity, so it is the full window after a
+  status call), and `null` when locked or when idle lock is disabled
+  (`KDBX_IDLE_TIMEOUT_SECONDS=0`).
