@@ -10,7 +10,7 @@ User-facing summary: `README.md`. Full v0.1 design (motivation, protocol surface
 
 ## Status
 
-**All five v0.1 phases complete (the full server, its automated test suite, CI gates, and docs), on branch `feat/v0.1`, not yet pushed. v0.1 is feature-complete, pending merge and a crates.io release.**
+**All five v0.1 phases complete (the full server, its automated test suite, CI gates, and docs). Merged to `main` locally (merge commit, `feat/v0.1` deleted); `main` is ahead of `origin/main` and not yet pushed. v0.1 is feature-complete, pending a crates.io release.**
 
 The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 226 tests pass (194 library unit tests, 27 protocol-conformance, 5 integration); `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the source security audit (`bash scripts/ci-audit.sh`) are clean. The server runs: all 17 tools register and respond over real stdio MCP.
 
@@ -32,7 +32,7 @@ Two error codes are not reachable from a black-box protocol test and stay covere
 
 Phase 5 (tasks 23 to 26): `.github/workflows/ci.yml` (rust-test, protocol-conformance, and source-audit jobs; checks out the sibling `diff-kdbx` so the path dep resolves), `scripts/ci-audit.sh` (seven source-invariant grep checks), `docs/operations.md` (config, secret managers, audit log, posture), and the README polish (status, quick start, CI badge). The CI gate runs `cargo fmt --check`, `cargo test --all-features`, and `cargo clippy --all-targets --all-features -- -D warnings` (the `--all-features` is needed to lint the `cli`-gated `gen-fixtures` helper).
 
-Remaining for release (not v0.1 plan tasks): merge `feat/v0.1` to `main`, run the `docs/manual-testing.md` smoke against a real host, then migrate the `diff-kdbx` path dependency to a crates.io (or git) version and publish. The CI currently checks out `diff-kdbx`'s default branch as a sibling, so it depends on that branch carrying the API mcp-kdbx builds against (the local `diff-kdbx` HEAD with the needed API may be ahead of its pushed `main`).
+Remaining for release (not v0.1 plan tasks): push `main` to `origin`, run the `docs/manual-testing.md` smoke against a real host, then migrate the `diff-kdbx` path dependency to a crates.io (or git) version and publish. The CI currently checks out `diff-kdbx`'s default branch as a sibling, so it depends on that branch carrying the API mcp-kdbx builds against (the local `diff-kdbx` HEAD with the needed API may be ahead of its pushed `main`; pushing diff-kdbx or pinning the CI checkout removes the risk before the first CI run).
 
 ## Position in the ecosystem
 

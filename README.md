@@ -14,7 +14,8 @@ The sibling members are `diff-kdbx` (semantic-diff CLI and library) and
 
 ## Status
 
-**v0.1 feature-complete on branch `feat/v0.1`, pending merge and release.** All
+**v0.1 feature-complete, merged to `main` locally (not yet pushed); pending
+release.** All
 five phases of the v0.1 plan are done: the 17-tool server (built on `rmcp` 1.7.0),
 the stage-then-commit write path, and the full test suite. 226 tests pass (194
 library, 27 protocol-conformance against the real binary over stdio, 5
