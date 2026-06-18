@@ -21,7 +21,6 @@ use crate::kdbx_core::path::VaultPath;
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
-use sha2::{Digest, Sha256};
 
 /// Size (in bytes) above which a downloaded attachment gets a warn log entry.
 /// It is not a rejection threshold: KDBX places no cap and neither do we (spec
@@ -74,9 +73,9 @@ impl KdbxServer {
         &self,
         Parameters(params): Parameters<RevealPasswordParams>,
     ) -> String {
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&ErrorCode::VaultLocked.into());
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
         let db = match vault.working_db() {
             Ok(db) => db,
@@ -128,9 +127,9 @@ impl KdbxServer {
         &self,
         Parameters(params): Parameters<RevealProtectedParams>,
     ) -> String {
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&ErrorCode::VaultLocked.into());
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
         let db = match vault.working_db() {
             Ok(db) => db,
@@ -191,9 +190,9 @@ impl KdbxServer {
         &self,
         Parameters(params): Parameters<DownloadAttachmentParams>,
     ) -> String {
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&ErrorCode::VaultLocked.into());
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
         let db = match vault.working_db() {
             Ok(db) => db,
@@ -240,7 +239,7 @@ impl KdbxServer {
         // The content sha256 is a plain digest fingerprint of the bytes (spec
         // section 1: the download_attachment event carries the content sha256),
         // not the domain-separated reveal hash, which is for string secrets.
-        let content_sha256 = sha256_hex(&bytes);
+        let content_sha256 = crate::adapter::views::sha256_hex(&bytes);
         let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
         self.emit(AuditEvent::DownloadAttachment {
@@ -266,9 +265,9 @@ impl KdbxServer {
         description = "Compute the current TOTP code for an entry. Reads the modern otp field (otpauth URI) or the legacy TOTP Seed and TOTP Settings pair. Returns the code with its remaining validity and period. The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
     )]
     async fn kdbx_get_otp(&self, Parameters(params): Parameters<GetOtpParams>) -> String {
-        let vault = self.vault().await;
+        let mut vault = self.vault().await;
         if !vault.is_unlocked() {
-            return responses::err(&ErrorCode::VaultLocked.into());
+            return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
         let db = match vault.working_db() {
             Ok(db) => db,
@@ -319,16 +318,4 @@ impl KdbxServer {
             "period_seconds": code.period_seconds,
         }))
     }
-}
-
-/// Lowercase hex SHA-256 of `bytes`. Used as the attachment content fingerprint
-/// (metadata, not a reveal of a string secret), so it is a plain digest with no
-/// domain prefix, matching `views::attachment_list`.
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
 }

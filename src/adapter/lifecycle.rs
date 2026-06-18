@@ -6,19 +6,19 @@
 //! `KDBX_UNLOCK_CMD`), never logs it, and emits `vault_unlocked` or
 //! `auth_failed` to the audit trail.
 
+use crate::adapter::views::format_system_time;
 use crate::adapter::{KEEPASS_RS_VERSION, KdbxServer, responses};
 use crate::kdbx_core::audit::AuditEvent;
-use crate::kdbx_core::config::Config;
 use crate::kdbx_core::error::{CoreError, ErrorCode};
 use crate::kdbx_core::unlock::resolve_unlock_source;
 use crate::kdbx_core::vault::LockReason;
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
-use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 /// Input for `kdbx_unlock`: an optional password and an optional base64 keyfile.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct UnlockParams {
     /// The master password. When omitted, the server resolves it from
     /// `KDBX_PASSWORD` or `KDBX_UNLOCK_CMD`.
@@ -27,6 +27,21 @@ pub struct UnlockParams {
     /// An optional keyfile for two-factor unlock, base64-encoded.
     #[serde(default)]
     pub keyfile_bytes: Option<String>,
+}
+
+/// Hand-written `Debug` that never prints the secrets. Both fields render as
+/// `Some("<redacted>")`/`None`, so a stray `tracing::debug!(?params)` reveals
+/// only whether a password or keyfile was supplied, never the value.
+impl std::fmt::Debug for UnlockParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnlockParams")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field(
+                "keyfile_bytes",
+                &self.keyfile_bytes.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[tool_router(router = lifecycle_router, vis = "pub(crate)")]
@@ -52,9 +67,15 @@ impl KdbxServer {
         } else {
             Some(vault.has_pending_changes())
         };
-        // The idle-timer task in main owns the countdown; report null here while
-        // honoring the "null when locked" contract.
-        let idle_remaining: Option<u64> = None;
+        // Seconds until the idle timer would lock the vault if no further tool
+        // call arrives. None when locked or when idle lock is disabled
+        // (KDBX_IDLE_TIMEOUT_SECONDS=0), both of which serialize to null per the
+        // spec. self.vault() above touched last_activity (status is a keep-alive),
+        // so this reports the full window from now.
+        let idle_remaining = vault.idle_remaining(
+            Instant::now(),
+            Duration::from_secs(self.config.idle_timeout_seconds),
+        );
 
         responses::ok(serde_json::json!({
             "locked": locked,
@@ -80,25 +101,42 @@ impl KdbxServer {
         }
 
         // Resolve the password (tool input wins, then env, then command). The
-        // result is zeroized on drop and never logged.
-        let source = unlock_source_label(params.password.as_deref(), &self.config);
-        let password = match resolve_unlock_source(params.password.as_deref(), &self.config).await {
-            Ok(pw) => pw,
+        // result is zeroized on drop and never logged. resolve_unlock_source
+        // returns the source it actually used, so the audit label cannot drift
+        // from the resolution order.
+        let (password, source) =
+            match resolve_unlock_source(params.password.as_deref(), &self.config).await {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    if e.code_enum() == ErrorCode::AuthFailed {
+                        // The source the command path tried; resolution failed
+                        // before returning one, so label it "cmd" (the only
+                        // source that can fail with AUTH_FAILED here).
+                        self.emit(AuditEvent::AuthFailed {
+                            source: "cmd".to_string(),
+                            error_code: e.code().to_string(),
+                        });
+                    }
+                    return responses::err(&e);
+                }
+            };
+        let source_label = source.as_str().to_string();
+
+        // Resolve the keyfile: the per-call keyfile_bytes wins; otherwise fall
+        // back to the configured KDBX_KEYFILE_PATH (mirrors the password source
+        // precedence). A malformed or unreadable keyfile is AUTH_FAILED and is
+        // audited like the other failed-unlock paths.
+        let keyfile = match resolve_keyfile_bytes(&params, &self.config) {
+            Ok(bytes) => bytes,
             Err(e) => {
                 if e.code_enum() == ErrorCode::AuthFailed {
                     self.emit(AuditEvent::AuthFailed {
-                        source: source.to_string(),
+                        source: source_label.clone(),
                         error_code: e.code().to_string(),
                     });
                 }
                 return responses::err(&e);
             }
-        };
-
-        // Decode the optional keyfile.
-        let keyfile = match decode_keyfile(params.keyfile_bytes.as_deref()) {
-            Ok(bytes) => bytes,
-            Err(e) => return responses::err(&e),
         };
 
         match vault.unlock(&password, keyfile.as_deref()) {
@@ -109,7 +147,7 @@ impl KdbxServer {
                     .map(format_system_time)
                     .unwrap_or_default();
                 self.emit(AuditEvent::VaultUnlocked {
-                    unlock_source: source.to_string(),
+                    unlock_source: source_label.clone(),
                     file_mtime,
                 });
                 let vault_name = vault
@@ -125,7 +163,7 @@ impl KdbxServer {
             Err(e) => {
                 if e.code_enum() == ErrorCode::AuthFailed {
                     self.emit(AuditEvent::AuthFailed {
-                        source: source.to_string(),
+                        source: source_label.clone(),
                         error_code: e.code().to_string(),
                     });
                 }
@@ -153,39 +191,34 @@ impl KdbxServer {
     }
 }
 
-/// Which password source `resolve_unlock_source` will use, for the audit event.
-/// Mirrors that function's priority order (input, then env, then command).
-fn unlock_source_label(input: Option<&str>, config: &Config) -> &'static str {
-    if input.is_some() {
-        "input"
-    } else if config.password.is_some() {
-        "env"
-    } else if config.unlock_cmd.is_some() {
-        "cmd"
-    } else {
-        // Unreachable when resolution succeeded; resolution returns
-        // UNLOCK_SOURCE_MISSING before any unlock is attempted.
-        "input"
-    }
-}
-
-/// Decode the optional base64 keyfile. A malformed value is an AUTH_FAILED with
-/// a clear reason rather than a generic decode error.
-fn decode_keyfile(encoded: Option<&str>) -> Result<Option<Vec<u8>>, CoreError> {
-    match encoded {
-        None => Ok(None),
-        Some(s) => base64::engine::general_purpose::STANDARD
-            .decode(s)
+/// Resolve the keyfile bytes for an unlock, honoring source precedence: the
+/// per-call `keyfile_bytes` (base64) wins, otherwise the configured
+/// `KDBX_KEYFILE_PATH` is read from disk, otherwise there is no keyfile.
+///
+/// Either source failing (malformed base64, or an unreadable configured path)
+/// is `AUTH_FAILED` with a clear message, which the caller audits like the other
+/// failed-unlock paths. Returning a typed error here, rather than emitting,
+/// keeps the audit emission in the tool body next to the password path.
+fn resolve_keyfile_bytes(
+    params: &UnlockParams,
+    config: &crate::kdbx_core::config::Config,
+) -> Result<Option<Vec<u8>>, CoreError> {
+    if let Some(encoded) = params.keyfile_bytes.as_deref() {
+        return base64::engine::general_purpose::STANDARD
+            .decode(encoded)
             .map(Some)
             .map_err(|_| {
                 CoreError::new(ErrorCode::AuthFailed)
                     .with_message("keyfile_bytes is not valid base64")
-            }),
+            });
     }
-}
-
-/// Format a `SystemTime` as `YYYY-MM-DDTHH:MM:SSZ` (UTC).
-fn format_system_time(time: SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Utc> = time.into();
-    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    match &config.keyfile_path {
+        Some(path) => std::fs::read(path).map(Some).map_err(|io| {
+            CoreError::new(ErrorCode::AuthFailed).with_message(format!(
+                "could not read configured keyfile at {}: {io}",
+                path.display()
+            ))
+        }),
+        None => Ok(None),
+    }
 }

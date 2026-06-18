@@ -33,11 +33,42 @@ use zeroize::Zeroizing;
 use crate::kdbx_core::config::Config;
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 
+/// Which of the three sources actually produced the master password.
+///
+/// This is the single source of truth for the audit `unlock_source` label. The
+/// adapter records whatever [`resolve_unlock_source`] returns rather than
+/// re-deriving the label from the config, so the audit cannot drift from the
+/// priority order applied here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockSource {
+    /// The `password` argument passed to the tool call.
+    Input,
+    /// `KDBX_PASSWORD` from the environment.
+    Env,
+    /// The stdout of `KDBX_UNLOCK_CMD`.
+    Cmd,
+}
+
+impl UnlockSource {
+    /// The stable audit label for this source: "input", "env", or "cmd".
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnlockSource::Input => "input",
+            UnlockSource::Env => "env",
+            UnlockSource::Cmd => "cmd",
+        }
+    }
+}
+
 /// Resolve the master password from the first available source, in priority
 /// order: the `input_password` argument, then `config.password`
 /// (`KDBX_PASSWORD`), then the stdout of `config.unlock_cmd` (`KDBX_UNLOCK_CMD`).
 ///
-/// Returns the password wrapped in [`Zeroizing`] so it is scrubbed on drop.
+/// Returns the password wrapped in [`Zeroizing`] so it is scrubbed on drop,
+/// paired with the [`UnlockSource`] that produced it. The source is the
+/// authoritative audit `unlock_source` label: callers record it directly
+/// instead of re-deriving it, which keeps the audit aligned with the priority
+/// order applied here.
 ///
 /// Errors:
 /// - [`ErrorCode::AuthFailed`] when the unlock command exits non-zero (details
@@ -47,20 +78,21 @@ use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 pub async fn resolve_unlock_source(
     input_password: Option<&str>,
     config: &Config,
-) -> CoreResult<Zeroizing<String>> {
+) -> CoreResult<(Zeroizing<String>, UnlockSource)> {
     // (a) An explicit per-call password wins over any configured source.
     if let Some(pw) = input_password {
-        return Ok(Zeroizing::new(pw.to_string()));
+        return Ok((Zeroizing::new(pw.to_string()), UnlockSource::Input));
     }
 
     // (b) KDBX_PASSWORD, injected directly into the environment.
     if let Some(pw) = config.password.as_deref() {
-        return Ok(Zeroizing::new(pw.to_string()));
+        return Ok((Zeroizing::new(pw.to_string()), UnlockSource::Env));
     }
 
     // (c) KDBX_UNLOCK_CMD: shell out to a secret manager and read its stdout.
     if let Some(cmd) = config.unlock_cmd.as_deref() {
-        return run_unlock_cmd(cmd, config.unlock_cmd_timeout_seconds).await;
+        let pw = run_unlock_cmd(cmd, config.unlock_cmd_timeout_seconds).await?;
+        return Ok((pw, UnlockSource::Cmd));
     }
 
     // (d) Nothing to unlock with.
@@ -82,7 +114,11 @@ async fn run_unlock_cmd(cmd: &str, timeout_seconds: u64) -> CoreResult<Zeroizing
         .arg(cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Reap the child if this future is dropped (for example, when the
+        // timeout below fires). Without this, a hung unlock command would be
+        // left running after we stop waiting on it.
+        .kill_on_drop(true);
 
     let run = command.output();
     let timeout = Duration::from_secs(timeout_seconds);
@@ -154,10 +190,11 @@ mod tests {
         cfg.password = Some("from-env".to_string());
         cfg.unlock_cmd = Some("printf should-not-run".to_string());
 
-        let pw = resolve_unlock_source(Some("from-input"), &cfg)
+        let (pw, source) = resolve_unlock_source(Some("from-input"), &cfg)
             .await
             .expect("input password resolves");
         assert_eq!(&*pw, "from-input");
+        assert_eq!(source, UnlockSource::Input);
     }
 
     #[tokio::test]
@@ -167,10 +204,11 @@ mod tests {
         // A command is also configured, but the env password outranks it.
         cfg.unlock_cmd = Some("printf should-not-run".to_string());
 
-        let pw = resolve_unlock_source(None, &cfg)
+        let (pw, source) = resolve_unlock_source(None, &cfg)
             .await
             .expect("env password resolves");
         assert_eq!(&*pw, "env-secret");
+        assert_eq!(source, UnlockSource::Env);
     }
 
     #[tokio::test]
@@ -180,10 +218,11 @@ mod tests {
         // Use echo to confirm the trailing newline is stripped.
         cfg.unlock_cmd = Some("echo secretpw".to_string());
 
-        let pw = resolve_unlock_source(None, &cfg)
+        let (pw, source) = resolve_unlock_source(None, &cfg)
             .await
             .expect("command password resolves");
         assert_eq!(&*pw, "secretpw");
+        assert_eq!(source, UnlockSource::Cmd);
     }
 
     #[tokio::test]
@@ -191,10 +230,11 @@ mod tests {
         let mut cfg = base_config();
         cfg.unlock_cmd = Some("printf secretpw".to_string());
 
-        let pw = resolve_unlock_source(None, &cfg)
+        let (pw, source) = resolve_unlock_source(None, &cfg)
             .await
             .expect("command password resolves");
         assert_eq!(&*pw, "secretpw");
+        assert_eq!(source, UnlockSource::Cmd);
     }
 
     #[tokio::test]
@@ -237,6 +277,15 @@ mod tests {
         assert_eq!(err.code_enum(), ErrorCode::UnlockSourceMissing);
     }
 
+    #[test]
+    fn unlock_source_labels_are_stable() {
+        // These strings are the audit unlock_source label; pin them so a rename
+        // of an enum variant cannot silently change the audit contract.
+        assert_eq!(UnlockSource::Input.as_str(), "input");
+        assert_eq!(UnlockSource::Env.as_str(), "env");
+        assert_eq!(UnlockSource::Cmd.as_str(), "cmd");
+    }
+
     #[tokio::test]
     async fn empty_input_password_is_still_used() {
         // An explicitly empty string is a present source: it short-circuits
@@ -245,9 +294,10 @@ mod tests {
         let mut cfg = base_config();
         cfg.password = Some("env-secret".to_string());
 
-        let pw = resolve_unlock_source(Some(""), &cfg)
+        let (pw, source) = resolve_unlock_source(Some(""), &cfg)
             .await
             .expect("empty input password resolves");
         assert_eq!(&*pw, "");
+        assert_eq!(source, UnlockSource::Input);
     }
 }

@@ -22,9 +22,14 @@
 //!
 //! - Plaintext values never appear in any event. Reveal events carry a sha256
 //!   hash via [`hash_revealed`], never the value.
-//! - The master password and unlock-command output never appear anywhere. The
-//!   `mcp_message` trace capture is scrubbed with [`redact_password_in_payload`]
-//!   before it is logged.
+//! - The master password and unlock-command output never appear anywhere.
+//!
+//! Deferred beyond v0.1: debug/trace JSON-RPC payload capture (the spec's
+//! `tool_call` and `mcp_message` events). Those events were never wired into a
+//! call site. The actual leak risk (rmcp Debug-logging raw JSON-RPC payloads
+//! that contain secrets) is prevented in `main.rs` by capping rmcp's tracing
+//! verbosity, not by emitting redacted copies of those payloads here. If the
+//! capture is added later, it must restore a redaction layer before logging.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -145,18 +150,6 @@ pub enum AuditEvent {
         target_path: String,
         target_uuid: String,
     },
-    /// Tool entry/exit at debug level. `params` has sensitive fields redacted
-    /// by the caller before construction.
-    ToolCall {
-        tool: String,
-        params: Value,
-        duration_ms: u64,
-        /// The error code string if the call failed; null on success.
-        error_code: Option<String>,
-    },
-    /// Raw JSON-RPC payload capture at trace level. `payload` MUST already be
-    /// passed through [`redact_password_in_payload`] by the caller.
-    McpMessage { direction: String, payload: Value },
 }
 
 impl AuditEvent {
@@ -176,8 +169,6 @@ impl AuditEvent {
             AuditEvent::RevealProtected { .. } => "reveal_protected",
             AuditEvent::DownloadAttachment { .. } => "download_attachment",
             AuditEvent::GetOtp { .. } => "get_otp",
-            AuditEvent::ToolCall { .. } => "tool_call",
-            AuditEvent::McpMessage { .. } => "mcp_message",
         }
     }
 
@@ -198,8 +189,6 @@ impl AuditEvent {
             AuditEvent::RevealProtected { .. } => Level::Info,
             AuditEvent::DownloadAttachment { .. } => Level::Info,
             AuditEvent::GetOtp { .. } => Level::Info,
-            AuditEvent::ToolCall { .. } => Level::Debug,
-            AuditEvent::McpMessage { .. } => Level::Trace,
         }
     }
 
@@ -321,21 +310,6 @@ impl AuditEvent {
                 "target_path": target_path,
                 "target_uuid": target_uuid,
             }),
-            AuditEvent::ToolCall {
-                tool,
-                params,
-                duration_ms,
-                error_code,
-            } => json!({
-                "tool": tool,
-                "params": params,
-                "duration_ms": duration_ms,
-                "error_code": error_code,
-            }),
-            AuditEvent::McpMessage { direction, payload } => json!({
-                "direction": direction,
-                "payload": payload,
-            }),
         }
     }
 
@@ -375,36 +349,6 @@ pub fn hash_revealed(value: &str) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
-}
-
-/// Overwrite any `password` field in a JSON-RPC payload with `"<redacted>"`.
-///
-/// The `mcp_message` trace capture may carry a `kdbx_unlock` call whose params
-/// include the master password. The JSON-RPC shape nests call arguments under
-/// `params`, so this checks both the top-level object and a nested `params`
-/// object (and `params.arguments`, which is where MCP tool args live). Other
-/// fields are left untouched.
-pub fn redact_password_in_payload(payload: &mut Value) {
-    redact_in_object(payload);
-    if let Some(params) = payload.get_mut("params") {
-        redact_in_object(params);
-        if let Some(arguments) = params.get_mut("arguments") {
-            redact_in_object(arguments);
-        }
-    }
-}
-
-/// If `value` is an object with a `password` key, replace its value with the
-/// redaction marker. A no-op for non-objects and objects without the key.
-fn redact_in_object(value: &mut Value) {
-    if let Some(obj) = value.as_object_mut() {
-        if obj.contains_key("password") {
-            obj.insert(
-                "password".to_string(),
-                Value::String("<redacted>".to_string()),
-            );
-        }
-    }
 }
 
 /// Writes audit events as JSONL to stderr and, if configured, to a file.
@@ -581,24 +525,6 @@ mod tests {
                 "get_otp",
                 Level::Info,
             ),
-            (
-                AuditEvent::ToolCall {
-                    tool: "kdbx_list_entries".to_string(),
-                    params: json!({ "path": "/Web" }),
-                    duration_ms: 3,
-                    error_code: None,
-                },
-                "tool_call",
-                Level::Debug,
-            ),
-            (
-                AuditEvent::McpMessage {
-                    direction: "inbound".to_string(),
-                    payload: json!({ "method": "tools/call" }),
-                },
-                "mcp_message",
-                Level::Trace,
-            ),
         ]
     }
 
@@ -744,69 +670,6 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_ne!(hash_revealed(value), plain_hex);
-    }
-
-    #[test]
-    fn redact_replaces_top_level_password() {
-        let mut payload = json!({
-            "method": "kdbx_unlock",
-            "password": "hunter2",
-        });
-        redact_password_in_payload(&mut payload);
-        assert_eq!(payload["password"], json!("<redacted>"));
-        // Other fields untouched.
-        assert_eq!(payload["method"], json!("kdbx_unlock"));
-    }
-
-    #[test]
-    fn redact_replaces_nested_params_password() {
-        // JSON-RPC shape: the password sits under params.
-        let mut payload = json!({
-            "jsonrpc": "2.0",
-            "method": "kdbx_unlock",
-            "params": {
-                "password": "hunter2",
-                "vault": "/vault.kdbx",
-            },
-        });
-        redact_password_in_payload(&mut payload);
-        assert_eq!(payload["params"]["password"], json!("<redacted>"));
-        // Sibling field under params is preserved.
-        assert_eq!(payload["params"]["vault"], json!("/vault.kdbx"));
-        // Top-level fields preserved.
-        assert_eq!(payload["method"], json!("kdbx_unlock"));
-    }
-
-    #[test]
-    fn redact_replaces_password_under_params_arguments() {
-        // MCP tools/call shape: arguments nested under params.arguments.
-        let mut payload = json!({
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {
-                "name": "kdbx_unlock",
-                "arguments": {
-                    "password": "hunter2",
-                },
-            },
-        });
-        redact_password_in_payload(&mut payload);
-        assert_eq!(
-            payload["params"]["arguments"]["password"],
-            json!("<redacted>")
-        );
-        assert_eq!(payload["params"]["name"], json!("kdbx_unlock"));
-    }
-
-    #[test]
-    fn redact_is_noop_without_password_key() {
-        let mut payload = json!({
-            "method": "kdbx_list_entries",
-            "params": { "path": "/Web" },
-        });
-        let before = payload.clone();
-        redact_password_in_payload(&mut payload);
-        assert_eq!(payload, before);
     }
 
     #[test]

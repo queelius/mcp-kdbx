@@ -72,7 +72,7 @@ These are non-negotiable from the spec; flag any change that violates them as a 
 
 - **Bulk reads never expose protected values.** `kdbx_list_entries`, `kdbx_get_entry`, `kdbx_find_entry`, `kdbx_list_attachments` return metadata only (including the `protected: bool` flag per field). Reveal requires a separate per-call event.
 - **Reveal events log a sha256 of the value, never the value.** Domain prefix: `kdbx-reveal-v1\0`. Plaintext values appear in logs only at `trace` level (explicit opt-in, documented warning).
-- **Master password and `KDBX_UNLOCK_CMD` output never appear in any log.** `mcp_message` capture redacts the `password` parameter on `kdbx_unlock`.
+- **Master password and `KDBX_UNLOCK_CMD` output never appear in any log.** v0.1 ensures this by capping rmcp's tracing verbosity (`rmcp=warn` in `main.rs`) so the SDK never debug-logs raw JSON-RPC payloads (which carry the password and revealed secrets), and by hand-written redacting `Debug` on `Config` and `UnlockParams`. The spec's `mcp_message` trace capture is deferred (see the spec's implementation notes); if it lands later, it must redact before logging.
 - **Writes default off.** `KDBX_ALLOW_WRITES` MUST be exactly `"true"` to enable; other values rejected at startup.
 - **Stage-then-commit.** Writes mutate `working_db`; nothing hits disk until `kdbx_save_pending`. Lock (any reason) discards the stage; the next tool call returns VAULT_LOCKED with the discarded summary.
 - **Save atomicity via temp+fsync+rename+fsync(parent).** No partial-file window on power loss.

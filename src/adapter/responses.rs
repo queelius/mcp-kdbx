@@ -11,9 +11,35 @@
 //! locked vault or a missing entry is a normal, expected outcome the agent
 //! should see and reason about, not a transport error.
 
-use crate::kdbx_core::error::CoreError;
+use crate::kdbx_core::error::{CoreError, ErrorCode};
+use crate::kdbx_core::vault::LockInfo;
 use serde::Serialize;
 use serde_json::json;
+
+/// Build the `VAULT_LOCKED` error for a tool that found the vault locked.
+///
+/// The first tool call after a lock should say what staged work the lock
+/// discarded, so the agent can recover (re-unlock, re-stage). The caller passes
+/// the result of [`crate::kdbx_core::vault::Vault::take_last_lock`]: when it is
+/// `Some`, the error carries `details { lock_reason, pending_discarded_count,
+/// pending_discarded_summary }`; when it is `None` (no prior lock to report, or
+/// the details were already taken by an earlier call), the error is a bare
+/// `VAULT_LOCKED` with no details.
+///
+/// `take_last_lock` clears the stash, so only the first locked-tool call after a
+/// lock gets the details; subsequent calls get the bare error. This is the
+/// single place that shape is built, so every tool reports it the same way.
+pub fn locked_error(last_lock: Option<LockInfo>) -> CoreError {
+    let base = CoreError::new(ErrorCode::VaultLocked);
+    match last_lock {
+        Some(info) => base.with_details(json!({
+            "lock_reason": info.reason,
+            "pending_discarded_count": info.pending_discarded_count,
+            "pending_discarded_summary": info.summary,
+        })),
+        None => base,
+    }
+}
 
 /// Serialize a successful tool payload into the `{ ok: true, data }` envelope
 /// string.
@@ -94,6 +120,32 @@ mod tests {
     #[test]
     fn err_without_details_omits_the_key() {
         let s = err(&CoreError::new(ErrorCode::VaultLocked));
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"]["code"], json!("VAULT_LOCKED"));
+        assert!(v["error"].get("details").is_none());
+    }
+
+    #[test]
+    fn locked_error_with_info_carries_discard_details() {
+        let info = LockInfo {
+            reason: "idle_timeout".to_string(),
+            pending_discarded_count: 2,
+            summary: vec!["/Web/GitHub".to_string(), "/Web/GitLab".to_string()],
+        };
+        let s = err(&locked_error(Some(info)));
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"]["code"], json!("VAULT_LOCKED"));
+        assert_eq!(v["error"]["details"]["lock_reason"], json!("idle_timeout"));
+        assert_eq!(v["error"]["details"]["pending_discarded_count"], json!(2));
+        assert_eq!(
+            v["error"]["details"]["pending_discarded_summary"],
+            json!(["/Web/GitHub", "/Web/GitLab"])
+        );
+    }
+
+    #[test]
+    fn locked_error_without_info_is_bare() {
+        let s = err(&locked_error(None));
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["error"]["code"], json!("VAULT_LOCKED"));
         assert!(v["error"].get("details").is_none());

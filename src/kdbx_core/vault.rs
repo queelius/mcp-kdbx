@@ -39,6 +39,38 @@ pub enum LockReason {
     Shutdown,
 }
 
+impl LockReason {
+    /// The stable lowercase label used in audit events and the [`LockInfo`]
+    /// returned to the adapter. The adapter attaches this to the
+    /// `VAULT_LOCKED` error so the first call after a lock can say why.
+    pub fn label(self) -> &'static str {
+        match self {
+            LockReason::Manual => "manual",
+            LockReason::IdleTimeout => "idle_timeout",
+            LockReason::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// What a lock discarded, captured at lock time so the first tool call after a
+/// lock can report what staged work was thrown away (spec section 2, "Pending
+/// changes on lock").
+///
+/// The adapter takes this once (via [`Vault::take_last_lock`]) and attaches it
+/// to the next `VAULT_LOCKED` error. `reason` is the [`LockReason::label`]
+/// string; `pending_discarded_count` is the number of added plus modified
+/// entries that were dropped; `summary` is their human-readable vault paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockInfo {
+    /// The lock reason as a stable label: `"manual"`, `"idle_timeout"`, or
+    /// `"shutdown"`.
+    pub reason: String,
+    /// How many staged entries (added plus modified) the lock discarded.
+    pub pending_discarded_count: usize,
+    /// The vault paths of the discarded added and modified entries.
+    pub summary: Vec<String>,
+}
+
 /// The two states a vault can be in.
 ///
 /// `Locked` carries no secrets. `Unlocked` owns everything that must be zeroed
@@ -83,6 +115,10 @@ pub struct Vault {
     path: PathBuf,
     /// The current lock state.
     state: VaultState,
+    /// What the most recent lock discarded, if any, and not yet reported. Set
+    /// by [`lock`](Self::lock) when there was staged work, cleared by a
+    /// successful [`unlock`](Self::unlock) and by [`take_last_lock`](Self::take_last_lock).
+    last_lock: Option<LockInfo>,
 }
 
 impl Vault {
@@ -92,6 +128,7 @@ impl Vault {
         Vault {
             path,
             state: VaultState::Locked,
+            last_lock: None,
         }
     }
 
@@ -159,39 +196,83 @@ impl Vault {
             file_mtime_at_unlock,
         };
 
+        // A fresh session has no prior discard to report. Clear any LockInfo
+        // left over from an earlier lock so the next VAULT_LOCKED (if it ever
+        // comes) reflects this session, not a stale one.
+        self.last_lock = None;
+
         Ok(())
     }
 
     /// Move from `Unlocked` back to `Locked`, returning the count of pending
     /// changes that were discarded.
     ///
+    /// Before dropping the databases, the discard summary is computed against
+    /// the canonical and working dbs and stashed in `last_lock`, so the first
+    /// tool call after the lock can report what staged work was thrown away
+    /// (spec section 2, "Pending changes on lock"). The adapter reads it once
+    /// via [`take_last_lock`](Self::take_last_lock).
+    ///
     /// The master key is zeroed before the state transition; dropping the
     /// `Unlocked` state then drops both databases, which is what discards the
-    /// pending stage (the working db is the stage). `reason` is accepted so the
-    /// caller can record it in the audit log; this module does not emit audit
-    /// events in Phase 1.
+    /// pending stage (the working db is the stage). `reason` is recorded in the
+    /// stashed [`LockInfo`] (as its [`label`](LockReason::label)) so the caller
+    /// can say why.
     ///
-    /// Locking an already-locked vault is a no-op that returns 0.
+    /// Locking an already-locked vault is a no-op that returns 0 and leaves
+    /// `last_lock` untouched.
     ///
-    /// The returned count is boolean-ish in Phase 1: 0 when there are no pending
-    /// changes, 1 when there are. A precise per-operation count is a Phase 2
-    /// concern handled by diff-kdbx; see [`has_pending_changes`](Self::has_pending_changes).
+    /// The returned count is the real number of added plus modified entries
+    /// discarded, the same `pending_discarded_count` stored in `last_lock`.
     pub fn lock(&mut self, reason: LockReason) -> usize {
-        // `reason` is part of the signature so callers thread it through to the
-        // audit log. Phase 1 does not log from here.
-        let _ = reason;
-
-        let pending = if self.has_pending_changes() { 1 } else { 0 };
+        // Compute the discard summary while the databases are still live. When
+        // unlocked, diff the canonical baseline against the working stage; an
+        // already-locked vault has nothing to summarize.
+        let (count, summary) = match &self.state {
+            VaultState::Unlocked {
+                canonical_db,
+                working_db,
+                ..
+            } => {
+                let diff = crate::kdbx_core::stage::diff_pending(canonical_db, working_db);
+                let count = diff.summary.num_added + diff.summary.num_modified;
+                let mut paths: Vec<String> = Vec::with_capacity(count);
+                paths.extend(diff.added.iter().map(|a| a.path.clone()));
+                paths.extend(diff.modified.iter().map(|m| m.path.clone()));
+                (count, paths)
+            }
+            VaultState::Locked => (0, Vec::new()),
+        };
 
         // Take the state out so we can zero the key before it drops. Replacing
         // with `Locked` also drops the old `Unlocked` value (and both databases)
         // at the end of this scope.
         let old = std::mem::replace(&mut self.state, VaultState::Locked);
-        if let VaultState::Unlocked { mut key, .. } = old {
-            key.zeroize();
+        match old {
+            VaultState::Unlocked { mut key, .. } => {
+                key.zeroize();
+                // Stash what this lock discarded for the next VAULT_LOCKED.
+                self.last_lock = Some(LockInfo {
+                    reason: reason.label().to_string(),
+                    pending_discarded_count: count,
+                    summary,
+                });
+            }
+            VaultState::Locked => {
+                // No-op lock: leave any existing last_lock untouched.
+            }
         }
 
-        pending
+        count
+    }
+
+    /// Take the most recent lock's discard summary, clearing it.
+    ///
+    /// The adapter calls this once per lock to attach the discard summary to the
+    /// next `VAULT_LOCKED` error. Returns `None` when there is nothing to report
+    /// (no lock since the last unlock, or it was already taken).
+    pub fn take_last_lock(&mut self) -> Option<LockInfo> {
+        self.last_lock.take()
     }
 
     /// True when the vault is unlocked.
@@ -268,6 +349,26 @@ impl Vault {
         }
     }
 
+    /// The number of pending changes: added plus modified entries between the
+    /// canonical baseline and the working stage. Zero when locked.
+    ///
+    /// This is the precise count [`has_pending_changes`](Self::has_pending_changes)
+    /// reduces to a boolean. It runs the same diff-kdbx stage diff the lock
+    /// summary and the save outcome use, so all three agree on the count.
+    pub fn pending_count(&self) -> usize {
+        match &self.state {
+            VaultState::Unlocked {
+                canonical_db,
+                working_db,
+                ..
+            } => {
+                let diff = crate::kdbx_core::stage::diff_pending(canonical_db, working_db);
+                diff.summary.num_added + diff.summary.num_modified
+            }
+            VaultState::Locked => 0,
+        }
+    }
+
     /// Whether the idle timer should lock the vault now.
     ///
     /// True when the vault is unlocked, `idle_timeout` is non-zero, and at least
@@ -287,6 +388,29 @@ impl Vault {
                 now.saturating_duration_since(*last_activity) >= idle_timeout
             }
             VaultState::Locked => false,
+        }
+    }
+
+    /// Whole seconds remaining before the idle timer would lock, for
+    /// `kdbx_status.idle_timeout_remaining_seconds` (spec: "number or null,
+    /// null if locked").
+    ///
+    /// Returns `None` when locked or when `timeout` is zero (idle lock
+    /// disabled), and `Some(remaining)` otherwise: the saturating difference
+    /// between `timeout` and the elapsed time since the last
+    /// [`touch`](Self::touch), truncated to whole seconds. A vault that is
+    /// already past its timeout (but not yet locked) reports `Some(0)`. Mirrors
+    /// [`should_lock`](Self::should_lock) in structure so the two stay in step.
+    pub fn idle_remaining(&self, now: Instant, timeout: Duration) -> Option<u64> {
+        if timeout.is_zero() {
+            return None;
+        }
+        match &self.state {
+            VaultState::Unlocked { last_activity, .. } => {
+                let elapsed = now.saturating_duration_since(*last_activity);
+                Some(timeout.saturating_sub(elapsed).as_secs())
+            }
+            VaultState::Locked => None,
         }
     }
 
@@ -335,12 +459,13 @@ impl Vault {
     }
 
     /// Discard the staged changes: reset the working db to a fresh clone of the
-    /// canonical baseline. Returns the prior pending state as a count (boolean
-    /// in Phase 1: 0 or 1; the precise count is a diff-kdbx concern).
+    /// canonical baseline. Returns the real number of pending changes (added
+    /// plus modified entries) that were discarded, computed before the reset.
     ///
     /// [`ErrorCode::VaultLocked`] when locked.
     pub fn discard_working(&mut self) -> CoreResult<usize> {
-        let pending = if self.has_pending_changes() { 1 } else { 0 };
+        // Count before the reset: after it the dbs are equal and the count is 0.
+        let pending = self.pending_count();
         match &mut self.state {
             VaultState::Unlocked {
                 canonical_db,
@@ -628,5 +753,164 @@ mod tests {
         vault.mark_saved(new_mtime).expect("mark saved");
         assert!(!vault.has_pending_changes());
         assert_eq!(vault.mtime_at_unlock().expect("unlocked"), new_mtime);
+    }
+
+    // Lock-recovery, real counts, and idle-remaining additions.
+
+    /// Stage a change on the working db so the vault is dirty. Adds a URL field
+    /// to the first entry.
+    fn stage_one_change(vault: &mut Vault) {
+        let db = vault.working_db_mut().expect("working db");
+        let id = db.iter_all_entries().next().expect("an entry").id();
+        db.entry_mut(id)
+            .expect("entry")
+            .edit(|e| e.set_unprotected(keepass::db::fields::URL, "https://example.com"));
+    }
+
+    #[test]
+    fn lock_reason_labels_are_stable() {
+        assert_eq!(LockReason::Manual.label(), "manual");
+        assert_eq!(LockReason::IdleTimeout.label(), "idle_timeout");
+        assert_eq!(LockReason::Shutdown.label(), "shutdown");
+    }
+
+    #[test]
+    fn lock_stashes_discard_summary_taken_once() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        stage_one_change(&mut vault);
+
+        let discarded = vault.lock(LockReason::IdleTimeout);
+        assert_eq!(discarded, 1);
+
+        let info = vault.take_last_lock().expect("a discard to report");
+        assert_eq!(info.reason, "idle_timeout");
+        assert_eq!(info.pending_discarded_count, 1);
+        assert_eq!(info.summary.len(), 1);
+        // The summary holds the human path of the modified entry.
+        assert_eq!(info.summary[0], "/Test Entry");
+
+        // Taken once: a second take is None.
+        assert!(vault.take_last_lock().is_none());
+    }
+
+    #[test]
+    fn lock_with_no_changes_still_records_zero_discard() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+
+        let discarded = vault.lock(LockReason::Manual);
+        assert_eq!(discarded, 0);
+
+        // A clean lock still records a LockInfo so the adapter can report the
+        // reason; the count is zero and the summary empty.
+        let info = vault.take_last_lock().expect("clean lock still records");
+        assert_eq!(info.reason, "manual");
+        assert_eq!(info.pending_discarded_count, 0);
+        assert!(info.summary.is_empty());
+    }
+
+    #[test]
+    fn noop_lock_does_not_record_last_lock() {
+        let mut vault = Vault::new(PathBuf::from("/nonexistent/vault.kdbx"));
+        // Locking an already-locked vault is a no-op and records nothing.
+        assert_eq!(vault.lock(LockReason::Shutdown), 0);
+        assert!(vault.take_last_lock().is_none());
+    }
+
+    #[test]
+    fn unlock_clears_prior_last_lock() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("first unlock");
+        stage_one_change(&mut vault);
+        vault.lock(LockReason::Manual);
+
+        // A fresh unlock clears the stashed discard: a new session has nothing
+        // prior to report.
+        vault.unlock(TEST_PASSWORD, None).expect("second unlock");
+        assert!(vault.take_last_lock().is_none());
+    }
+
+    #[test]
+    fn pending_count_zero_then_one() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        assert_eq!(vault.pending_count(), 0);
+
+        stage_one_change(&mut vault);
+        assert_eq!(vault.pending_count(), 1);
+    }
+
+    #[test]
+    fn pending_count_is_zero_when_locked() {
+        let vault = Vault::new(PathBuf::from("/nonexistent/vault.kdbx"));
+        assert_eq!(vault.pending_count(), 0);
+    }
+
+    #[test]
+    fn discard_working_returns_real_count() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        stage_one_change(&mut vault);
+
+        let discarded = vault.discard_working().expect("discard");
+        assert_eq!(discarded, 1);
+        assert_eq!(vault.pending_count(), 0);
+    }
+
+    #[test]
+    fn idle_remaining_is_none_when_locked() {
+        let vault = Vault::new(PathBuf::from("/nonexistent/vault.kdbx"));
+        assert_eq!(
+            vault.idle_remaining(Instant::now(), Duration::from_secs(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_remaining_is_none_for_zero_timeout() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        assert_eq!(vault.idle_remaining(Instant::now(), Duration::ZERO), None);
+    }
+
+    #[test]
+    fn idle_remaining_counts_down() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        let now = Instant::now();
+        // Right after unlock, close to the full timeout remains.
+        let remaining = vault
+            .idle_remaining(now, Duration::from_secs(900))
+            .expect("unlocked has a remaining");
+        assert!((899..=900).contains(&remaining));
+
+        // Halfway through: about half remains.
+        let halfway = now + Duration::from_secs(450);
+        let remaining = vault
+            .idle_remaining(halfway, Duration::from_secs(900))
+            .expect("still unlocked");
+        assert!((449..=450).contains(&remaining));
+    }
+
+    #[test]
+    fn idle_remaining_saturates_to_zero_past_timeout() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        let now = Instant::now();
+        // Past the timeout but not yet locked: reports zero, not an underflow.
+        let later = now + Duration::from_secs(1_000);
+        assert_eq!(
+            vault.idle_remaining(later, Duration::from_secs(900)),
+            Some(0)
+        );
     }
 }

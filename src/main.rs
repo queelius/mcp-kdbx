@@ -18,11 +18,23 @@ use std::time::SystemTime;
 async fn main() -> anyhow::Result<()> {
     // Diagnostic tracing goes to stderr; stdout is reserved for the JSON-RPC
     // stream the MCP host reads. The audit trail is separate (AuditLog below).
+    //
+    // rmcp is capped at warn regardless of KDBX_LOG_LEVEL. rmcp's service loop
+    // Debug-logs the full JSON-RPC request and response, which on a kdbx_unlock
+    // call carries the master password and on any reveal call carries the
+    // secret. Letting KDBX_LOG_LEVEL=debug or trace reach rmcp would print those
+    // payloads to stderr. So mcp-kdbx's own level follows KDBX_LOG_LEVEL while
+    // rmcp stays quiet. KDBX_LOG_LEVEL is validated by Config, but the
+    // subscriber is built before config so it stays robust on its own: default
+    // to info when the variable is absent, and let EnvFilter reject a malformed
+    // directive (falling back to info) rather than panic.
+    let log_level = std::env::var("KDBX_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    let filter_directive = format!("{log_level},rmcp=warn");
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("KDBX_LOG_LEVEL")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_new(&filter_directive)
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rmcp=warn")),
         )
         .init();
 
@@ -70,9 +82,15 @@ fn build_audit_log(config: &Config) -> AuditLog {
     let Some(path) = &config.log_file else {
         return AuditLog::stderr_only();
     };
+    // The audit trail holds reveal hashes, paths, and policy. Create it 0600 so
+    // it is owner-only from the first byte (mode applies only when the file is
+    // newly created; an existing file keeps its current permissions). This crate
+    // is POSIX-only per the spec, so the unix-only mode call is fine.
+    use std::os::unix::fs::OpenOptionsExt;
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)
     {
         Ok(file) => AuditLog::new(Some(file)),

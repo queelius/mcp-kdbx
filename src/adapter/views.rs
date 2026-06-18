@@ -17,6 +17,7 @@ use keepass::Database;
 use keepass::db::{EntryId, GroupId};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::time::SystemTime;
 
 /// The KDBX-canonical field names. These are surfaced through their own keys
 /// (username, url, notes) or are implicitly protected (password) and a title;
@@ -149,10 +150,22 @@ fn format_time(time: Option<NaiveDateTime>) -> Option<String> {
 }
 
 /// Lowercase hex SHA-256 of `bytes`. Used for attachment content fingerprints
-/// (metadata, not a reveal), so it is a plain digest with no domain prefix.
-fn sha256_hex(bytes: &[u8]) -> String {
+/// (metadata, not a reveal), so it is a plain digest with no domain prefix. The
+/// single definition the adapter shares: the read views and the
+/// `kdbx_download_attachment` reveal both report the same fingerprint, so they
+/// cannot drift.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Format a `SystemTime` as `YYYY-MM-DDTHH:MM:SSZ` (UTC). The single definition
+/// the adapter shares for audit-event mtime fields (the unlock file mtime and
+/// the save before/after mtimes), so the lifecycle and write tools format times
+/// the same way.
+pub(crate) fn format_system_time(time: SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Utc> = time.into();
+    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 #[cfg(test)]
