@@ -10,9 +10,9 @@ User-facing summary: `README.md`. Full v0.1 design (motivation, protocol surface
 
 ## Status
 
-**Phases 1, 2, 3, and 4 complete (the full server plus its automated test suite), on branch `feat/v0.1`, not yet pushed.**
+**All five v0.1 phases complete (the full server, its automated test suite, CI gates, and docs), on branch `feat/v0.1`, not yet pushed. v0.1 is feature-complete, pending merge and a crates.io release.**
 
-The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 226 tests pass (194 library unit tests, 27 protocol-conformance, 5 integration); `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean (clippy also clean under `--features cli`, which builds the `gen-fixtures` helper). The server runs: all 17 tools register and respond over real stdio MCP.
+The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 226 tests pass (194 library unit tests, 27 protocol-conformance, 5 integration); `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the source security audit (`bash scripts/ci-audit.sh`) are clean. The server runs: all 17 tools register and respond over real stdio MCP.
 
 Phase 1 (tasks 1 to 9), the `kdbx_core` foundation: `error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`.
 
@@ -30,8 +30,9 @@ Minor deferred item: explicit SIGTERM/SIGINT lock-on-shutdown (Task 18 step 4) i
 
 Two error codes are not reachable from a black-box protocol test and stay covered by `kdbx_core` unit tests: `VAULT_NOT_FOUND` (the config layer refuses to start without a readable vault path) and `WRITE_FAILED` (needs a mid-save filesystem failure).
 
-Pending:
-- Phase 5 (CI gates and docs, tasks 23 to 26). The CI gate should run `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --features cli -- -D warnings` (the `--features cli` is needed to lint the `gen-fixtures` helper).
+Phase 5 (tasks 23 to 26): `.github/workflows/ci.yml` (rust-test, protocol-conformance, and source-audit jobs; checks out the sibling `diff-kdbx` so the path dep resolves), `scripts/ci-audit.sh` (seven source-invariant grep checks), `docs/operations.md` (config, secret managers, audit log, posture), and the README polish (status, quick start, CI badge). The CI gate runs `cargo fmt --check`, `cargo test --all-features`, and `cargo clippy --all-targets --all-features -- -D warnings` (the `--all-features` is needed to lint the `cli`-gated `gen-fixtures` helper).
+
+Remaining for release (not v0.1 plan tasks): merge `feat/v0.1` to `main`, run the `docs/manual-testing.md` smoke against a real host, then migrate the `diff-kdbx` path dependency to a crates.io (or git) version and publish. The CI currently checks out `diff-kdbx`'s default branch as a sibling, so it depends on that branch carrying the API mcp-kdbx builds against (the local `diff-kdbx` HEAD with the needed API may be ahead of its pushed `main`).
 
 ## Position in the ecosystem
 

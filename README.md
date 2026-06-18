@@ -1,5 +1,7 @@
 # mcp-kdbx
 
+[![CI](https://github.com/queelius/mcp-kdbx/actions/workflows/ci.yml/badge.svg)](https://github.com/queelius/mcp-kdbx/actions/workflows/ci.yml)
+
 **Model Context Protocol server for KeePass KDBX vaults.** Lets LLM agents
 list, search, reveal, and (when explicitly enabled) edit entries in your
 encrypted KeePass vault, with per-secret consent gating and a full audit
@@ -12,17 +14,21 @@ The sibling members are `diff-kdbx` (semantic-diff CLI and library) and
 
 ## Status
 
-**Working server, pre-release.** Phases 1-3 of the v0.1 plan are complete
-on branch `feat/v0.1`: all 17 tools register and respond over real stdio
-MCP (built on `rmcp` 1.7.0), 179 library tests pass, `cargo fmt` and
-`cargo clippy -D warnings` are clean, and consent gating, the
-`KDBX_ALLOW_WRITES` gate, and the sha256-not-plaintext audit trail were
-validated end to end against a live MCP host with zero plaintext leakage.
-Remaining before release: Phase 4 (fixtures, integration tests,
-protocol-conformance harness) and Phase 5 (CI gates and docs).
+**v0.1 feature-complete on branch `feat/v0.1`, pending merge and release.** All
+five phases of the v0.1 plan are done: the 17-tool server (built on `rmcp` 1.7.0),
+the stage-then-commit write path, and the full test suite. 226 tests pass (194
+library, 27 protocol-conformance against the real binary over stdio, 5
+integration); `cargo fmt --check` and `cargo clippy --all-targets --all-features
+-- -D warnings` are clean; the source security audit (`scripts/ci-audit.sh`)
+passes; and consent gating, the `KDBX_ALLOW_WRITES` gate, and the
+sha256-not-plaintext audit trail are validated end to end with zero plaintext
+leakage. Not yet published to crates.io.
 
 The v0.1 design lives at `docs/superpowers/specs/2026-05-08-mcp-kdbx-design.md`;
 the implementation plan at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md`.
+For deployment and observability, see [`docs/operations.md`](docs/operations.md);
+for host setup and the per-release smoke checklist, see
+[`docs/manual-testing.md`](docs/manual-testing.md).
 
 ## Known limitations
 
@@ -41,6 +47,7 @@ Build from source (Rust 1.85+, edition 2024). `diff-kdbx` is currently a
 path dependency, so check out the sibling repo at `../diff-kdbx` first:
 
 ```sh
+git clone https://github.com/queelius/diff-kdbx ../diff-kdbx
 cargo build --release   # produces target/release/mcp-kdbx
 ```
 
@@ -90,9 +97,11 @@ without explicit opt-in.
 
 1. `docs/superpowers/specs/2026-05-08-mcp-kdbx-design.md` (the v0.1 design)
 2. `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (the 26-task
-   implementation plan; Phases 1-3 done, 4-5 pending)
-3. `~/github/kdbx/CLAUDE.md` (ecosystem-level conventions)
-4. The sibling repo specs at `~/github/kdbx/web-kdbx/docs/superpowers/specs/`
+   implementation plan; all five phases complete)
+3. `docs/operations.md` (deployment, secret managers, audit log) and
+   `docs/manual-testing.md` (host config and the smoke checklist)
+4. `~/github/kdbx/CLAUDE.md` (ecosystem-level conventions)
+5. The sibling repo specs at `~/github/kdbx/web-kdbx/docs/superpowers/specs/`
    for reference on the spec/plan/execute flow
 
 ## License
