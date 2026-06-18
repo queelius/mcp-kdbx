@@ -177,9 +177,11 @@ impl ServerHandler for KdbxServer {
                  memory and committed atomically with kdbx_save_pending.",
             );
         // Report mcp-kdbx as the server, not rmcp's default implementation name.
-        // from_build_env reads CARGO_PKG_NAME and CARGO_PKG_VERSION. ServerInfo
-        // is non-exhaustive, so set the field after construction.
-        info.server_info = Implementation::from_build_env();
+        // Implementation::from_build_env expands env!("CARGO_CRATE_NAME") inside
+        // the rmcp crate, so it would report "rmcp" and rmcp's version, not ours.
+        // Build the identity explicitly from this crate's own build env instead.
+        // ServerInfo is non-exhaustive, so set the field after construction.
+        info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         info
     }
 }
