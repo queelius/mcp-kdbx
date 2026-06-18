@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "kdbx": {
+      "command": "mcp-kdbx",
+      "env": {
+        "KDBX_VAULT_PATH": "/absolute/path/to/your/vault.kdbx",
+        "KDBX_IDLE_TIMEOUT_SECONDS": "900"
+      }
+    }
+  }
+}

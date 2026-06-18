@@ -50,6 +50,15 @@ rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io"] }
 # diff-kdbx / web-kdbx convention of a `cli`-gated fixture generator.
 cli = ["dep:clap"]
 
+# The gen-fixtures helper builds the committed test vaults under tests/fixtures/.
+# Gated by the `cli` feature so a default build stays lean and the generator is
+# not part of the shipped server. Regenerate with:
+#   cargo run --features cli --bin gen-fixtures
+[[bin]]
+name = "gen-fixtures"
+path = "src/bin/gen_fixtures.rs"
+required-features = ["cli"]
+
 [dependencies.clap]
 version = "4"
 features = ["derive"]
