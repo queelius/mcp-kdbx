@@ -266,12 +266,12 @@ impl KdbxServer {
         }))
     }
 
-    /// Reveal: compute the current TOTP code for an entry. Prefers the modern
-    /// `otp` field (an otpauth URI), falling back to the legacy
-    /// `TOTP Seed`/`TOTP Settings` pair. The secret never leaves the process;
+    /// Reveal: compute the current TOTP code for an entry, from whichever
+    /// source `totp::resolve_for_entry` finds (otpauth URI, KeePass 2 native
+    /// `TimeOtp-*` fields, or the legacy pair). The secret never leaves the process;
     /// only the code crosses out, and the audit event logs no code.
     #[tool(
-        description = "Compute the current TOTP code for an entry. Reads the modern otp field (otpauth URI) or the legacy TOTP Seed and TOTP Settings pair. Returns the code with its remaining validity, period, and the time_unix it was computed at (an optional time_unix is clamped to now plus or minus one period). The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
+        description = "Compute the current TOTP code for an entry. Reads the otp field (otpauth URI), the KeePass 2 TimeOtp-* fields, or the legacy TOTP Seed and TOTP Settings pair, in that order. Returns the code with its remaining validity, period, and the time_unix it was computed at (an optional time_unix is clamped to now plus or minus one period). The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
     )]
     async fn kdbx_get_otp(&self, Parameters(params): Parameters<GetOtpParams>) -> String {
         let mut vault = self.vault().await;
@@ -289,15 +289,11 @@ impl KdbxServer {
         };
         let target_path = canonical_entry_path(db, &entry);
 
-        // Resolve a config (modern otpauth field, then the legacy pair) through
+        // Resolve a config (otpauth, KeePass native, then legacy) through
         // the shared resolver, the same one the read views use for has_otp, so
         // the capability flag and this computation cannot drift. The config
         // holds the secret; it stays in this scope and never crosses out.
-        let config = match crate::kdbx_core::totp::resolve_config(
-            entry.get("otp"),
-            entry.get("TOTP Seed"),
-            entry.get("TOTP Settings"),
-        ) {
+        let config = match crate::kdbx_core::totp::resolve_for_entry(&entry) {
             Some(c) => c,
             None => return responses::err(&ErrorCode::NoOtpConfigured.into()),
         };

@@ -1301,3 +1301,15 @@ integration tests assert them.
   `title`, `username`, `url`, `notes`, and any other value is refused at the
   protocol level as invalid params (JSON-RPC error -32602, "unknown variant"),
   before the tool runs. An omitted or empty list still means the default set.
+- **TOTP sources.** One resolver, `totp::resolve_for_entry`, decides an
+  entry's TOTP config for `kdbx_get_otp`, `has_otp` in the read views, and
+  `has_otp` in the stage diff (three hand-copied lookups before). It tries, in
+  order: the `otp` field (otpauth URI); KeePass 2's native `TimeOtp-*` fields
+  (KeePass 2.47+, documented under "Placeholders", `{TIMEOTP}`): exactly one
+  of `TimeOtp-Secret` (UTF-8), `-Hex`, `-Base32`, `-Base64`, plus optional
+  `TimeOtp-Length` (default 6, at most 8), `TimeOtp-Period` (default 30), and
+  `TimeOtp-Algorithm` (`HMAC-SHA-1` default, `HMAC-SHA-256`, `HMAC-SHA-512`);
+  then the legacy `TOTP Seed` + `TOTP Settings` pair. A malformed source falls
+  through to the next. Base32 secrets are normalized before decoding
+  (whitespace removed, uppercased, `=` padding dropped), so lowercase, grouped,
+  or padded secrets now work.

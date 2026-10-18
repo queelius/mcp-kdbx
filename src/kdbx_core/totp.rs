@@ -4,9 +4,14 @@
 //!
 //! - the modern `otpauth://totp/...` URI stored in an entry's `otp` field
 //!   ([`TotpConfig::parse`]), and
+//! - KeePass 2's native `TimeOtp-*` fields, via
+//!   [`TotpConfig::from_keepass_native`], and
 //! - the legacy KeePass field pair `TOTP Seed` (base32 secret) plus
 //!   `TOTP Settings` (a `period;digits` string), via
 //!   [`TotpConfig::from_legacy`].
+//!
+//! [`resolve_for_entry`] picks the source for an entry; every caller goes
+//! through it.
 //!
 //! Both parsers are provided here. The modern field takes priority, but this
 //! module does not decide precedence: the Phase 3 caller resolves which source
@@ -250,10 +255,22 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Decode a base32 secret using the RFC 4648 alphabet without required padding.
-/// This is the encoding both otpauth URIs and the legacy `TOTP Seed` field use.
+/// Decode a base32 secret (RFC 4648 alphabet). The input is normalized first:
+/// whitespace is removed, letters are uppercased, and trailing `=` padding is
+/// dropped. Real secrets arrive lowercase, grouped in blocks of four, or
+/// padded (authenticator setup pages, KeePass's entry dialog), and the strict
+/// decoder rejected all three. This is the encoding both otpauth URIs and the
+/// legacy `TOTP Seed` field use, and KeePass's `TimeOtp-Secret-Base32`.
 fn decode_base32_secret(s: &str) -> Option<Vec<u8>> {
-    base32::decode(base32::Alphabet::Rfc4648 { padding: false }, s)
+    let normalized: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    base32::decode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        normalized.trim_end_matches('='),
+    )
 }
 
 /// Map an otpauth `algorithm` value to [`TotpAlgo`], case-insensitively. An
@@ -276,28 +293,130 @@ pub fn no_otp_configured() -> CoreError {
     ErrorCode::NoOtpConfigured.into()
 }
 
-/// Resolve a [`TotpConfig`] from an entry's fields, preferring the modern
-/// otpauth `otp` field and falling back to the legacy `TOTP Seed` + `TOTP
-/// Settings` pair. Returns `None` when neither yields a usable config.
+/// The entry field names the TOTP sources are read from. One place, so the
+/// resolver and its tests agree on the spelling.
+pub mod field_names {
+    /// KeePassXC's modern field: an `otpauth://totp/...` URI.
+    pub use keepass::db::fields::OTP;
+    /// KeeOtp / older KeePassXC: base32 seed plus a `period;digits` string.
+    pub const LEGACY_SEED: &str = "TOTP Seed";
+    /// See [`LEGACY_SEED`].
+    pub const LEGACY_SETTINGS: &str = "TOTP Settings";
+    /// KeePass 2 native (2.47+, the `{TIMEOTP}` placeholder): the secret, as
+    /// UTF-8 text.
+    pub const NATIVE_SECRET: &str = "TimeOtp-Secret";
+    /// KeePass 2 native: the secret, hex-encoded.
+    pub const NATIVE_SECRET_HEX: &str = "TimeOtp-Secret-Hex";
+    /// KeePass 2 native: the secret, base32-encoded.
+    pub const NATIVE_SECRET_BASE32: &str = "TimeOtp-Secret-Base32";
+    /// KeePass 2 native: the secret, base64-encoded.
+    pub const NATIVE_SECRET_BASE64: &str = "TimeOtp-Secret-Base64";
+    /// KeePass 2 native: code length (default 6, at most 8).
+    pub const NATIVE_LENGTH: &str = "TimeOtp-Length";
+    /// KeePass 2 native: time step in seconds (default 30).
+    pub const NATIVE_PERIOD: &str = "TimeOtp-Period";
+    /// KeePass 2 native: `HMAC-SHA-1` (default), `HMAC-SHA-256`, or
+    /// `HMAC-SHA-512`.
+    pub const NATIVE_ALGORITHM: &str = "TimeOtp-Algorithm";
+}
+
+/// The longest code KeePass's native TOTP produces (its documented maximum).
+const NATIVE_MAX_DIGITS: u32 = 8;
+
+/// Resolve the [`TotpConfig`] an entry carries, trying its sources in order:
 ///
-/// This is the single source of truth for "does this entry have usable TOTP".
-/// `kdbx_get_otp` calls it to compute a code, and the read views call it (and
-/// check `.is_some()`) to set the `has_otp` capability flag. Routing both
-/// through one function keeps the advertised capability and the actual behavior
-/// from drifting: an entry's `has_otp` is true exactly when `kdbx_get_otp`
-/// would succeed.
-pub fn resolve_config(
-    otp: Option<&str>,
-    legacy_seed: Option<&str>,
-    legacy_settings: Option<&str>,
-) -> Option<TotpConfig> {
-    if let Some(config) = otp.and_then(TotpConfig::parse) {
+/// 1. the modern `otp` field (an otpauth URI, KeePassXC);
+/// 2. the KeePass 2 native `TimeOtp-*` fields (keepass.info, "Placeholders",
+///    the `{TIMEOTP}` section);
+/// 3. the legacy `TOTP Seed` + `TOTP Settings` pair.
+///
+/// A source that is present but malformed falls through to the next. Returns
+/// `None` when no source yields a usable config.
+///
+/// This is the single source of truth for "does this entry have usable TOTP":
+/// `kdbx_get_otp` computes with it, and the read views and the stage diff set
+/// `has_otp` from it, so the advertised capability and the behavior agree.
+pub fn resolve_for_entry(entry: &keepass::db::Entry) -> Option<TotpConfig> {
+    use field_names::*;
+    if let Some(config) = entry.get(OTP).and_then(TotpConfig::parse) {
         return Some(config);
     }
-    match (legacy_seed, legacy_settings) {
+    if let Some(config) = TotpConfig::from_keepass_native(|name| entry.get(name)) {
+        return Some(config);
+    }
+    match (entry.get(LEGACY_SEED), entry.get(LEGACY_SETTINGS)) {
         (Some(seed), Some(settings)) => TotpConfig::from_legacy(seed, settings),
         _ => None,
     }
+}
+
+impl TotpConfig {
+    /// Build a config from KeePass 2's native `TimeOtp-*` fields, read through
+    /// `get`. Exactly one of the four secret fields must be present (KeePass's
+    /// rule); `TimeOtp-Length` (1..=8, default 6), `TimeOtp-Period` (default
+    /// 30), and `TimeOtp-Algorithm` (default `HMAC-SHA-1`) are optional. Any
+    /// malformed or unknown value yields `None`.
+    pub fn from_keepass_native<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Self> {
+        use base64::Engine;
+        use field_names::*;
+        let decoders: [(&str, SecretDecoder); 4] = [
+            (NATIVE_SECRET, |v| Some(v.as_bytes().to_vec())),
+            (NATIVE_SECRET_HEX, decode_hex),
+            (NATIVE_SECRET_BASE32, decode_base32_secret),
+            (NATIVE_SECRET_BASE64, |v| {
+                let compact: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+                base64::engine::general_purpose::STANDARD
+                    .decode(compact)
+                    .ok()
+            }),
+        ];
+        let mut present = decoders
+            .iter()
+            .filter_map(|(name, decode)| get(name).map(|value| (*decode, value)));
+        let (decode, value) = present.next()?;
+        if present.next().is_some() {
+            return None;
+        }
+        let secret = decode(value).filter(|s| !s.is_empty())?;
+
+        let digits = match get(NATIVE_LENGTH) {
+            Some(v) => v.trim().parse().ok().filter(|d| *d <= NATIVE_MAX_DIGITS)?,
+            None => 6,
+        };
+        let period = match get(NATIVE_PERIOD) {
+            Some(v) => v.trim().parse().ok()?,
+            None => 30,
+        };
+        let algo = match get(NATIVE_ALGORITHM).map(str::trim) {
+            None | Some("HMAC-SHA-1") => TotpAlgo::Sha1,
+            Some("HMAC-SHA-256") => TotpAlgo::Sha256,
+            Some("HMAC-SHA-512") => TotpAlgo::Sha512,
+            Some(_) => return None,
+        };
+        checked_params(period, digits)?;
+        Some(Self {
+            secret: Secret::new(secret),
+            period,
+            digits,
+            algo,
+        })
+    }
+}
+
+/// Decodes one encoding of a KeePass native TOTP secret field.
+type SecretDecoder = fn(&str) -> Option<Vec<u8>>;
+
+/// Decode a hex string (whitespace ignored, either case) to bytes.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let digits: Vec<u8> = s
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_digit(16).map(|d| d as u8))
+        .collect::<Option<_>>()?;
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    Some(digits.chunks(2).map(|p| (p[0] << 4) | p[1]).collect())
 }
 
 /// Resolve a [`TotpConfig`] into a code, or report [`ErrorCode::NoOtpConfigured`]
@@ -499,31 +618,102 @@ mod tests {
         assert_eq!(code.code.expose(), "287082");
     }
 
+    /// Build a database holding one root entry with the given unprotected
+    /// fields, and resolve its TOTP config.
+    fn resolve_fields(fields_spec: &[(&str, &str)]) -> Option<TotpConfig> {
+        let mut db = keepass::Database::new();
+        db.root_mut().add_entry().edit(|e| {
+            for (name, value) in fields_spec {
+                e.set_unprotected(*name, *value);
+            }
+        });
+        let entry = db.iter_all_entries().next().expect("one entry");
+        resolve_for_entry(&entry)
+    }
+
+    /// RFC 6238 SHA-1 secret "12345678901234567890" at t=59 -> 94287082;
+    /// six digits -> 287082.
+    const RFC_SHA1_AT_59: &str = "287082";
+
     #[test]
-    fn resolve_config_prefers_modern_then_legacy_then_none() {
-        // Modern otpauth field resolves.
-        assert!(
-            resolve_config(
-                Some("otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP"),
-                None,
-                None
-            )
-            .is_some()
-        );
-        // Legacy seed + settings pair resolves when there is no modern field.
-        assert!(resolve_config(None, Some("JBSWY3DPEHPK3PXP"), Some("30;6")).is_some());
+    fn resolve_for_entry_prefers_otpauth_then_native_then_legacy() {
+        let modern = ("otp", "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP");
+        let legacy = [("TOTP Seed", "JBSWY3DPEHPK3PXP"), ("TOTP Settings", "30;6")];
+        assert!(resolve_fields(&[modern]).is_some());
+        assert!(resolve_fields(&legacy).is_some());
         // Seed without settings does not resolve.
-        assert!(resolve_config(None, Some("JBSWY3DPEHPK3PXP"), None).is_none());
-        // Nothing resolves when all sources are absent.
-        assert!(resolve_config(None, None, None).is_none());
-        // A malformed modern field falls through to the legacy pair.
-        assert!(
-            resolve_config(
-                Some("not-an-otpauth-uri"),
-                Some("JBSWY3DPEHPK3PXP"),
-                Some("30;6")
-            )
-            .is_some()
-        );
+        assert!(resolve_fields(&legacy[..1]).is_none());
+        assert!(resolve_fields(&[]).is_none());
+        // A malformed modern field falls through to the next source.
+        let mut fallthrough = vec![("otp", "not-an-otpauth-uri")];
+        fallthrough.extend_from_slice(&legacy);
+        assert!(resolve_fields(&fallthrough).is_some());
+        // The KeePass 2 native fields outrank the legacy pair.
+        let both = [
+            ("TimeOtp-Secret", "12345678901234567890"),
+            ("TOTP Seed", "JBSWY3DPEHPK3PXP"),
+            ("TOTP Settings", "30;8"),
+        ];
+        let cfg = resolve_fields(&both).expect("native resolves");
+        assert_eq!(cfg.compute_at(59).code.expose(), RFC_SHA1_AT_59);
+    }
+
+    #[test]
+    fn keepass_native_secret_encodings_all_decode_to_the_same_key() {
+        for (field, value) in [
+            ("TimeOtp-Secret", "12345678901234567890"),
+            (
+                "TimeOtp-Secret-Hex",
+                "3132333435363738393031323334353637383930",
+            ),
+            ("TimeOtp-Secret-Base32", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
+            ("TimeOtp-Secret-Base64", "MTIzNDU2Nzg5MDEyMzQ1Njc4OTA="),
+        ] {
+            let cfg = resolve_fields(&[(field, value)]).unwrap_or_else(|| panic!("{field}"));
+            assert_eq!(cfg.period, 30, "{field} default period");
+            assert_eq!(cfg.digits, 6, "{field} default length");
+            assert_eq!(cfg.compute_at(59).code.expose(), RFC_SHA1_AT_59, "{field}");
+        }
+    }
+
+    #[test]
+    fn keepass_native_length_period_and_algorithm() {
+        // RFC 6238 SHA-256 vector: 32-byte secret, t=59, 8 digits -> 46119246.
+        let cfg = resolve_fields(&[
+            ("TimeOtp-Secret", "12345678901234567890123456789012"),
+            ("TimeOtp-Length", "8"),
+            ("TimeOtp-Period", "30"),
+            ("TimeOtp-Algorithm", "HMAC-SHA-256"),
+        ])
+        .expect("resolves");
+        assert_eq!(cfg.algo, TotpAlgo::Sha256);
+        assert_eq!(cfg.compute_at(59).code.expose(), "46119246");
+        // KeePass caps the length at 8; a longer one, an unknown algorithm, or
+        // two secret fields at once is not a usable config.
+        assert!(resolve_fields(&[("TimeOtp-Secret", "x"), ("TimeOtp-Length", "9")]).is_none());
+        assert!(resolve_fields(&[("TimeOtp-Secret", "x"), ("TimeOtp-Algorithm", "MD5")]).is_none());
+        assert!(resolve_fields(&[("TimeOtp-Secret", "x"), ("TimeOtp-Secret-Hex", "78")]).is_none());
+    }
+
+    #[test]
+    fn base32_secrets_are_normalized_before_decoding() {
+        // Lowercase, grouped with spaces, and padded: all common in the wild
+        // (authenticator setup pages, KeePass's own entry dialog).
+        let canonical = decode_base32_secret("JBSWY3DPEHPK3PXP").expect("canonical");
+        for messy in [
+            "jbswy3dpehpk3pxp",
+            "JBSW Y3DP EHPK 3PXP",
+            "JBSWY3DPEHPK3PXP====",
+            " jbsw\ty3dp ehpk3pxp\n",
+        ] {
+            assert_eq!(
+                decode_base32_secret(messy).as_ref(),
+                Some(&canonical),
+                "{messy:?}"
+            );
+        }
+        let cfg =
+            TotpConfig::parse("otpauth://totp/X?secret=jbswy3dpehpk3pxp").expect("lowercase uri");
+        assert_eq!(cfg.secret.expose(), &canonical);
     }
 }

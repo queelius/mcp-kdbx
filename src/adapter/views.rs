@@ -146,15 +146,9 @@ fn has_attachments(entry: &keepass::db::EntryRef<'_>) -> bool {
 
 /// Whether the entry has a usable TOTP source. Uses the same resolver as
 /// `kdbx_get_otp`, so the `has_otp` flag is true exactly when a code could be
-/// produced, covering both the modern `otp` field and the legacy `TOTP Seed` +
-/// `TOTP Settings` pair.
+/// produced, from any source `totp::resolve_for_entry` knows.
 fn has_otp(entry: &keepass::db::EntryRef<'_>) -> bool {
-    crate::kdbx_core::totp::resolve_config(
-        entry.get("otp"),
-        entry.get("TOTP Seed"),
-        entry.get("TOTP Settings"),
-    )
-    .is_some()
+    crate::kdbx_core::totp::resolve_for_entry(entry).is_some()
 }
 
 /// The canonical path string of an entry, or null when it cannot be built.
