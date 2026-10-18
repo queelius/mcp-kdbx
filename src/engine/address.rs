@@ -2,7 +2,7 @@
 //!
 //! An entry or group can be addressed two ways:
 //!
-//! - by vault path (`/Web/GitHub`, see [`crate::kdbx_core::path`]), which is
+//! - by vault path (`/Web/GitHub`, see [`crate::engine::path`]), which is
 //!   readable but session-scoped (`:N` ordinals can shift across sessions) and
 //!   absent for a record whose title or ancestor group name is empty; or
 //! - by record UUID, which the spec names as the cross-session-stable
@@ -13,8 +13,8 @@
 //! one silently: if the two disagreed, any choice would act on an entry the
 //! caller may not have meant.
 
-use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
-use crate::kdbx_core::path::VaultPath;
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::path::VaultPath;
 use keepass::Database;
 use keepass::db::{EntryId, GroupId};
 use uuid::Uuid;

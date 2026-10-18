@@ -10,9 +10,9 @@
 //! because every call goes through [`KdbxServer::vault`].
 
 use crate::adapter::{KdbxServer, locate_entry, responses, views};
-use crate::kdbx_core::address::GroupAddress;
-use crate::kdbx_core::error::ErrorCode;
-use crate::kdbx_core::search::{self, Field};
+use crate::engine::address::GroupAddress;
+use crate::engine::error::ErrorCode;
+use crate::engine::search::{self, Field};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
 

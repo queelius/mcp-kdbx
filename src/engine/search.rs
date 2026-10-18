@@ -16,17 +16,17 @@
 //! so this is acceptable for now and can be revisited if it bites.
 //!
 //! Protected values are never compared. A field is read through
-//! [`crate::kdbx_core::visibility::metadata_value`], the same rule the read
+//! [`crate::engine::visibility::metadata_value`], the same rule the read
 //! views use, so a field is searchable exactly when the views would show it.
 //! Without this, repeated substring queries against a protected UserName, URL,
 //! or Notes would recover the value with no reveal and no audit event.
 //!
 //! Besides that rule, this module depends only on `keepass` and `std`. It
 //! builds the group path inline during the walk rather than going through
-//! `crate::kdbx_core::path`, since tracking the path as we recurse is simpler
+//! `crate::engine::path`, since tracking the path as we recurse is simpler
 //! and matches the shape that the read tooling (Phase 3) needs.
 
-use crate::kdbx_core::visibility::metadata_value;
+use crate::engine::visibility::metadata_value;
 
 /// One field of an entry that a search may look at.
 ///

@@ -15,8 +15,8 @@
 //! vault guard.
 
 use crate::adapter::{KdbxServer, canonical_entry_path, locate_entry, responses};
-use crate::kdbx_core::audit::{AuditEvent, hash_revealed};
-use crate::kdbx_core::error::{CoreError, ErrorCode};
+use crate::engine::audit::{AuditEvent, hash_revealed};
+use crate::engine::error::{CoreError, ErrorCode};
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
@@ -294,15 +294,14 @@ impl KdbxServer {
         // the shared resolver, the same one the read views use for has_otp, so
         // the capability flag and this computation cannot drift. The config
         // holds the secret; it stays in this scope and never crosses out.
-        let config = match crate::kdbx_core::totp::resolve_for_entry(&entry) {
+        let config = match crate::engine::totp::resolve_for_entry(&entry) {
             Some(c) => c,
             None => return responses::err(&ErrorCode::NoOtpConfigured.into()),
         };
 
         // A requested time is clamped to now plus or minus one period, so only
         // the previous, current, or next code can ever cross out.
-        let time_unix =
-            config.evaluation_time(params.time_unix, crate::kdbx_core::totp::unix_now());
+        let time_unix = config.evaluation_time(params.time_unix, crate::engine::totp::unix_now());
         let code = config.compute_at(time_unix);
         let target_uuid = entry.id().uuid().to_string();
 

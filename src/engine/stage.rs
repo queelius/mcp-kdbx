@@ -25,12 +25,12 @@
 //! non-protected one. That is how we decide whether to redact a field change
 //! without ever holding a protected plaintext.
 
-use crate::kdbx_core::address::{EntryAddress, GroupAddress};
-use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
-use crate::kdbx_core::path::{vault_path_to_entry, vault_path_to_group};
-use crate::kdbx_core::secret::Secret;
-use crate::kdbx_core::vault::Vault;
-use crate::kdbx_core::vault_file::{
+use crate::engine::address::{EntryAddress, GroupAddress};
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::path::{vault_path_to_entry, vault_path_to_group};
+use crate::engine::secret::Secret;
+use crate::engine::vault::Vault;
+use crate::engine::vault_file::{
     LockUnavailable, SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint,
     resolve_write_target, write_atomically,
 };
@@ -626,7 +626,7 @@ fn map_added_entry(working: &Database, uuid: uuid::Uuid) -> Option<AddedEntry> {
     // (src/adapter/views.rs), so kdbx_diff_pending and kdbx_list_entries agree on
     // whether an entry has a usable TOTP source (every source the resolver
     // knows, not just a bare `otp` presence check).
-    let has_otp = crate::kdbx_core::totp::resolve_for_entry(&entry_ref).is_some();
+    let has_otp = crate::engine::totp::resolve_for_entry(&entry_ref).is_some();
 
     Some(AddedEntry {
         path,
@@ -875,8 +875,8 @@ fn absolute_path_string(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kdbx_core::path::VaultPath;
-    use crate::kdbx_core::vault::Vault;
+    use crate::engine::path::VaultPath;
+    use crate::engine::vault::Vault;
     use keepass::{Database, DatabaseKey};
     use std::io::Write;
     use std::path::PathBuf;

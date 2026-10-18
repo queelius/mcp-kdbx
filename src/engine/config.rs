@@ -7,7 +7,7 @@
 //!
 //! Two error surfaces live in this crate, and they are deliberately separate:
 //!
-//! - [`crate::kdbx_core::error::CoreError`] is the per-tool-call surface. It
+//! - [`crate::engine::error::CoreError`] is the per-tool-call surface. It
 //!   maps onto the MCP protocol error envelope and is recoverable: a bad tool
 //!   call returns an error, the server keeps running.
 //! - [`ConfigError`] (defined here) is fatal startup configuration. A bad
@@ -32,8 +32,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::kdbx_core::audit::Level;
-use crate::kdbx_core::secret::Secret;
+use crate::engine::audit::Level;
+use crate::engine::secret::Secret;
 
 /// Upper bound for the two integer settings, in seconds. 86400 is one day,
 /// which is far beyond any sane idle window or secret-manager round trip while

@@ -198,7 +198,7 @@ impl fmt::Display for CoreError {
 
 impl std::error::Error for CoreError {}
 
-/// Shorthand for the result type used throughout `kdbx_core`.
+/// Shorthand for the result type used throughout `engine`.
 pub type CoreResult<T> = Result<T, CoreError>;
 
 #[cfg(test)]

@@ -19,8 +19,8 @@
 //! id does not resolve, which the calling tool maps to `ENTRY_NOT_FOUND` or
 //! `GROUP_NOT_FOUND`.
 
-use crate::kdbx_core::path::{vault_path_to_entry, vault_path_to_group};
-use crate::kdbx_core::visibility::{STANDARD_FIELDS, is_standard_field, metadata_value};
+use crate::engine::path::{vault_path_to_entry, vault_path_to_group};
+use crate::engine::visibility::{STANDARD_FIELDS, is_standard_field, metadata_value};
 use chrono::NaiveDateTime;
 use keepass::Database;
 use keepass::db::{EntryId, GroupId, fields};
@@ -148,7 +148,7 @@ fn has_attachments(entry: &keepass::db::EntryRef<'_>) -> bool {
 /// `kdbx_get_otp`, so the `has_otp` flag is true exactly when a code could be
 /// produced, from any source `totp::resolve_for_entry` knows.
 fn has_otp(entry: &keepass::db::EntryRef<'_>) -> bool {
-    crate::kdbx_core::totp::resolve_for_entry(entry).is_some()
+    crate::engine::totp::resolve_for_entry(entry).is_some()
 }
 
 /// The canonical path string of an entry, or null when it cannot be built.

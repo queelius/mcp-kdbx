@@ -6,7 +6,7 @@
 //! `WRITES_DISABLED` before touching the vault, then requires an unlocked vault
 //! (`VAULT_LOCKED`). Writes mutate the working db only; nothing reaches disk
 //! until `kdbx_save_pending`. The actual mutation, diffing, and atomic save live
-//! in `kdbx_core::stage`; this module is the thin adapter that converts the MCP
+//! in `engine::stage`; this module is the thin adapter that converts the MCP
 //! tool inputs into core calls, emits the right audit event, and wraps results
 //! in the `{ ok, data } | { ok, error }` envelope.
 //!
@@ -18,13 +18,13 @@
 
 use crate::adapter::views::format_system_time;
 use crate::adapter::{KdbxServer, responses};
-use crate::kdbx_core::address::{EntryAddress, GroupAddress};
-use crate::kdbx_core::audit::{AuditEvent, StageDiscardReason, WriteTool};
-use crate::kdbx_core::error::{CoreError, ErrorCode};
-use crate::kdbx_core::path::vault_path_to_entry;
-use crate::kdbx_core::secret::Secret;
-use crate::kdbx_core::stage;
-use crate::kdbx_core::vault_file::SaveStep;
+use crate::engine::address::{EntryAddress, GroupAddress};
+use crate::engine::audit::{AuditEvent, StageDiscardReason, WriteTool};
+use crate::engine::error::{CoreError, ErrorCode};
+use crate::engine::path::vault_path_to_entry;
+use crate::engine::secret::Secret;
+use crate::engine::stage;
+use crate::engine::vault_file::SaveStep;
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};

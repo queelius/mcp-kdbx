@@ -18,7 +18,7 @@
 //! scan when asked and returns a [`CleanReport`] for the caller to log. It does not
 //! touch the audit log itself.
 
-use crate::kdbx_core::vault_file::TempName;
+use crate::engine::vault_file::TempName;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};

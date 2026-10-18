@@ -31,10 +31,10 @@
 //! verbosity, not by emitting redacted copies of those payloads here. If the
 //! capture is added later, it must restore a redaction layer before logging.
 
-use crate::kdbx_core::error::ErrorCode;
-use crate::kdbx_core::unlock::UnlockSource;
-use crate::kdbx_core::vault::{LockReason, UnreadableReason};
-use crate::kdbx_core::vault_file::{LockUnavailable, SaveStep};
+use crate::engine::error::ErrorCode;
+use crate::engine::unlock::UnlockSource;
+use crate::engine::vault::{LockReason, UnreadableReason};
+use crate::engine::vault_file::{LockUnavailable, SaveStep};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

@@ -21,8 +21,8 @@
 //! which is what discards the pending stage: there is no separate stage data
 //! structure to clear.
 
-use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
-use crate::kdbx_core::vault_file::{FileFingerprint, read_with_fingerprint};
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::vault_file::{FileFingerprint, read_with_fingerprint};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 use zeroize::Zeroize;
@@ -282,7 +282,7 @@ impl Vault {
                 working_db,
                 ..
             } => {
-                let diff = crate::kdbx_core::stage::diff_pending(canonical_db, working_db);
+                let diff = crate::engine::stage::diff_pending(canonical_db, working_db);
                 let count = diff.summary.num_added + diff.summary.num_modified;
                 (count, diff.entry_labels())
             }
@@ -414,7 +414,7 @@ impl Vault {
                 working_db,
                 ..
             } => {
-                let diff = crate::kdbx_core::stage::diff_pending(canonical_db, working_db);
+                let diff = crate::engine::stage::diff_pending(canonical_db, working_db);
                 diff.summary.num_added + diff.summary.num_modified
             }
             VaultState::Locked => 0,

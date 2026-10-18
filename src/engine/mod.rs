@@ -1,4 +1,4 @@
-//! kdbx_core: vault logic with no MCP-protocol types.
+//! engine: vault logic with no MCP-protocol types.
 //!
 //! Audit invariant (from the v0.1 spec): nothing under this module imports
 //! MCP-specific types, so the core stays reusable by a future serv-kdbx HTTP

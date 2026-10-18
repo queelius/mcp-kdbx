@@ -1124,7 +1124,7 @@ against them.
   `kdbx_get_entry`, and `kdbx_find_entry` (and repeated `kdbx_find_entry`
   substring queries recovered it), bypassing the reveal tools and the audit
   trail. The fix, all derived from the stored per-field flag through one rule
-  (`kdbx_core::visibility::metadata_value`) shared by the views and search:
+  (`engine::visibility::metadata_value`) shared by the views and search:
   - A protected `UserName`, `URL`, or `Notes` is emitted as JSON `null` under
     its usual key (`username`, `url`, `notes` / `notes_preview`).
   - Every read view now carries `standard_field_names: { name, protected }[]`,
@@ -1276,7 +1276,7 @@ integration tests assert them.
   two decimal parts, so a user file like `vault.kdbx.tmp.old.bak` is never
   deleted.
 - **Secret hygiene.** Every secret-bearing field is a `Secret<T>`
-  (`kdbx_core::secret`): `Debug` prints `<redacted>`, the value is zeroized on
+  (`engine::secret`): `Debug` prints `<redacted>`, the value is zeroized on
   drop, and reading it takes an explicit `expose()`. This covers `Config`'s
   password and unlock command, `kdbx_unlock`'s inputs, `kdbx_add_entry` and
   `kdbx_update_field` values and attachment content, the staged

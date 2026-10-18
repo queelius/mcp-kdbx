@@ -18,7 +18,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use mcp_kdbx::kdbx_core::audit::hash_revealed;
+use mcp_kdbx::engine::audit::hash_revealed;
 use serde_json::{Value, json};
 
 /// Spawn against a writable temp copy of a fixture, with the given extra env,

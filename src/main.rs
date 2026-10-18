@@ -7,9 +7,9 @@
 //! never collide with the JSON-RPC stream on stdout.
 
 use mcp_kdbx::adapter::KdbxServer;
-use mcp_kdbx::kdbx_core::audit::AuditLog;
-use mcp_kdbx::kdbx_core::config::Config;
-use mcp_kdbx::kdbx_core::orphan;
+use mcp_kdbx::engine::audit::AuditLog;
+use mcp_kdbx::engine::config::Config;
+use mcp_kdbx::engine::orphan;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use std::time::SystemTime;

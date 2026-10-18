@@ -441,7 +441,7 @@ fn write_and_stage_tools_happy_path() {
 // ---------------------------------------------------------------------------
 //
 // Two codes are not triggerable from a black-box protocol test and are covered
-// by unit tests in kdbx_core instead:
+// by unit tests in engine instead:
 //   - VAULT_NOT_FOUND: the config layer refuses to start when the vault path is
 //     missing, so a running server never reaches this from a tool call.
 //   - WRITE_FAILED: requires a filesystem write failure mid-save, which is not

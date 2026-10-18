@@ -28,7 +28,7 @@
 //! including injection-shaped input like `/../../etc`, simply fails to resolve;
 //! there is no filesystem access at any point.
 
-use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 use keepass::Database;
 use keepass::db::{EntryId, GroupId};
 use unicode_normalization::UnicodeNormalization;
@@ -556,7 +556,7 @@ fn nfc_normalize(input: &str) -> String {
 ///
 /// Returns `None` as well when the entry has no addressable path: its title is
 /// empty or some ancestor group's name is empty (see [`addressable`]). Such a
-/// record is still reachable by UUID ([`crate::kdbx_core::address`]).
+/// record is still reachable by UUID ([`crate::engine::address`]).
 pub fn vault_path_to_entry(db: &Database, target: EntryId) -> Option<VaultPath> {
     let root = db.root().id();
     let mut segments = Vec::new();

@@ -28,10 +28,10 @@
 //! the period is echoed back as `period_seconds`, and a legacy field-pair
 //! constructor is added that web-kdbx does not have.
 
-use crate::kdbx_core::secret::Secret;
+use crate::engine::secret::Secret;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 
 /// A computed one-time code plus its remaining lifetime.
 ///

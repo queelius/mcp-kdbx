@@ -11,8 +11,8 @@
 //! locked vault or a missing entry is a normal, expected outcome the agent
 //! should see and reason about, not a transport error.
 
-use crate::kdbx_core::error::{CoreError, ErrorCode};
-use crate::kdbx_core::vault::LockInfo;
+use crate::engine::error::{CoreError, ErrorCode};
+use crate::engine::vault::LockInfo;
 use serde::Serialize;
 use serde_json::json;
 
@@ -20,7 +20,7 @@ use serde_json::json;
 ///
 /// The first tool call after a lock should say what staged work the lock
 /// discarded, so the agent can recover (re-unlock, re-stage). The caller passes
-/// the result of [`crate::kdbx_core::vault::Vault::take_last_lock`]: when it is
+/// the result of [`crate::engine::vault::Vault::take_last_lock`]: when it is
 /// `Some`, the error carries `details { lock_reason, pending_discarded_count,
 /// pending_discarded_summary }`; when it is `None` (no prior lock to report, or
 /// the details were already taken by an earlier call), the error is a bare
@@ -88,7 +88,7 @@ fn to_string(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kdbx_core::error::ErrorCode;
+    use crate::engine::error::ErrorCode;
     use serde_json::Value;
 
     #[test]
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn locked_error_with_info_carries_discard_details() {
         let info = LockInfo {
-            reason: crate::kdbx_core::vault::LockReason::IdleTimeout,
+            reason: crate::engine::vault::LockReason::IdleTimeout,
             pending_discarded_count: 2,
             summary: vec!["/Web/GitHub".to_string(), "/Web/GitLab".to_string()],
         };

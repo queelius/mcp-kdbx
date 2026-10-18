@@ -73,7 +73,7 @@ fi
 #    struct that derives Debug, a field whose name marks it as secret material
 #    (password, unlock_cmd, keyfile_bytes, secret, value, base64, bytes, code)
 #    must not hold a raw String or Vec<u8> (optionally in an Option). It must
-#    be wrapped in kdbx_core::secret::Secret, whose Debug prints <redacted>.
+#    be wrapped in engine::secret::Secret, whose Debug prints <redacted>.
 #    A struct with a hand-written Debug is not matched (it has no derive).
 #    This covers every current and future struct, not a list of named types.
 # ---------------------------------------------------------------------------
@@ -114,12 +114,12 @@ fi
 
 # ---------------------------------------------------------------------------
 # F. The MCP adapter layer is free of direct filesystem writes: all disk I/O
-#    goes through kdbx_core (vault, stage, audit). A write appearing in the
+#    goes through engine (vault, stage, audit). A write appearing in the
 #    adapter is a layering break worth a second look.
 # ---------------------------------------------------------------------------
 hits=$(grep -rn 'fs::write\|File::create\|OpenOptions' src/adapter --include='*.rs' || true)
 if [ -n "$hits" ]; then
-    problem "direct filesystem write in the adapter layer (disk I/O belongs in kdbx_core)" "$hits"
+    problem "direct filesystem write in the adapter layer (disk I/O belongs in engine)" "$hits"
 else
     pass "no direct filesystem writes in the adapter layer"
 fi

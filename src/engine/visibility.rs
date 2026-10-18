@@ -8,7 +8,7 @@
 //!
 //! [`metadata_value`] is the single rule both consumers share: the read views
 //! (`adapter::views`) use it for the values they emit, and the search
-//! (`kdbx_core::search`) uses it for the values it compares against. Keeping one
+//! (`engine::search`) uses it for the values it compares against. Keeping one
 //! definition means a field is searchable exactly when it is visible, so search
 //! can never become an oracle on a value the views hide.
 //!

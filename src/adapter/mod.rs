@@ -1,10 +1,10 @@
-//! The MCP adapter: wraps `kdbx_core` and speaks MCP over stdio via rmcp.
+//! The MCP adapter: wraps `engine` and speaks MCP over stdio via rmcp.
 //!
 //! This is the only layer that knows about MCP. It owns the shared vault state
 //! and the audit log, defines the tool surface, converts tool inputs into core
 //! calls, and wraps core results in the `{ ok, data } | { ok, error }` envelope
 //! (see [`responses`]). The dependency direction is one way: the adapter
-//! depends on `kdbx_core`, never the reverse, so a future HTTP adapter could
+//! depends on `engine`, never the reverse, so a future HTTP adapter could
 //! reuse the core unchanged.
 //!
 //! The 17 tools are split by category across submodules, each a
@@ -20,12 +20,12 @@ pub mod reveals;
 pub mod views;
 pub mod writes;
 
-use crate::kdbx_core::address::EntryAddress;
-use crate::kdbx_core::audit::{AuditEvent, AuditLog};
-use crate::kdbx_core::config::Config;
-use crate::kdbx_core::error::{CoreError, ErrorCode};
-use crate::kdbx_core::secret::Secret;
-use crate::kdbx_core::vault::Vault;
+use crate::engine::address::EntryAddress;
+use crate::engine::audit::{AuditEvent, AuditLog};
+use crate::engine::config::Config;
+use crate::engine::error::{CoreError, ErrorCode};
+use crate::engine::secret::Secret;
+use crate::engine::vault::Vault;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool_handler};
@@ -142,7 +142,7 @@ impl KdbxServer {
             tokio::time::sleep(interval).await;
             let mut vault = self.state.lock().await;
             if vault.should_lock(Instant::now(), timeout) {
-                let reason = crate::kdbx_core::vault::LockReason::IdleTimeout;
+                let reason = crate::engine::vault::LockReason::IdleTimeout;
                 let dropped = vault.lock(reason);
                 // Drop the guard before emitting so the audit write is off the
                 // lock.
@@ -199,12 +199,12 @@ pub(crate) fn canonical_entry_path(
     db: &keepass::Database,
     entry: &keepass::db::EntryRef<'_>,
 ) -> Option<String> {
-    crate::kdbx_core::path::vault_path_to_entry(db, entry.id()).map(|p| p.format())
+    crate::engine::path::vault_path_to_entry(db, entry.id()).map(|p| p.format())
 }
 
 /// Tool inputs wrap secret values in [`Secret`]; their JSON Schema is the inner
 /// type's, unchanged, so the wire contract an MCP host sees does not move.
-/// (Implemented here, not in `kdbx_core`, which stays free of the rmcp/schemars
+/// (Implemented here, not in `engine`, which stays free of the rmcp/schemars
 /// dependency.)
 impl<T> rmcp::schemars::JsonSchema for Secret<T>
 where
@@ -244,7 +244,7 @@ impl ServerHandler for KdbxServer {
 
 #[cfg(test)]
 mod tests {
-    use crate::kdbx_core::{config::Config, stage, totp::TotpConfig};
+    use crate::engine::{config::Config, stage, totp::TotpConfig};
 
     /// A value that must never appear in any Debug rendering below.
     const MARK: &str = "SECRET-MARK-7f3a";
