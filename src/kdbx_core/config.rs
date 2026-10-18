@@ -32,55 +32,13 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::kdbx_core::audit::Level;
 use crate::kdbx_core::secret::Secret;
 
 /// Upper bound for the two integer settings, in seconds. 86400 is one day,
 /// which is far beyond any sane idle window or secret-manager round trip while
 /// still rejecting obvious overflow or garbage values.
 const MAX_SECONDS: u64 = 86_400;
-
-/// The verbosity levels accepted by `KDBX_LOG_LEVEL`, ordered least to most
-/// verbose. The wire/config names are the lowercase variant names; parsing is
-/// case-sensitive to keep the contract unambiguous.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LogLevel {
-    Error,
-    Warn,
-    /// The default level. Captures lifecycle and reveal events (spec section 5
-    /// defaults rationale).
-    #[default]
-    Info,
-    Debug,
-    Trace,
-}
-
-impl LogLevel {
-    /// The stable config string for this level.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            LogLevel::Error => "error",
-            LogLevel::Warn => "warn",
-            LogLevel::Info => "info",
-            LogLevel::Debug => "debug",
-            LogLevel::Trace => "trace",
-        }
-    }
-
-    /// Parse one of the five accepted level names. Anything else is rejected so
-    /// a misspelled level does not silently fall back to a default.
-    fn parse(raw: &str) -> Result<Self, ConfigError> {
-        match raw {
-            "error" => Ok(LogLevel::Error),
-            "warn" => Ok(LogLevel::Warn),
-            "info" => Ok(LogLevel::Info),
-            "debug" => Ok(LogLevel::Debug),
-            "trace" => Ok(LogLevel::Trace),
-            other => Err(ConfigError::InvalidLogLevel {
-                value: other.to_string(),
-            }),
-        }
-    }
-}
 
 /// A fatal startup-configuration error.
 ///
@@ -169,7 +127,7 @@ pub struct Config {
     pub auto_clean_orphans: bool,
 
     /// Log verbosity (`KDBX_LOG_LEVEL`). Default info.
-    pub log_level: LogLevel,
+    pub log_level: Level,
 
     /// Append-only audit log path (`KDBX_LOG_FILE`). When unset, logs go to
     /// stderr only.
@@ -209,8 +167,10 @@ impl Config {
         let auto_clean_orphans = parse_strict_bool(vars, "KDBX_AUTO_CLEAN_ORPHANS")?;
 
         let log_level = match vars.get("KDBX_LOG_LEVEL").filter(|v| !v.is_empty()) {
-            Some(raw) => LogLevel::parse(raw)?,
-            None => LogLevel::default(),
+            Some(raw) => raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidLogLevel { value: raw.clone() })?,
+            None => Level::default(),
         };
 
         let log_file = optional_path(vars, "KDBX_LOG_FILE");
@@ -254,7 +214,7 @@ impl Default for Config {
             allow_writes: false,
             idle_timeout_seconds: 900,
             auto_clean_orphans: false,
-            log_level: LogLevel::Info,
+            log_level: Level::Info,
             log_file: None,
         }
     }
@@ -407,7 +367,7 @@ mod tests {
         assert!(cfg.allow_writes);
         assert_eq!(cfg.idle_timeout_seconds, 300);
         assert!(cfg.auto_clean_orphans);
-        assert_eq!(cfg.log_level, LogLevel::Debug);
+        assert_eq!(cfg.log_level, Level::Debug);
         assert_eq!(cfg.log_file, Some(PathBuf::from("/var/log/mcp-kdbx.jsonl")));
     }
 
@@ -423,7 +383,7 @@ mod tests {
         assert!(!cfg.allow_writes);
         assert_eq!(cfg.idle_timeout_seconds, 900);
         assert!(!cfg.auto_clean_orphans);
-        assert_eq!(cfg.log_level, LogLevel::Info);
+        assert_eq!(cfg.log_level, Level::Info);
         assert_eq!(cfg.log_file, None);
     }
 
@@ -572,18 +532,18 @@ mod tests {
     #[test]
     fn every_log_level_name_parses() {
         let cases = [
-            ("error", LogLevel::Error),
-            ("warn", LogLevel::Warn),
-            ("info", LogLevel::Info),
-            ("debug", LogLevel::Debug),
-            ("trace", LogLevel::Trace),
+            ("error", Level::Error),
+            ("warn", Level::Warn),
+            ("info", Level::Info),
+            ("debug", Level::Debug),
+            ("trace", Level::Trace),
         ];
         for (name, expected) in cases {
             let (_file, mut vars) = vault_fixture();
             set(&mut vars, "KDBX_LOG_LEVEL", name);
             let cfg = Config::from_map(&vars).expect("valid config");
             assert_eq!(cfg.log_level, expected);
-            assert_eq!(cfg.log_level.as_str(), name);
+            assert_eq!(serde_json::to_value(cfg.log_level).unwrap(), name);
         }
     }
 
@@ -692,7 +652,7 @@ mod tests {
         assert_eq!(cfg.idle_timeout_seconds, 900);
         assert!(!cfg.allow_writes);
         assert!(!cfg.auto_clean_orphans);
-        assert_eq!(cfg.log_level, LogLevel::Info);
+        assert_eq!(cfg.log_level, Level::Info);
         assert_eq!(cfg.password, None);
         assert_eq!(cfg.log_file, None);
     }

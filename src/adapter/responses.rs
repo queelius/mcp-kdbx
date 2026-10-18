@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn locked_error_with_info_carries_discard_details() {
         let info = LockInfo {
-            reason: "idle_timeout".to_string(),
+            reason: crate::kdbx_core::vault::LockReason::IdleTimeout,
             pending_discarded_count: 2,
             summary: vec!["/Web/GitHub".to_string(), "/Web/GitLab".to_string()],
         };

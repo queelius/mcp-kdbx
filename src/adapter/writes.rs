@@ -19,14 +19,16 @@
 use crate::adapter::views::format_system_time;
 use crate::adapter::{KdbxServer, responses};
 use crate::kdbx_core::address::EntryAddress;
-use crate::kdbx_core::audit::AuditEvent;
+use crate::kdbx_core::audit::{AuditEvent, StageDiscardReason, WriteTool};
 use crate::kdbx_core::error::{CoreError, ErrorCode};
 use crate::kdbx_core::path::{VaultPath, vault_path_to_entry};
 use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::stage;
+use crate::kdbx_core::vault_file::SaveStep;
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
+use serde::Deserialize;
 use std::collections::HashMap;
 
 /// One field on a new entry in the `kdbx_add_entry` input map: a value and its
@@ -170,7 +172,7 @@ impl KdbxServer {
         let uuid = entry_id.uuid().to_string();
 
         self.emit(AuditEvent::WriteStaged {
-            tool: "kdbx_add_entry".to_string(),
+            tool: WriteTool::KdbxAddEntry,
             target_path: path.clone(),
             target_uuid: uuid.clone(),
             field_name: None,
@@ -228,7 +230,7 @@ impl KdbxServer {
         let path = vault_path_to_entry(working, entry_id).map(|p| p.format());
         let uuid = entry_id.uuid().to_string();
         self.emit(AuditEvent::WriteStaged {
-            tool: "kdbx_update_field".to_string(),
+            tool: WriteTool::KdbxUpdateField,
             target_path: path.clone(),
             target_uuid: uuid.clone(),
             field_name: Some(params.field_name.clone()),
@@ -337,8 +339,14 @@ impl KdbxServer {
                     ErrorCode::NoPendingChanges => {}
                     // Any other failure is a write failure.
                     _ => {
+                        // The save path tags every WRITE_FAILED with the step
+                        // that failed (details.step, a SaveStep).
+                        let failure_step = e
+                            .details()
+                            .and_then(|d| d.get("step"))
+                            .and_then(|step| SaveStep::deserialize(step).ok());
                         self.emit(AuditEvent::SaveFailed {
-                            failure_step: "write".to_string(),
+                            failure_step,
                             error_message: e.message().to_string(),
                             pending_changes: pending_before,
                         });
@@ -380,7 +388,7 @@ impl KdbxServer {
         };
 
         self.emit(AuditEvent::StageDiscarded {
-            reason: "manual".to_string(),
+            reason: StageDiscardReason::Manual,
             num_dropped: num_dropped as u64,
             summary,
         });

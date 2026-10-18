@@ -115,6 +115,13 @@ impl ErrorCode {
     }
 }
 
+/// Serializes as the stable wire string (the audit `auth_failed.error_code`).
+impl serde::Serialize for ErrorCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())

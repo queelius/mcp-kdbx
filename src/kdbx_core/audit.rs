@@ -31,35 +31,74 @@
 //! verbosity, not by emitting redacted copies of those payloads here. If the
 //! capture is added later, it must restore a redaction layer before logging.
 
+use crate::kdbx_core::error::ErrorCode;
+use crate::kdbx_core::unlock::UnlockSource;
+use crate::kdbx_core::vault::LockReason;
+use crate::kdbx_core::vault_file::SaveStep;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
 
-/// Severity level for an audit event, mapped from the spec's per-event level
-/// column. The wire form is lowercase (see [`Level::as_str`]) to match the
-/// envelope shape in spec section 6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Severity level, shared by audit events and the `KDBX_LOG_LEVEL` setting.
+///
+/// The variants are declared least verbose first, so the derived `Ord` is the
+/// verbosity order: an event is emitted when `event.level() <= configured`.
+/// The wire and config spelling is the lowercase variant name, via serde (the
+/// envelope's `level` field, and [`Level::from_str`] for the env var), so
+/// there is no string table to keep in step.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Level {
     Error,
     Warn,
+    /// The default level. Captures lifecycle and reveal events.
+    #[default]
     Info,
     Debug,
     Trace,
 }
 
-impl Level {
-    /// The lowercase wire string for this level.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Level::Error => "error",
-            Level::Warn => "warn",
-            Level::Info => "info",
-            Level::Debug => "debug",
-            Level::Trace => "trace",
-        }
+impl std::str::FromStr for Level {
+    type Err = serde::de::value::Error;
+
+    /// Parse the lowercase level name (case-sensitive). Anything else is an
+    /// error, so a misspelled `KDBX_LOG_LEVEL` does not silently default.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        use serde::de::IntoDeserializer;
+        Level::deserialize(raw.into_deserializer())
     }
+}
+
+/// Which write tool staged a change (the `write_staged` event's `tool`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteTool {
+    KdbxAddEntry,
+    KdbxUpdateField,
+}
+
+/// Why the stage was discarded (the `stage_discarded` event's `reason`). A
+/// lock also drops the stage, but that is reported as `vault_locked` with a
+/// [`LockReason`]; this event covers the explicit tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageDiscardReason {
+    /// `kdbx_discard_pending`.
+    Manual,
 }
 
 /// One audited action. Each variant carries the event-specific detail fields
@@ -80,21 +119,24 @@ pub enum AuditEvent {
         writes_allowed: bool,
         idle_timeout_seconds: u64,
     },
-    /// A vault was unlocked. `unlock_source` is one of "input", "env", "cmd".
+    /// A vault was unlocked.
     VaultUnlocked {
-        unlock_source: String,
+        unlock_source: UnlockSource,
         file_mtime: String,
     },
     /// A vault was locked (idle, explicit, or shutdown).
     VaultLocked {
-        reason: String,
+        reason: LockReason,
         pending_discarded_count: u64,
     },
     /// Authentication failed. `source` matches the unlock source that failed.
-    AuthFailed { source: String, error_code: String },
+    AuthFailed {
+        source: UnlockSource,
+        error_code: ErrorCode,
+    },
     /// A write was staged into the working database (not yet on disk).
     WriteStaged {
-        tool: String,
+        tool: WriteTool,
         target_path: Option<String>,
         target_uuid: String,
         /// Present only for field-level writes; null otherwise.
@@ -102,7 +144,7 @@ pub enum AuditEvent {
     },
     /// The pending stage was discarded. `summary` carries paths only, no values.
     StageDiscarded {
-        reason: String,
+        reason: StageDiscardReason,
         num_dropped: u64,
         summary: Vec<String>,
     },
@@ -118,9 +160,10 @@ pub enum AuditEvent {
         conflict_mtime: String,
         pending_changes: u64,
     },
-    /// Save failed mid-flight. `failure_step` names where it stopped.
+    /// Save failed mid-flight. `failure_step` names where it stopped (null
+    /// only if the error carried no step, which the save path never does).
     SaveFailed {
-        failure_step: String,
+        failure_step: Option<SaveStep>,
         error_message: String,
         pending_changes: u64,
     },
@@ -331,7 +374,7 @@ impl AuditEvent {
     pub fn envelope(&self, timestamp: &str, pid: u32) -> Value {
         json!({
             "timestamp": timestamp,
-            "level": self.level().as_str(),
+            "level": self.level(),
             "event": self.event(),
             "pid": pid,
             "details": self.details_json(),
@@ -432,7 +475,7 @@ mod tests {
             ),
             (
                 AuditEvent::VaultUnlocked {
-                    unlock_source: "env".to_string(),
+                    unlock_source: UnlockSource::Env,
                     file_mtime: "2026-05-08T10:00:00Z".to_string(),
                 },
                 "vault_unlocked",
@@ -440,7 +483,7 @@ mod tests {
             ),
             (
                 AuditEvent::VaultLocked {
-                    reason: "idle_timeout".to_string(),
+                    reason: LockReason::IdleTimeout,
                     pending_discarded_count: 0,
                 },
                 "vault_locked",
@@ -448,15 +491,15 @@ mod tests {
             ),
             (
                 AuditEvent::AuthFailed {
-                    source: "cmd".to_string(),
-                    error_code: "AUTH_FAILED".to_string(),
+                    source: UnlockSource::Cmd,
+                    error_code: ErrorCode::AuthFailed,
                 },
                 "auth_failed",
                 Level::Error,
             ),
             (
                 AuditEvent::WriteStaged {
-                    tool: "kdbx_update_field".to_string(),
+                    tool: WriteTool::KdbxUpdateField,
                     target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                     field_name: Some("Password".to_string()),
@@ -466,7 +509,7 @@ mod tests {
             ),
             (
                 AuditEvent::StageDiscarded {
-                    reason: "manual".to_string(),
+                    reason: StageDiscardReason::Manual,
                     num_dropped: 2,
                     summary: vec!["/Web/GitHub".to_string(), "/Web/GitLab".to_string()],
                 },
@@ -493,7 +536,7 @@ mod tests {
             ),
             (
                 AuditEvent::SaveFailed {
-                    failure_step: "rename".to_string(),
+                    failure_step: Some(SaveStep::Rename),
                     error_message: "disk full".to_string(),
                     pending_changes: 1,
                 },
@@ -576,12 +619,24 @@ mod tests {
     }
 
     #[test]
-    fn level_wire_strings() {
-        assert_eq!(Level::Error.as_str(), "error");
-        assert_eq!(Level::Warn.as_str(), "warn");
-        assert_eq!(Level::Info.as_str(), "info");
-        assert_eq!(Level::Debug.as_str(), "debug");
-        assert_eq!(Level::Trace.as_str(), "trace");
+    fn level_wire_strings_parse_and_order() {
+        let all = [
+            (Level::Error, "error"),
+            (Level::Warn, "warn"),
+            (Level::Info, "info"),
+            (Level::Debug, "debug"),
+            (Level::Trace, "trace"),
+        ];
+        for (level, name) in all {
+            assert_eq!(serde_json::to_value(level).unwrap(), json!(name));
+            assert_eq!(name.parse::<Level>().unwrap(), level);
+        }
+        assert!("INFO".parse::<Level>().is_err());
+        assert!("verbose".parse::<Level>().is_err());
+        // Declaration order is verbosity order.
+        assert!(Level::Error < Level::Warn && Level::Warn < Level::Info);
+        assert!(Level::Info < Level::Debug && Level::Debug < Level::Trace);
+        assert_eq!(Level::default(), Level::Info);
     }
 
     #[test]
@@ -600,7 +655,7 @@ mod tests {
         // Exactly the five envelope fields from spec section 6, no more.
         assert_eq!(obj.len(), 5);
         assert_eq!(obj["timestamp"], json!("2026-05-08T10:00:00Z"));
-        assert_eq!(obj["level"], json!(level.as_str()));
+        assert_eq!(obj["level"], json!(level));
         assert_eq!(obj["event"], json!(name));
         assert_eq!(obj["pid"], json!(12345));
         assert!(obj["details"].is_object());
@@ -611,7 +666,7 @@ mod tests {
         for (event, name, level) in all_events() {
             let env = event.envelope("2026-05-08T10:00:00Z", 999);
             assert_eq!(env["timestamp"], json!("2026-05-08T10:00:00Z"));
-            assert_eq!(env["level"], json!(level.as_str()));
+            assert_eq!(env["level"], json!(level));
             assert_eq!(env["event"], json!(name));
             assert_eq!(env["pid"], json!(999));
             assert!(
@@ -625,7 +680,7 @@ mod tests {
     fn details_carry_the_spec_fields() {
         // Spot-check a few variants against the spec's details column.
         let staged = AuditEvent::WriteStaged {
-            tool: "kdbx_add_entry".to_string(),
+            tool: WriteTool::KdbxAddEntry,
             target_path: Some("/Web/New".to_string()),
             target_uuid: "uuid-1".to_string(),
             field_name: None,

@@ -109,14 +109,13 @@ impl KdbxServer {
                     // before returning one, so label it "cmd" (the only
                     // source that can fail with AUTH_FAILED here).
                     self.emit(AuditEvent::AuthFailed {
-                        source: "cmd".to_string(),
-                        error_code: e.code().to_string(),
+                        source: crate::kdbx_core::unlock::UnlockSource::Cmd,
+                        error_code: e.code_enum(),
                     });
                 }
                 return responses::err(&e);
             }
         };
-        let source_label = source.as_str().to_string();
 
         // Resolve the keyfile: the per-call keyfile_bytes wins; otherwise fall
         // back to the configured KDBX_KEYFILE_PATH (mirrors the password source
@@ -127,8 +126,8 @@ impl KdbxServer {
             Err(e) => {
                 if e.code_enum() == ErrorCode::AuthFailed {
                     self.emit(AuditEvent::AuthFailed {
-                        source: source_label.clone(),
-                        error_code: e.code().to_string(),
+                        source,
+                        error_code: e.code_enum(),
                     });
                 }
                 return responses::err(&e);
@@ -146,7 +145,7 @@ impl KdbxServer {
                     .map(format_system_time)
                     .unwrap_or_default();
                 self.emit(AuditEvent::VaultUnlocked {
-                    unlock_source: source_label.clone(),
+                    unlock_source: source,
                     file_mtime,
                 });
                 let vault_name = vault
@@ -165,8 +164,8 @@ impl KdbxServer {
             Err(e) => {
                 if e.code_enum() == ErrorCode::AuthFailed {
                     self.emit(AuditEvent::AuthFailed {
-                        source: source_label.clone(),
-                        error_code: e.code().to_string(),
+                        source,
+                        error_code: e.code_enum(),
                     });
                 }
                 responses::err(&e)
@@ -183,7 +182,7 @@ impl KdbxServer {
         let mut vault = self.vault().await;
         let pending_discarded = vault.lock(LockReason::Manual);
         self.emit(AuditEvent::VaultLocked {
-            reason: "manual".to_string(),
+            reason: LockReason::Manual,
             pending_discarded_count: pending_discarded as u64,
         });
         responses::ok(serde_json::json!({

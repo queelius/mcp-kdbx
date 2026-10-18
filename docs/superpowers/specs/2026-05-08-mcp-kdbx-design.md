@@ -1322,3 +1322,14 @@ integration tests assert them.
   says to call the tool with no arguments (the server reads `KDBX_PASSWORD` or
   `KDBX_UNLOCK_CMD`) and not to ask the user to type the password into the
   chat; the `password` argument is documented as for scripted use.
+- **Typed audit fields (format unchanged).** One ordered `Level` enum serves
+  both the audit envelope and `KDBX_LOG_LEVEL` (the derived order is the
+  verbosity order, replacing a string-keyed rank with a silent `info`
+  fallback). `unlock_source` and `source` are an `UnlockSource`, `reason` on
+  `vault_locked` and in lock reports is a `LockReason`, `tool` a `WriteTool`,
+  `stage_discarded.reason` a `StageDiscardReason`, `error_code` an
+  `ErrorCode`, and `failure_step` a `SaveStep`, all serialized through serde
+  to the same strings as before; a unit test pins the exact JSONL line of
+  every event. The one value change: `save_failed.failure_step` now names the
+  real step (`lock`, `reread`, `serialize`, `write_temp`, `rename`) instead of
+  always `"write"`.

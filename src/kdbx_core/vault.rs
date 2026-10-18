@@ -30,7 +30,11 @@ use zeroize::Zeroize;
 /// Why a lock happened. Passed into [`Vault::lock`] so the caller can record it
 /// in the audit log. Phase 1 does not emit audit events from this module; the
 /// reason is threaded through for the Phase 3 adapter and for tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes as its snake_case name (`"manual"`, `"idle_timeout"`,
+/// `"shutdown"`) in audit events and lock reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LockReason {
     /// An explicit `kdbx_lock` tool call.
     Manual,
@@ -40,26 +44,12 @@ pub enum LockReason {
     Shutdown,
 }
 
-impl LockReason {
-    /// The stable lowercase label used in audit events and the [`LockInfo`]
-    /// returned to the adapter. The adapter attaches this to the
-    /// `VAULT_LOCKED` error so the first call after a lock can say why.
-    pub fn label(self) -> &'static str {
-        match self {
-            LockReason::Manual => "manual",
-            LockReason::IdleTimeout => "idle_timeout",
-            LockReason::Shutdown => "shutdown",
-        }
-    }
-}
-
 /// What a lock discarded, captured at lock time so the first tool call after a
 /// lock can report what staged work was thrown away (spec section 2, "Pending
 /// changes on lock").
 ///
 /// The adapter takes this once (via [`Vault::take_last_lock`]) and attaches it
-/// to the next `VAULT_LOCKED` error. `reason` is the [`LockReason::label`]
-/// string; `pending_discarded_count` is the number of added plus modified
+/// to the next `VAULT_LOCKED` error. `reason` is the [`LockReason`]; `pending_discarded_count` is the number of added plus modified
 /// entries that were dropped; `summary` labels them (vault path, or UUID for a
 /// record with no addressable path, see `DiffPending::entry_labels`).
 ///
@@ -68,10 +58,9 @@ impl LockReason {
 /// `{ lock_reason, pending_discarded_count, pending_discarded_summary }`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LockInfo {
-    /// The lock reason as a stable label: `"manual"`, `"idle_timeout"`, or
-    /// `"shutdown"`.
+    /// Why the lock happened.
     #[serde(rename = "lock_reason")]
-    pub reason: String,
+    pub reason: LockReason,
     /// How many staged entries (added plus modified) the lock discarded.
     pub pending_discarded_count: usize,
     /// The discarded added and modified entries: each one's vault path, or its
@@ -276,8 +265,7 @@ impl Vault {
     /// The master key is zeroed before the state transition; dropping the
     /// `Unlocked` state then drops both databases, which is what discards the
     /// pending stage (the working db is the stage). `reason` is recorded in the
-    /// stashed [`LockInfo`] (as its [`label`](LockReason::label)) so the caller
-    /// can say why.
+    /// stashed [`LockInfo`] so the caller can say why.
     ///
     /// Locking an already-locked vault is a no-op that returns 0 and leaves
     /// `last_lock` untouched.
@@ -310,7 +298,7 @@ impl Vault {
                 key.zeroize();
                 // Stash what this lock discarded for the next VAULT_LOCKED.
                 self.last_lock = Some(LockInfo {
-                    reason: reason.label().to_string(),
+                    reason,
                     pending_discarded_count: count,
                     summary,
                 });
@@ -886,10 +874,11 @@ mod tests {
     }
 
     #[test]
-    fn lock_reason_labels_are_stable() {
-        assert_eq!(LockReason::Manual.label(), "manual");
-        assert_eq!(LockReason::IdleTimeout.label(), "idle_timeout");
-        assert_eq!(LockReason::Shutdown.label(), "shutdown");
+    fn lock_reason_wire_names_are_stable() {
+        let name = |r| serde_json::to_value(r).unwrap();
+        assert_eq!(name(LockReason::Manual), "manual");
+        assert_eq!(name(LockReason::IdleTimeout), "idle_timeout");
+        assert_eq!(name(LockReason::Shutdown), "shutdown");
     }
 
     #[test]
@@ -903,7 +892,7 @@ mod tests {
         assert_eq!(discarded, 1);
 
         let info = vault.take_last_lock().expect("a discard to report");
-        assert_eq!(info.reason, "idle_timeout");
+        assert_eq!(info.reason, LockReason::IdleTimeout);
         assert_eq!(info.pending_discarded_count, 1);
         assert_eq!(info.summary.len(), 1);
         // The summary holds the human path of the modified entry.
@@ -925,7 +914,7 @@ mod tests {
         // A clean lock still records a LockInfo so the adapter can report the
         // reason; the count is zero and the summary empty.
         let info = vault.take_last_lock().expect("clean lock still records");
-        assert_eq!(info.reason, "manual");
+        assert_eq!(info.reason, LockReason::Manual);
         assert_eq!(info.pending_discarded_count, 0);
         assert!(info.summary.is_empty());
     }
@@ -966,7 +955,7 @@ mod tests {
             .unlock(TEST_PASSWORD, None)
             .expect("second unlock")
             .expect("the discard is reported");
-        assert_eq!(prior.reason, "idle_timeout");
+        assert_eq!(prior.reason, LockReason::IdleTimeout);
         assert_eq!(prior.pending_discarded_count, 1);
         assert!(vault.last_lock().is_none(), "consumed by the unlock");
     }

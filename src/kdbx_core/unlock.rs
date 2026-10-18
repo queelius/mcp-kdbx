@@ -39,7 +39,10 @@ use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 /// adapter records whatever [`resolve_unlock_source`] returns rather than
 /// re-deriving the label from the config, so the audit cannot drift from the
 /// priority order applied here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes as its lowercase name: `"input"`, `"env"`, or `"cmd"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UnlockSource {
     /// The `password` argument passed to the tool call.
     Input,
@@ -47,17 +50,6 @@ pub enum UnlockSource {
     Env,
     /// The stdout of `KDBX_UNLOCK_CMD`.
     Cmd,
-}
-
-impl UnlockSource {
-    /// The stable audit label for this source: "input", "env", or "cmd".
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            UnlockSource::Input => "input",
-            UnlockSource::Env => "env",
-            UnlockSource::Cmd => "cmd",
-        }
-    }
 }
 
 /// Resolve the master password from the first available source, in priority
@@ -314,9 +306,18 @@ mod tests {
     fn unlock_source_labels_are_stable() {
         // These strings are the audit unlock_source label; pin them so a rename
         // of an enum variant cannot silently change the audit contract.
-        assert_eq!(UnlockSource::Input.as_str(), "input");
-        assert_eq!(UnlockSource::Env.as_str(), "env");
-        assert_eq!(UnlockSource::Cmd.as_str(), "cmd");
+        assert_eq!(
+            serde_json::to_value(UnlockSource::Input).unwrap(),
+            json!("input")
+        );
+        assert_eq!(
+            serde_json::to_value(UnlockSource::Env).unwrap(),
+            json!("env")
+        );
+        assert_eq!(
+            serde_json::to_value(UnlockSource::Cmd).unwrap(),
+            json!("cmd")
+        );
     }
 
     #[tokio::test]

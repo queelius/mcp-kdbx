@@ -99,7 +99,8 @@ impl KdbxServer {
     /// by setting KDBX_LOG_LEVEL=warn"). Reveal and write events are info level,
     /// so they appear by default and can be silenced only deliberately.
     pub(crate) fn emit(&self, event: AuditEvent) {
-        if verbosity(event.level().as_str()) <= verbosity(self.config.log_level.as_str()) {
+        // Level's derived order is verbosity order (least verbose first).
+        if event.level() <= self.config.log_level {
             self.audit.write(&event);
         }
     }
@@ -141,12 +142,13 @@ impl KdbxServer {
             tokio::time::sleep(interval).await;
             let mut vault = self.state.lock().await;
             if vault.should_lock(Instant::now(), timeout) {
-                let dropped = vault.lock(crate::kdbx_core::vault::LockReason::IdleTimeout);
+                let reason = crate::kdbx_core::vault::LockReason::IdleTimeout;
+                let dropped = vault.lock(reason);
                 // Drop the guard before emitting so the audit write is off the
                 // lock.
                 drop(vault);
                 self.emit(AuditEvent::VaultLocked {
-                    reason: "idle_timeout".to_string(),
+                    reason,
                     pending_discarded_count: dropped as u64,
                 });
             }
@@ -222,21 +224,6 @@ where
 
     fn json_schema(generator: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
         T::json_schema(generator)
-    }
-}
-
-/// Map a level name (`error`/`warn`/`info`/`debug`/`trace`) to a verbosity rank,
-/// least verbose first. An event emits when its rank is at most the configured
-/// level's rank. Both `audit::Level` and `config::LogLevel` render to these
-/// names, so this one ranking covers the comparison without a second table.
-fn verbosity(level: &str) -> u8 {
-    match level {
-        "error" => 0,
-        "warn" => 1,
-        "info" => 2,
-        "debug" => 3,
-        "trace" => 4,
-        _ => 2,
     }
 }
 
