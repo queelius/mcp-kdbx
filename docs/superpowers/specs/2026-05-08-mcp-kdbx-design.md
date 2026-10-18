@@ -1250,3 +1250,10 @@ integration tests assert them.
   file the link pointed at. `KDBX_AUTO_CLEAN_ORPHANS` scans the resolved
   file's directory for the same reason. `kdbx_status.vault_path` still reports
   the configured path.
+- **Save temp files are owner-only from creation, and orphan cleanup is
+  strict.** The temp file (`<vault>.tmp.<pid>.<nonce>`, both decimal) is
+  created with mode 0600 (it was umask-default until a later chmod, briefly
+  world-readable). One `TempName` type formats the name for the writer and
+  parses it for `KDBX_AUTO_CLEAN_ORPHANS`, which now removes only names with
+  two decimal parts, so a user file like `vault.kdbx.tmp.old.bak` is never
+  deleted.

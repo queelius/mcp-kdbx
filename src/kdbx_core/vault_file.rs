@@ -200,22 +200,13 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> CoreResult<FileFingerprint
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "vault.kdbx".to_string());
+    let temp_path = parent.join(TempName::new(&file_name).file_name());
 
-    let temp_path = parent.join(format!(
-        "{}.tmp.{}.{}",
-        file_name,
-        std::process::id(),
-        temp_suffix()
-    ));
-
-    // create_new (O_EXCL) refuses to clobber a pre-existing temp file. Any
-    // failure here unlinks the temp and surfaces WRITE_FAILED; the vault file
-    // is untouched.
+    // create_new (O_EXCL) refuses to clobber a pre-existing temp file, and the
+    // file is owner-only from creation (see create_temp_file). Any failure here
+    // unlinks the temp and surfaces WRITE_FAILED; the vault file is untouched.
     let write_result = (|| -> std::io::Result<SystemTime> {
-        let mut file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
+        let mut file = create_temp_file(&temp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         file.metadata()?.modified()
@@ -269,13 +260,89 @@ fn preserve_temp_permissions(vault_path: &Path, temp_path: &Path) {
 #[cfg(not(unix))]
 fn preserve_temp_permissions(_vault_path: &Path, _temp_path: &Path) {}
 
-/// A per-call suffix for the temp file name, from the current time's nanos.
-/// Combined with the pid in the name, unique enough for a short-lived file.
-fn temp_suffix() -> u128 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
+/// Create a save temp file: exclusive (`create_new`, so an existing file is
+/// never clobbered) and, on Unix, mode 0600 from the moment it exists. The
+/// temp holds the whole encrypted vault; creating it with the umask default
+/// (typically 0644) and tightening it afterwards would leave a window where it
+/// is world-readable.
+fn create_temp_file(temp_path: &Path) -> std::io::Result<File> {
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(temp_path)
+}
+
+/// The name of a save temp file: `<vault_file>.tmp.<pid>.<nonce>`, with `pid`
+/// and `nonce` decimal.
+///
+/// One type both writes the name ([`TempName::file_name`], used by
+/// [`write_atomically`]) and reads it back ([`TempName::parse`], used by the
+/// orphan cleanup), so the cleanup recognizes exactly the files the writer can
+/// produce and nothing else: `vault.kdbx.tmp.old.bak` is not a temp file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TempName {
+    vault_file: String,
+    pid: u32,
+    nonce: u128,
+}
+
+impl TempName {
+    /// The infix between the vault file name and the pid.
+    const INFIX: &'static str = ".tmp.";
+
+    /// A fresh temp name for `vault_file` (the vault's file name, not a path):
+    /// this process's pid and a nonce from the current time's nanoseconds.
+    /// With the pid in the name, that is unique enough for a short-lived file,
+    /// and `create_new` turns any collision into an error, not a clobber.
+    pub fn new(vault_file: &str) -> TempName {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        TempName {
+            vault_file: vault_file.to_string(),
+            pid: std::process::id(),
+            nonce,
+        }
+    }
+
+    /// The file name to create.
+    pub fn file_name(&self) -> String {
+        format!(
+            "{}{}{}.{}",
+            self.vault_file,
+            Self::INFIX,
+            self.pid,
+            self.nonce
+        )
+    }
+
+    /// Parse `name` as a temp name for `vault_file`. Strict: after the
+    /// `<vault_file>.tmp.` prefix there must be exactly two dot-separated runs
+    /// of ASCII digits that fit the pid and nonce types. Anything else is
+    /// `None`.
+    pub fn parse(name: &str, vault_file: &str) -> Option<TempName> {
+        let rest = name.strip_prefix(vault_file)?.strip_prefix(Self::INFIX)?;
+        let (pid, nonce) = rest.split_once('.')?;
+        Some(TempName {
+            vault_file: vault_file.to_string(),
+            pid: parse_decimal(pid)?,
+            nonce: parse_decimal(nonce)?,
+        })
+    }
+}
+
+/// Parse a non-empty run of ASCII digits (no sign, no whitespace) as `T`.
+/// `str::parse` alone would accept a leading `+`.
+fn parse_decimal<T: std::str::FromStr>(s: &str) -> Option<T> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
 }
 
 #[cfg(test)]
@@ -328,6 +395,39 @@ mod tests {
 
         drop(held);
         WriterLock::acquire(&vault, Duration::ZERO).expect("free after release");
+    }
+
+    #[test]
+    fn temp_name_round_trips_and_parses_strictly() {
+        let name = TempName::new("vault.kdbx");
+        let formatted = name.file_name();
+        assert!(formatted.starts_with("vault.kdbx.tmp."));
+        assert_eq!(TempName::parse(&formatted, "vault.kdbx"), Some(name));
+        // Wrong vault, non-numeric parts, extra parts, signs: not ours.
+        for other in [
+            "other.kdbx.tmp.1.2",
+            "vault.kdbx.tmp.old.bak",
+            "vault.kdbx.tmp.1.abc",
+            "vault.kdbx.tmp.1.2.3",
+            "vault.kdbx.tmp.+1.2",
+            "vault.kdbx.tmp.1",
+            "vault.kdbx.tmp.",
+            "vault.kdbx",
+        ] {
+            assert_eq!(TempName::parse(other, "vault.kdbx"), None, "{other}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn temp_file_is_created_owner_only() {
+        // The temp holds the full (encrypted) vault. It must be 0600 from
+        // creation, not umask-default until a later chmod.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(TempName::new("v.kdbx").file_name());
+        let file = create_temp_file(&p).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]
