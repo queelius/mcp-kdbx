@@ -17,7 +17,8 @@
 //!    dependency. The sidecar is never deleted: removing a lock file while
 //!    another process may be about to open it is its own race.
 //! 3. [`write_atomically`]: temp file in the same directory, fsync, rename over
-//!    the vault, fsync the directory.
+//!    the vault, fsync the directory. The save first resolves symlinks
+//!    ([`resolve_write_target`]) so a linked vault stays linked.
 //!
 //! Residual risk, documented in the spec: the lock coordinates mcp-kdbx
 //! instances only. Another program (KeePassXC) does not take it, so a write by
@@ -77,6 +78,24 @@ pub fn read_with_fingerprint(path: &Path) -> std::io::Result<(Vec<u8>, FileFinge
     file.read_to_end(&mut bytes)?;
     let fingerprint = FileFingerprint::new(&bytes, mtime);
     Ok((bytes, fingerprint))
+}
+
+/// The file a save must replace: `path` with every symlink resolved.
+///
+/// The atomic rename replaces whatever directory entry it targets. Renaming
+/// onto the configured path when it is a symlink would replace the link with a
+/// regular file, silently detaching the vault from the file the link pointed
+/// at (a dotfile manager's or sync folder's copy). So the save resolves the
+/// link and works next to the real file: the temp file, the rename, and the
+/// writer lock all use the resolved path, which also means two instances that
+/// reach one vault through different links share one lock. A vault file that
+/// no longer exists is `WRITE_FAILED`.
+pub fn resolve_write_target(path: &Path) -> CoreResult<PathBuf> {
+    std::fs::canonicalize(path).map_err(|e| {
+        CoreError::new(ErrorCode::WriteFailed)
+            .with_message(format!("could not resolve the vault file path: {e}"))
+            .with_details(serde_json::json!({ "step": SaveStep::Reread }))
+    })
 }
 
 /// The sidecar lock-file path for `vault`: `<vault>.lock` in the same

@@ -54,6 +54,10 @@ pub struct CleanReport {
 /// responsibility (spec section 2, startup step 8).
 pub fn clean_orphans(vault_path: &Path, now: SystemTime) -> CleanReport {
     let mut report = CleanReport::default();
+    // Saves resolve symlinks and write their temp files next to the real vault
+    // file, so scan there. A path that cannot be resolved is scanned as given.
+    let resolved = std::fs::canonicalize(vault_path).ok();
+    let vault_path = resolved.as_deref().unwrap_or(vault_path);
 
     let parent = match vault_path.parent() {
         // An empty parent ("") means the current directory; normalize to ".".
@@ -332,6 +336,25 @@ mod tests {
             report.removed
         );
         assert!(vault.exists(), "vault file must never be removed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleans_next_to_the_symlink_target() {
+        // Saves write their temp files next to the resolved vault file, so the
+        // cleanup must look there too when the configured path is a link.
+        let real_dir = tempdir().unwrap();
+        let link_dir = tempdir().unwrap();
+        let vault = touch(real_dir.path(), "vault.kdbx");
+        let orphan = touch(real_dir.path(), "vault.kdbx.tmp.12345.67890");
+        let link = link_dir.path().join("link.kdbx");
+        std::os::unix::fs::symlink(&vault, &link).unwrap();
+
+        let report = clean_orphans(&link, two_hours_ahead());
+
+        assert!(!orphan.exists(), "orphan next to the target is removed");
+        assert!(vault.exists());
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
     }
 
     #[test]

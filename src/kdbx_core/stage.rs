@@ -30,7 +30,8 @@ use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 use crate::kdbx_core::path::{VaultPath, vault_path_to_entry, vault_path_to_group};
 use crate::kdbx_core::vault::Vault;
 use crate::kdbx_core::vault_file::{
-    SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint, write_atomically,
+    SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint, resolve_write_target,
+    write_atomically,
 };
 use diff_kdbx::change_set::{Change, EntryChangeKind, FieldChange, ValueChange, ValueDisplay};
 use diff_kdbx::options::DiffOptions;
@@ -666,7 +667,9 @@ fn plain_to_json(v: &ValueDisplay) -> serde_json::Value {
 /// 1. Refuse when nothing is pending (`NO_PENDING_CHANGES`).
 /// 2. Serialize (and encrypt) the working db in memory. The KDF runs here,
 ///    before the writer lock is taken, so the lock is held only for I/O.
-/// 3. Take the sidecar writer lock ([`WriterLock`]) so another mcp-kdbx
+/// 3. Resolve symlinks (a linked vault stays linked; see
+///    [`resolve_write_target`]) and take the sidecar writer lock
+///    ([`WriterLock`]) next to the real file so another mcp-kdbx
 ///    instance cannot interleave between the check and the rename.
 /// 4. Re-read the vault file and compare its content hash with the baseline
 ///    recorded at unlock (or at the last save). Any difference, whatever the
@@ -701,9 +704,12 @@ pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
         buf
     };
 
-    let _lock = WriterLock::acquire(&path, WRITER_LOCK_WAIT)?;
+    // Resolve symlinks so the rename replaces the real file, not the link.
+    let target = resolve_write_target(&path)?;
 
-    let (_, current) = read_with_fingerprint(&path).map_err(|e| {
+    let _lock = WriterLock::acquire(&target, WRITER_LOCK_WAIT)?;
+
+    let (_, current) = read_with_fingerprint(&target).map_err(|e| {
         CoreError::new(ErrorCode::WriteFailed)
             .with_message(format!("could not re-read the vault file: {e}"))
             .with_details(serde_json::json!({ "step": SaveStep::Reread }))
@@ -718,7 +724,7 @@ pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
         );
     }
 
-    let written = write_atomically(&path, &bytes)?;
+    let written = write_atomically(&target, &bytes)?;
 
     vault.mark_saved(written)?;
 
@@ -1596,6 +1602,54 @@ mod tests {
         )
         .unwrap();
         save_pending(&mut vault).expect("second save against the new baseline");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_through_a_symlink_writes_the_target_and_keeps_the_link() {
+        // A vault reached through a symlink (dotfile managers, synced folders)
+        // must stay a symlink: the save writes next to the target and renames
+        // onto it, instead of replacing the link with a regular file.
+        let db = build_db();
+        let (tmp, target) = write_fixture(&db);
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link.kdbx");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut vault = Vault::new(link.clone());
+        vault.unlock(TEST_PASSWORD, None).unwrap();
+        add_entry(
+            vault.working_db_mut().unwrap(),
+            &path("/"),
+            &simple_input("Via Link"),
+        )
+        .unwrap();
+        save_pending(&mut vault).expect("save through the link");
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link survives the save");
+        let reopened = Database::open(
+            &mut std::fs::File::open(&target).unwrap(),
+            DatabaseKey::new().with_password(TEST_PASSWORD),
+        )
+        .unwrap();
+        assert!(
+            reopened
+                .iter_all_entries()
+                .any(|e| e.get_title() == Some("Via Link")),
+            "the target file holds the saved change"
+        );
+        // Nothing (no temp, no lock file) was left next to the link.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "link.kdbx")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stray files next to the link: {leftovers:?}"
+        );
+        drop(tmp);
     }
 
     #[test]

@@ -1243,3 +1243,10 @@ integration tests assert them.
   current, or next code, for clock skew), the response gains `time_unix` (the
   time actually used), and the `get_otp` audit event records
   `requested_time_unix` (null when omitted) and the effective `time_unix`.
+- **A symlinked vault stays a symlink.** The save resolves the configured
+  `KDBX_VAULT_PATH` through any symlinks and writes the temp file, takes the
+  writer lock, re-reads, and renames next to the real file. Before, the rename
+  replaced the link itself with a regular file, detaching the vault from the
+  file the link pointed at. `KDBX_AUTO_CLEAN_ORPHANS` scans the resolved
+  file's directory for the same reason. `kdbx_status.vault_path` still reports
+  the configured path.
