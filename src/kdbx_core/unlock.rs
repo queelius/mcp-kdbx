@@ -155,6 +155,12 @@ async fn run_unlock_cmd(cmd: &str, timeout_seconds: u64) -> CoreResult<Zeroizing
         }
     };
 
+    // Both captured buffers are zeroized when they drop, on every path below
+    // (including the non-zero exit): stdout is the master password, and
+    // stderr may echo it (or other secret-manager output).
+    let stdout = Zeroizing::new(output.stdout);
+    let _stderr = Zeroizing::new(output.stderr);
+
     if !output.status.success() {
         return Err(CoreError::new(ErrorCode::AuthFailed)
             .with_message("Unlock command exited non-zero.")
@@ -164,11 +170,6 @@ async fn run_unlock_cmd(cmd: &str, timeout_seconds: u64) -> CoreResult<Zeroizing
                 "exit_code": output.status.code(),
             })));
     }
-
-    // Both captured buffers are zeroized when they drop: stdout is the master
-    // password, and stderr may echo it (or other secret-manager output).
-    let stdout = Zeroizing::new(output.stdout);
-    let _stderr = Zeroizing::new(output.stderr);
 
     // Strict UTF-8. A lossy decode would replace invalid bytes with U+FFFD and
     // unlock with a password that is not the one the command printed, which
