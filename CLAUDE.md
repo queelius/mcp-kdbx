@@ -12,7 +12,7 @@ User-facing summary: `README.md`. Full v0.1 design (motivation, protocol surface
 
 **All five v0.1 phases complete (the full server, its automated test suite, CI gates, and docs). Merged to `main` locally (merge commit, `feat/v0.1` deleted); `main` is ahead of `origin/main` and not yet pushed. v0.1 is feature-complete, pending a crates.io release.**
 
-The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 240 tests pass (207 library unit tests, 27 protocol-conformance, 6 integration); `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the source security audit (`bash scripts/ci-audit.sh`) are clean. The server runs: all 17 tools register and respond over real stdio MCP.
+The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 291 tests pass (246 library unit tests, 35 protocol-conformance, 10 integration); `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the source security audit (`bash scripts/ci-audit.sh`) are clean. The server runs: all 17 tools register and respond over real stdio MCP.
 
 Phase 1 (tasks 1 to 9), the `kdbx_core` foundation: `error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`.
 
@@ -27,6 +27,8 @@ Deliberate deviations from the plan's letter: the module is `kdbx_core` (not `co
 Phase 4 also fixed a latent server-identity bug found while writing the conformance test: `get_info` used `Implementation::from_build_env()`, whose `env!` expands inside the rmcp crate, so the server announced itself as `rmcp` v1.7.0. It now builds the identity from this crate's own `CARGO_PKG_NAME`/`CARGO_PKG_VERSION`, and the conformance test pins `mcp-kdbx`.
 
 Minor deferred item: explicit SIGTERM/SIGINT lock-on-shutdown (Task 18 step 4) is not wired, but `keepass::DatabaseKey` is `ZeroizeOnDrop`, so normal shutdown (stdin close) zeroizes the key on drop; abrupt signals rely on OS memory reclaim.
+
+Review fix batch (2026-10-18, branch `fix/review-batch`): paths can no longer alias another entry (empty-title records have `path: null`, entry tools refuse trailing-slash paths, and every entry tool accepts `uuid` instead of a path); save conflicts are detected by content sha256 under a sidecar `<vault>.lock` flock (MSRV 1.89 for `File::try_lock`); `update_field` records history and modification time; every Title write is validated (Unicode Cc/Cf rejected, via `unicode-properties`); `kdbx_get_otp` clamps `time_unix` to now plus or minus one period; symlinked vaults stay symlinks; temp files are 0600 from creation and orphan cleanup parses names strictly (`vault_file::TempName`); secret-bearing fields are `Secret<T>` (redacting, zeroizing) with a structural CI check; the last lock's discard is reported by `kdbx_unlock` (`previous_lock`) and `kdbx_status` (`last_lock`); new codes `PATH_INVALID` and `VAULT_UNREADABLE`; `find_entry.fields` is a closed enum; KeePass 2 native `TimeOtp-*` TOTP fields are supported; audit levels and reasons are serde enums with the JSONL format pinned. Details: the spec's "Implementation notes (review fix batch, 2026-10-18)".
 
 Two error codes are not reachable from a black-box protocol test and stay covered by `kdbx_core` unit tests: `VAULT_NOT_FOUND` (the config layer refuses to start without a readable vault path) and `WRITE_FAILED` (needs a mid-save filesystem failure).
 
