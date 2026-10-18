@@ -52,6 +52,20 @@ pub enum UnlockSource {
     Cmd,
 }
 
+/// Why the unlock command produced no password (the `reason` in an
+/// `AUTH_FAILED` error's details). A non-zero exit carries `exit_code`
+/// instead. Serialized snake_case, for example `"unlock_cmd_timeout"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlockCmdFailure {
+    /// `/bin/sh` could not be spawned or waited on.
+    UnlockCmdSpawnFailed,
+    /// The command outlived `KDBX_UNLOCK_CMD_TIMEOUT_SECONDS`.
+    UnlockCmdTimeout,
+    /// The command's stdout is not valid UTF-8.
+    UnlockCmdOutputNotUtf8,
+}
+
 /// Resolve the master password from the first available source, in priority
 /// order: the `input_password` argument, then `config.password`
 /// (`KDBX_PASSWORD`), then the stdout of `config.unlock_cmd` (`KDBX_UNLOCK_CMD`).
@@ -124,8 +138,8 @@ async fn run_unlock_cmd(cmd: &str, timeout_seconds: u64) -> CoreResult<Zeroizing
             return Err(CoreError::new(ErrorCode::AuthFailed)
                 .with_message("Unlock command failed to run.")
                 .with_details(json!({
-                    "source": "cmd",
-                    "reason": "unlock_cmd_spawn_failed",
+                    "source": UnlockSource::Cmd,
+                    "reason": UnlockCmdFailure::UnlockCmdSpawnFailed,
                     "io_error": e.kind().to_string(),
                 })));
         }
@@ -134,8 +148,8 @@ async fn run_unlock_cmd(cmd: &str, timeout_seconds: u64) -> CoreResult<Zeroizing
             return Err(CoreError::new(ErrorCode::AuthFailed)
                 .with_message("Unlock command timed out.")
                 .with_details(json!({
-                    "source": "cmd",
-                    "reason": "unlock_cmd_timeout",
+                    "source": UnlockSource::Cmd,
+                    "reason": UnlockCmdFailure::UnlockCmdTimeout,
                     "timeout_seconds": timeout_seconds,
                 })));
         }
@@ -145,7 +159,7 @@ async fn run_unlock_cmd(cmd: &str, timeout_seconds: u64) -> CoreResult<Zeroizing
         return Err(CoreError::new(ErrorCode::AuthFailed)
             .with_message("Unlock command exited non-zero.")
             .with_details(json!({
-                "source": "cmd",
+                "source": UnlockSource::Cmd,
                 // None when killed by a signal: serializes to JSON null.
                 "exit_code": output.status.code(),
             })));
@@ -165,8 +179,8 @@ async fn run_unlock_cmd(cmd: &str, timeout_seconds: u64) -> CoreResult<Zeroizing
         CoreError::new(ErrorCode::AuthFailed)
             .with_message("Unlock command output is not valid UTF-8.")
             .with_details(json!({
-                "source": "cmd",
-                "reason": "unlock_cmd_output_not_utf8",
+                "source": UnlockSource::Cmd,
+                "reason": UnlockCmdFailure::UnlockCmdOutputNotUtf8,
             }))
     })?;
 
