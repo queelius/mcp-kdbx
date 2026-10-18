@@ -723,10 +723,16 @@ fn roundtrip_binary_attachment_base64() {
 }
 
 #[test]
-fn roundtrip_integer_range_edges_for_otp_time() {
+fn roundtrip_integer_range_edges_for_otp_time_are_clamped() {
     let mut server = unlocked("with_otp.kdbx");
-    // time_unix at the low edge (0) and a far-future value both compute a code.
-    for t in [0u64, 2_000_000_000, 4_000_000_000] {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // time_unix at the low edge (0) and far-future values are accepted but
+    // clamped to now plus or minus one 30-second period: no far-past or
+    // far-future code can be harvested.
+    for t in [0u64, 2_000_000_000, 4_000_000_000, u64::MAX] {
         let otp = server.call_ok(
             "kdbx_get_otp",
             json!({ "path": "/TOTP Account", "time_unix": t }),
@@ -734,5 +740,10 @@ fn roundtrip_integer_range_edges_for_otp_time() {
         let code = otp["code"].as_str().unwrap();
         assert_eq!(code.len(), 6, "code at time {t}");
         assert!(code.chars().all(|c| c.is_ascii_digit()));
+        let used = otp["time_unix"].as_u64().unwrap();
+        assert!(
+            used + 31 >= now && used <= now + 31,
+            "time {t} was evaluated at {used}, outside now +/- one period"
+        );
     }
 }

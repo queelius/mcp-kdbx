@@ -216,15 +216,35 @@ impl TotpConfig {
         }
     }
 
+    /// The time (Unix seconds) a code is computed at for a request that asked
+    /// for `requested` (None means now), given the current time `now`.
+    ///
+    /// The request is clamped to `now` plus or minus one period. That still
+    /// lets a caller get the previous or next code (clock skew between this
+    /// host and the verifier), but never a code for a far-past or far-future
+    /// step: an agent able to ask for any time could harvest tomorrow's codes
+    /// today, which defeats the "only the current code crosses out" rule.
+    pub fn evaluation_time(&self, requested: Option<u64>, now: u64) -> u64 {
+        let period = u64::from(self.period);
+        let earliest = now.saturating_sub(period);
+        let latest = now.saturating_add(period);
+        requested.unwrap_or(now).clamp(earliest, latest)
+    }
+
     /// Compute the code for the current wall-clock time. If the clock is before
     /// the Unix epoch (it should not be), the step is treated as 0.
     pub fn compute_now(&self) -> TotpCode {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.compute_at(now)
+        self.compute_at(unix_now())
     }
+}
+
+/// The current wall-clock time in Unix seconds. A clock before the epoch (it
+/// should not be) reads as 0.
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Decode a base32 secret using the RFC 4648 alphabet without required padding.
@@ -302,6 +322,22 @@ mod tests {
         assert_eq!(cfg.period, 30);
         assert_eq!(cfg.digits, 6);
         assert_eq!(cfg.algo, TotpAlgo::Sha1);
+    }
+
+    #[test]
+    fn evaluation_time_is_clamped_to_one_period_around_now() {
+        let cfg = TotpConfig::parse(SAMPLE_URI).expect("parse");
+        let now = 2_000_000_000u64;
+        // Inside the window: used as asked.
+        assert_eq!(cfg.evaluation_time(Some(now - 30), now), now - 30);
+        assert_eq!(cfg.evaluation_time(Some(now + 30), now), now + 30);
+        assert_eq!(cfg.evaluation_time(None, now), now);
+        // Outside it: pulled to the nearest edge, so no far-past or far-future
+        // code can be harvested.
+        assert_eq!(cfg.evaluation_time(Some(0), now), now - 30);
+        assert_eq!(cfg.evaluation_time(Some(u64::MAX), now), now + 30);
+        // Near the epoch the lower edge saturates at zero.
+        assert_eq!(cfg.evaluation_time(Some(0), 10), 0);
     }
 
     #[test]

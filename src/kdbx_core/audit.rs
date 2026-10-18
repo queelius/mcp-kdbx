@@ -152,6 +152,11 @@ pub enum AuditEvent {
     GetOtp {
         target_path: Option<String>,
         target_uuid: String,
+        /// The `time_unix` the caller asked for, or `None` for "now".
+        requested_time_unix: Option<u64>,
+        /// The time the code was computed at, after clamping the request to
+        /// now plus or minus one period.
+        time_unix: u64,
     },
 }
 
@@ -309,9 +314,13 @@ impl AuditEvent {
             AuditEvent::GetOtp {
                 target_path,
                 target_uuid,
+                requested_time_unix,
+                time_unix,
             } => json!({
                 "target_path": target_path,
                 "target_uuid": target_uuid,
+                "requested_time_unix": requested_time_unix,
+                "time_unix": time_unix,
             }),
         }
     }
@@ -524,6 +533,8 @@ mod tests {
                 AuditEvent::GetOtp {
                     target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
+                    requested_time_unix: None,
+                    time_unix: 1_700_000_000,
                 },
                 "get_otp",
                 Level::Info,
@@ -605,11 +616,16 @@ mod tests {
         let otp = AuditEvent::GetOtp {
             target_path: Some("/Web/X".to_string()),
             target_uuid: "uuid-3".to_string(),
+            requested_time_unix: Some(0),
+            time_unix: 1_699_999_970,
         };
         let d = otp.details_json();
-        // No code field: the OTP value is never logged.
+        // No code field: the OTP value is never logged. The requested and the
+        // effective (clamped) evaluation times are.
         assert!(d.get("code").is_none());
-        assert_eq!(d.as_object().unwrap().len(), 2);
+        assert_eq!(d["requested_time_unix"], json!(0));
+        assert_eq!(d["time_unix"], json!(1_699_999_970));
+        assert_eq!(d.as_object().unwrap().len(), 4);
     }
 
     #[test]

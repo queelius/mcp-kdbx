@@ -81,6 +81,8 @@ pub struct GetOtpParams {
     #[serde(default)]
     pub uuid: Option<String>,
     /// The Unix time (seconds) at which to compute the code. Defaults to now.
+    /// Clamped to now plus or minus one TOTP period (previous, current, or
+    /// next code); the response's `time_unix` is the time actually used.
     #[serde(default)]
     pub time_unix: Option<u64>,
 }
@@ -269,7 +271,7 @@ impl KdbxServer {
     /// `TOTP Seed`/`TOTP Settings` pair. The secret never leaves the process;
     /// only the code crosses out, and the audit event logs no code.
     #[tool(
-        description = "Compute the current TOTP code for an entry. Reads the modern otp field (otpauth URI) or the legacy TOTP Seed and TOTP Settings pair. Returns the code with its remaining validity and period. The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
+        description = "Compute the current TOTP code for an entry. Reads the modern otp field (otpauth URI) or the legacy TOTP Seed and TOTP Settings pair. Returns the code with its remaining validity, period, and the time_unix it was computed at (an optional time_unix is clamped to now plus or minus one period). The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
     )]
     async fn kdbx_get_otp(&self, Parameters(params): Parameters<GetOtpParams>) -> String {
         let mut vault = self.vault().await;
@@ -300,22 +302,27 @@ impl KdbxServer {
             None => return responses::err(&ErrorCode::NoOtpConfigured.into()),
         };
 
-        let code = match params.time_unix {
-            Some(t) => config.compute_at(t),
-            None => config.compute_now(),
-        };
+        // A requested time is clamped to now plus or minus one period, so only
+        // the previous, current, or next code can ever cross out.
+        let time_unix =
+            config.evaluation_time(params.time_unix, crate::kdbx_core::totp::unix_now());
+        let code = config.compute_at(time_unix);
         let target_uuid = entry.id().uuid().to_string();
 
-        // The event records the access, never the code or the secret.
+        // The event records the access and both times, never the code or the
+        // secret.
         self.emit(AuditEvent::GetOtp {
             target_path,
             target_uuid,
+            requested_time_unix: params.time_unix,
+            time_unix,
         });
 
         responses::ok(serde_json::json!({
             "code": code.code,
             "valid_for_seconds": code.valid_for_seconds,
             "period_seconds": code.period_seconds,
+            "time_unix": time_unix,
         }))
     }
 }

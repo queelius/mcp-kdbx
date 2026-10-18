@@ -1236,3 +1236,10 @@ integration tests assert them.
   key in `kdbx_add_entry`'s `fields` map is refused with `FIELD_NAME_INVALID`
   (the `title` parameter is the one way to set it). Known cost: an emoji ZWJ
   sequence (U+200D is Cf) cannot appear in a title or field name.
+- **`kdbx_get_otp.time_unix` is clamped.** Section 1 let the caller pick any
+  evaluation time, which contradicts section 3's "only the current code is
+  exposed": an agent could harvest codes for any future step. The requested
+  time is now clamped to now plus or minus one TOTP period (so the previous,
+  current, or next code, for clock skew), the response gains `time_unix` (the
+  time actually used), and the `get_otp` audit event records
+  `requested_time_unix` (null when omitted) and the effective `time_unix`.
