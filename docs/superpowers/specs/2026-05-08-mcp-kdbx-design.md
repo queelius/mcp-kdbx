@@ -1235,12 +1235,13 @@ integration tests assert them.
 - **Title and field-name validation has no bypass, and rejects invisible
   characters.** Section 3's "No ASCII control characters" becomes: no Unicode
   control characters (General_Category Cc: ASCII controls, DEL, the C1
-  range) and none of the spoofing format characters, which are Unicode's
-  Bidi_Control set (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to
-  U+2069) plus the zero-width space U+200B and the byte-order mark U+FEFF.
-  Other format characters are allowed: the zero-width non-joiner and joiner
-  (U+200C, U+200D), which Persian, Hindi, Malayalam, and emoji sequences
-  need, and the soft hyphen. This applies to titles and field names; the
+  range) and no format characters (Cf) except an explicit allow-list: the
+  zero-width non-joiner and joiner (U+200C, U+200D), which Persian, Hindi,
+  Malayalam, and emoji sequences need. Everything else in Cf is refused,
+  including the bidi controls, zero-width space, word joiner, byte-order
+  mark, tag characters, soft hyphen, and any format character a future
+  Unicode version adds (an allow-list, not a list of known-bad ranges). This
+  applies to titles and field names; the
   error details carry the offending `code_point` (for example `"U+202E"`).
   Every write to `Title` is validated as a title: `kdbx_update_field` with
   `field_name: "Title"` (an empty or disallowed-character title is

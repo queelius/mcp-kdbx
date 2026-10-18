@@ -195,33 +195,26 @@ pub struct SaveOutcome {
 // Validation (spec section 3).
 // ---------------------------------------------------------------------------
 
-/// Format characters that make text display as something it is not:
-///
-/// - Unicode's Bidi_Control property (UAX #9): the Arabic letter mark, the
-///   left-to-right and right-to-left marks, the embeddings and overrides, and
-///   the isolates. They reorder how surrounding text renders, so
-///   "\u{202E}buHtiG" displays as "GitHub".
-/// - Zero-width space and the byte-order mark (zero-width no-break space):
-///   invisible separators that make two different names look identical.
-///
-/// Deliberately not here: the zero-width non-joiner and joiner (U+200C,
-/// U+200D), which Persian, Hindi, Malayalam, and emoji sequences need, and the
-/// soft hyphen (U+00AD). They are format characters too, but they neither
-/// reorder text nor hide a difference a reader could miss.
-const SPOOFING_FORMAT_CHARS: [std::ops::RangeInclusive<char>; 6] = [
-    '\u{061C}'..='\u{061C}', // ARABIC LETTER MARK (Bidi_Control)
-    '\u{200B}'..='\u{200B}', // ZERO WIDTH SPACE
-    '\u{200E}'..='\u{200F}', // LEFT-TO-RIGHT MARK, RIGHT-TO-LEFT MARK (Bidi_Control)
-    '\u{202A}'..='\u{202E}', // embeddings, pop, overrides (Bidi_Control)
-    '\u{2066}'..='\u{2069}', // isolates and pop isolate (Bidi_Control)
-    '\u{FEFF}'..='\u{FEFF}', // ZERO WIDTH NO-BREAK SPACE (byte-order mark)
-];
+/// The format characters (General_Category Cf) a title or field name may
+/// contain: the zero-width non-joiner U+200C and joiner U+200D. Persian,
+/// Hindi, Malayalam, and other scripts need them for correct spelling, and
+/// emoji sequences need the joiner. Every other format character is refused
+/// (bidi controls that reorder text, zero-width spaces and the word joiner
+/// that hide a difference, tag characters, the soft hyphen, and any Cf a
+/// future Unicode version adds), so this is an allow-list, not a list of
+/// known-bad ranges.
+const ALLOWED_FORMAT_CHARS: [char; 2] = ['\u{200C}', '\u{200D}'];
 
 /// True when `c` may not appear in a title or field name: a control character
-/// (General_Category Cc: ASCII controls, DEL, the C1 range; exactly what
-/// `char::is_control` tests) or one of the [`SPOOFING_FORMAT_CHARS`].
+/// (General_Category Cc: ASCII controls, DEL, the C1 range), or a format
+/// character (Cf) other than the [`ALLOWED_FORMAT_CHARS`].
 fn is_disallowed_name_char(c: char) -> bool {
-    c.is_control() || SPOOFING_FORMAT_CHARS.iter().any(|r| r.contains(&c))
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    match c.general_category() {
+        GeneralCategory::Control => true,
+        GeneralCategory::Format => !ALLOWED_FORMAT_CHARS.contains(&c),
+        _ => false,
+    }
 }
 
 /// The first disallowed character of `s` (see [`is_disallowed_name_char`]), as
@@ -232,8 +225,8 @@ fn first_invisible_char(s: &str) -> Option<String> {
         .map(|c| format!("U+{:04X}", c as u32))
 }
 
-/// Validate an entry title: length 1..=4096, no control characters or
-/// spoofing format characters (see [`is_disallowed_name_char`]). Every write to the Title field goes through here: the `title`
+/// Validate an entry title: length 1..=4096, no control characters and no
+/// format characters outside the allow-list (see [`is_disallowed_name_char`]). Every write to the Title field goes through here: the `title`
 /// of `add_entry`, and `update_field` on `Title`.
 fn validate_title(title: &str) -> CoreResult<()> {
     let len = title.chars().count();
@@ -250,8 +243,8 @@ fn validate_title(title: &str) -> CoreResult<()> {
     Ok(())
 }
 
-/// Validate a field name: length 1..=256, no control characters or spoofing
-/// format characters, no leading or trailing whitespace.
+/// Validate a field name: length 1..=256, no control characters and no format
+/// characters outside the allow-list, no leading or trailing whitespace.
 fn validate_field_name(name: &str) -> CoreResult<()> {
     let len = name.chars().count();
     if !(1..=256).contains(&len) {
@@ -1025,18 +1018,43 @@ mod tests {
     }
 
     #[test]
-    fn script_joiners_and_soft_hyphen_are_accepted() {
+    fn script_joiners_are_accepted() {
         // ZWNJ and ZWJ are format characters (Cf) that real text needs:
-        // Persian, Hindi, and Malayalam spelling, and emoji sequences. The soft
-        // hyphen is Cf too and harmless. None of them reorders or hides text.
+        // Persian, Hindi, and Malayalam spelling, and emoji sequences.
         for good in [
             "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}", // Persian, with ZWNJ
             "\u{915}\u{94d}\u{200d}\u{937}",                             // Devanagari, with ZWJ
             "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} family",
-            "pass\u{ad}word",
         ] {
             validate_title(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
             validate_field_name(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn every_other_format_character_is_rejected() {
+        // Everything in Cf outside the ZWNJ/ZWJ allow-list: tag characters, the
+        // word joiner and invisible operators, deprecated format controls, the
+        // Mongolian vowel separator, interlinear annotation, and the soft hyphen.
+        for c in [
+            '\u{E0041}',
+            '\u{E0001}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{180E}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{AD}',
+        ] {
+            let title = format!("Git{c}Hub");
+            assert_eq!(
+                validate_title(&title).map_err(|e| e.code_enum()),
+                Err(ErrorCode::EntryTitleInvalid),
+                "U+{:04X}",
+                c as u32
+            );
         }
     }
 
