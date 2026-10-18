@@ -1367,3 +1367,11 @@ integration tests assert them.
   check still runs) and a successful save emits a new warn-level audit event,
   `writer_lock_unavailable`, with `reason`: `no_locks` or `unsupported`. Any
   other lock error stays `WRITE_FAILED` (`details.step: "lock"`).
+- **UUID addressing for group tools.** `kdbx_list_entries` (`group_path` or
+  `uuid`), `kdbx_list_groups` (`parent_path` or `uuid`; with neither, the
+  root), and `kdbx_add_entry` (`group_path` or `group_uuid`, named so it
+  cannot be mistaken for the new entry's uuid) take a group by path or by
+  record UUID under the same exactly-one rule as entry tools: both, neither
+  (except `kdbx_list_groups`), or a malformed uuid is `INVALID_INPUT`; an
+  unknown uuid is `GROUP_NOT_FOUND`. A group under an unnamed group, whose
+  path is null, is reachable this way.

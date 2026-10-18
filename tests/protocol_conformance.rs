@@ -31,8 +31,8 @@ use serde_json::{Value, json};
 const EXPECTED_TOOLS: &[(&str, &[&str], &[&str])] = &[
     (
         "kdbx_add_entry",
-        &["attachments", "fields", "group_path", "title"],
-        &["group_path", "title"],
+        &["attachments", "fields", "group_path", "group_uuid", "title"],
+        &["title"],
     ),
     ("kdbx_diff_pending", &[], &[]),
     ("kdbx_discard_pending", &[], &[]),
@@ -45,8 +45,8 @@ const EXPECTED_TOOLS: &[(&str, &[&str], &[&str])] = &[
     ("kdbx_get_entry", &["path", "uuid"], &[]),
     ("kdbx_get_otp", &["path", "time_unix", "uuid"], &[]),
     ("kdbx_list_attachments", &["entry_path", "uuid"], &[]),
-    ("kdbx_list_entries", &["group_path"], &["group_path"]),
-    ("kdbx_list_groups", &["parent_path"], &[]),
+    ("kdbx_list_entries", &["group_path", "uuid"], &[]),
+    ("kdbx_list_groups", &["parent_path", "uuid"], &[]),
     ("kdbx_lock", &[], &[]),
     ("kdbx_reveal_password", &["path", "uuid"], &[]),
     (
@@ -768,6 +768,55 @@ fn entry_tools_accept_uuid_addressing() {
         json!({ "uuid": uuid, "field_name": "Secret" }),
     );
     assert_eq!(revealed["value"], json!("s"));
+}
+
+#[test]
+fn group_tools_accept_uuid_addressing() {
+    let (_dir, mut server) = unlocked_writable("nested.kdbx");
+    let personal = server.call_ok("kdbx_list_groups", json!({}))["groups"][0].clone();
+    assert_eq!(personal["name"], json!("Personal"));
+    let finance = server.call_ok("kdbx_list_groups", json!({ "uuid": personal["uuid"] }))["groups"]
+        [0]
+    .clone();
+    assert_eq!(finance["path"], json!("/Personal/Finance"));
+    let banking = server.call_ok(
+        "kdbx_list_groups",
+        json!({ "parent_path": "/Personal/Finance" }),
+    )["groups"][0]
+        .clone();
+
+    let entries = server.call_ok("kdbx_list_entries", json!({ "uuid": banking["uuid"] }));
+    assert_eq!(entries["entries"][0]["title"], json!("Checking Account"));
+
+    let added = server.call_ok(
+        "kdbx_add_entry",
+        json!({ "group_uuid": banking["uuid"], "title": "Savings" }),
+    );
+    assert_eq!(added["path"], json!("/Personal/Finance/Banking/Savings"));
+
+    // Exactly one of path or uuid, as for entry tools.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_list_entries",
+            json!({ "group_path": "/Personal", "uuid": personal["uuid"] })
+        ),
+        "INVALID_INPUT"
+    );
+    assert_eq!(
+        server.call_error_code("kdbx_list_entries", json!({})),
+        "INVALID_INPUT"
+    );
+    assert_eq!(
+        server.call_error_code("kdbx_add_entry", json!({ "title": "Nowhere" })),
+        "INVALID_INPUT"
+    );
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_list_groups",
+            json!({ "uuid": "6f9619ff-8b86-d011-b42d-00c04fc964ff" })
+        ),
+        "GROUP_NOT_FOUND"
+    );
 }
 
 #[test]

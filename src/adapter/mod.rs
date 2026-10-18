@@ -169,8 +169,8 @@ from the entry title, as in /Web/Banking/MyBank. Inside a name, write a literal 
 a literal backslash as \\\\, and a literal ':' before digits as \\:. When siblings share a \
 name, ':N' picks the Nth (1-based), as in /Web/MyBank:2. A trailing '/' names a group, never \
 an entry. Copy paths verbatim from tool output; ordinals can shift between sessions, so \
-for a stable reference pass an entry's uuid (every read returns it) instead of its path. \
-An entry whose path is null has no addressable path: use its uuid.\n\n\
+for a stable reference pass the entry's or group's uuid (every read returns it) instead of \
+its path. A record whose path is null has no addressable path: use its uuid.\n\n\
 Unlocking: call kdbx_unlock with no arguments; the server reads the master password from \
 its configured KDBX_PASSWORD or KDBX_UNLOCK_CMD. Do not ask the user to type the master \
 password into the chat.";

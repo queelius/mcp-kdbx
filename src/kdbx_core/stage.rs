@@ -25,9 +25,9 @@
 //! non-protected one. That is how we decide whether to redact a field change
 //! without ever holding a protected plaintext.
 
-use crate::kdbx_core::address::EntryAddress;
+use crate::kdbx_core::address::{EntryAddress, GroupAddress};
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
-use crate::kdbx_core::path::{VaultPath, vault_path_to_entry, vault_path_to_group};
+use crate::kdbx_core::path::{vault_path_to_entry, vault_path_to_group};
 use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::vault::Vault;
 use crate::kdbx_core::vault_file::{
@@ -298,7 +298,7 @@ fn validate_field_write(name: &str, value: &str) -> CoreResult<()> {
 /// be noise.
 pub fn add_entry(
     working: &mut Database,
-    group_path: &VaultPath,
+    group: &GroupAddress,
     input: &EntryInput,
 ) -> CoreResult<EntryId> {
     validate_title(&input.title)?;
@@ -313,7 +313,7 @@ pub fn add_entry(
         validate_field_write(&f.name, f.value.expose())?;
     }
 
-    let group_id = group_path.resolve_group(working)?;
+    let group_id = group.resolve(working)?;
 
     // Clone the inputs the closure needs. The edit closure is FnOnce and the
     // keepass write API takes owned values, so we move owned copies in.
@@ -332,7 +332,7 @@ pub fn add_entry(
     let mut group_mut = working.group_mut(group_id).ok_or_else(|| {
         CoreError::new(ErrorCode::GroupNotFound)
             .with_message("group disappeared between resolve and write")
-            .with_details(serde_json::json!({ "path": group_path.format() }))
+            .with_details(serde_json::json!({ "uuid": group_id.uuid().to_string() }))
     })?;
 
     let new_id = group_mut
@@ -875,6 +875,7 @@ fn absolute_path_string(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kdbx_core::path::VaultPath;
     use crate::kdbx_core::vault::Vault;
     use keepass::{Database, DatabaseKey};
     use std::io::Write;
@@ -905,6 +906,10 @@ mod tests {
 
     fn addr(s: &str) -> EntryAddress {
         EntryAddress::Path(path(s))
+    }
+
+    fn gaddr(s: &str) -> GroupAddress {
+        GroupAddress::Path(path(s))
     }
 
     fn simple_input(title: &str) -> EntryInput {
@@ -944,8 +949,8 @@ mod tests {
     #[test]
     fn add_entry_into_root_is_findable() {
         let mut db = build_db();
-        let id =
-            add_entry(&mut db, &path("/"), &simple_input("New Root Entry")).expect("add into root");
+        let id = add_entry(&mut db, &gaddr("/"), &simple_input("New Root Entry"))
+            .expect("add into root");
         let entry = db.entry(id).expect("entry exists");
         assert_eq!(entry.get_title(), Some("New Root Entry"));
         assert_eq!(entry.get("UserName"), Some("alice"));
@@ -958,7 +963,7 @@ mod tests {
     fn add_entry_into_nested_group() {
         let mut db = build_db();
         let id =
-            add_entry(&mut db, &path("/Web/"), &simple_input("Nested")).expect("add into /Web");
+            add_entry(&mut db, &gaddr("/Web/"), &simple_input("Nested")).expect("add into /Web");
         let resolved = path("/Web/Nested").resolve_entry(&db).expect("resolve");
         assert_eq!(resolved, id);
     }
@@ -975,7 +980,7 @@ mod tests {
             }],
             attachments: Vec::new(),
         };
-        let id = add_entry(&mut db, &path("/"), &input).expect("add");
+        let id = add_entry(&mut db, &gaddr("/"), &input).expect("add");
         let entry = db.entry(id).expect("entry");
         let pw = entry.fields.get("Password").expect("password field");
         assert!(pw.is_protected(), "Password should be protected");
@@ -993,7 +998,7 @@ mod tests {
                 bytes: b"hello".to_vec().into(),
             }],
         };
-        let id = add_entry(&mut db, &path("/"), &input).expect("add with attachment");
+        let id = add_entry(&mut db, &gaddr("/"), &input).expect("add with attachment");
         let entry = db.entry(id).expect("entry");
         assert!(
             entry.attachments_named().any(|(n, _)| n == "note.txt"),
@@ -1004,21 +1009,21 @@ mod tests {
     #[test]
     fn add_entry_bad_group_is_group_not_found() {
         let mut db = build_db();
-        let err = add_entry(&mut db, &path("/Nope/"), &simple_input("X")).expect_err("bad group");
+        let err = add_entry(&mut db, &gaddr("/Nope/"), &simple_input("X")).expect_err("bad group");
         assert_eq!(err.code_enum(), ErrorCode::GroupNotFound);
     }
 
     #[test]
     fn add_entry_empty_title_is_invalid() {
         let mut db = build_db();
-        let err = add_entry(&mut db, &path("/"), &simple_input("")).expect_err("empty title");
+        let err = add_entry(&mut db, &gaddr("/"), &simple_input("")).expect_err("empty title");
         assert_eq!(err.code_enum(), ErrorCode::EntryTitleInvalid);
     }
 
     #[test]
     fn add_entry_control_char_title_is_invalid() {
         let mut db = build_db();
-        let err = add_entry(&mut db, &path("/"), &simple_input("bad\u{0007}title"))
+        let err = add_entry(&mut db, &gaddr("/"), &simple_input("bad\u{0007}title"))
             .expect_err("control char title");
         assert_eq!(err.code_enum(), ErrorCode::EntryTitleInvalid);
     }
@@ -1126,7 +1131,7 @@ mod tests {
             }],
             attachments: Vec::new(),
         };
-        let err = add_entry(&mut db, &path("/"), &input).expect_err("Title in fields");
+        let err = add_entry(&mut db, &gaddr("/"), &input).expect_err("Title in fields");
         assert_eq!(err.code_enum(), ErrorCode::FieldNameInvalid);
         assert!(path("/Valid").resolve_entry(&db).is_err(), "nothing staged");
     }
@@ -1156,7 +1161,7 @@ mod tests {
             }],
             attachments: Vec::new(),
         };
-        let err = add_entry(&mut db, &path("/"), &input).expect_err("empty field name");
+        let err = add_entry(&mut db, &gaddr("/"), &input).expect_err("empty field name");
         assert_eq!(err.code_enum(), ErrorCode::FieldNameInvalid);
     }
 
@@ -1172,7 +1177,7 @@ mod tests {
             }],
             attachments: Vec::new(),
         };
-        let err = add_entry(&mut db, &path("/"), &input).expect_err("leading space");
+        let err = add_entry(&mut db, &gaddr("/"), &input).expect_err("leading space");
         assert_eq!(err.code_enum(), ErrorCode::FieldNameInvalid);
     }
 
@@ -1393,7 +1398,7 @@ mod tests {
     #[test]
     fn add_entry_sets_creation_and_modification_times_without_history() {
         let mut db = build_db();
-        let id = add_entry(&mut db, &path("/"), &simple_input("Timed")).unwrap();
+        let id = add_entry(&mut db, &gaddr("/"), &simple_input("Timed")).unwrap();
         let e = db.entry(id).unwrap();
         assert!(e.times.creation.is_some());
         assert!(e.times.last_modification.is_some());
@@ -1447,7 +1452,7 @@ mod tests {
             ],
             attachments: Vec::new(),
         };
-        add_entry(&mut working, &path("/Web/"), &input).expect("add");
+        add_entry(&mut working, &gaddr("/Web/"), &input).expect("add");
 
         let d = diff_pending(&canonical, &working);
         assert_eq!(d.summary.num_added, 1);
@@ -1654,7 +1659,7 @@ mod tests {
             }],
             attachments: Vec::new(),
         };
-        add_entry(&mut working, &path("/"), &input).expect("add otp entry");
+        add_entry(&mut working, &gaddr("/"), &input).expect("add otp entry");
         let d = diff_pending(&canonical, &working);
         let a = d
             .added
@@ -1674,7 +1679,7 @@ mod tests {
         // Stage an add on the working db.
         {
             let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Staged")).expect("stage add");
+            add_entry(working, &gaddr("/"), &simple_input("Staged")).expect("stage add");
         }
         assert!(vault.has_pending_changes());
 
@@ -1694,7 +1699,7 @@ mod tests {
         // Stage a new entry.
         {
             let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Saved Entry")).expect("stage add");
+            add_entry(working, &gaddr("/"), &simple_input("Saved Entry")).expect("stage add");
         }
         assert!(vault.has_pending_changes());
 
@@ -1811,7 +1816,7 @@ mod tests {
         let vault_path = vault.path().to_path_buf();
         add_entry(
             vault.working_db_mut().unwrap(),
-            &path("/"),
+            &gaddr("/"),
             &simple_input("Staged"),
         )
         .unwrap();
@@ -1831,8 +1836,8 @@ mod tests {
         let vault_path = vault.path().to_path_buf();
         {
             let working = vault.working_db_mut().unwrap();
-            add_entry(working, &path("/"), &simple_input("One")).unwrap();
-            add_entry(working, &path("/Web/"), &simple_input("Two")).unwrap();
+            add_entry(working, &gaddr("/"), &simple_input("One")).unwrap();
+            add_entry(working, &gaddr("/Web/"), &simple_input("Two")).unwrap();
             update_field(working, &addr("/Existing"), "URL", "x", None).unwrap();
         }
         external_rewrite(&vault_path, SystemTime::now());
@@ -1854,7 +1859,7 @@ mod tests {
         let vault_path = vault.path().to_path_buf();
         add_entry(
             vault.working_db_mut().unwrap(),
-            &path("/"),
+            &gaddr("/"),
             &simple_input("First"),
         )
         .unwrap();
@@ -1864,7 +1869,7 @@ mod tests {
 
         add_entry(
             vault.working_db_mut().unwrap(),
-            &path("/"),
+            &gaddr("/"),
             &simple_input("Second"),
         )
         .unwrap();
@@ -1887,7 +1892,7 @@ mod tests {
         vault.unlock(TEST_PASSWORD, None).unwrap();
         add_entry(
             vault.working_db_mut().unwrap(),
-            &path("/"),
+            &gaddr("/"),
             &simple_input("Via Link"),
         )
         .unwrap();
@@ -1934,7 +1939,7 @@ mod tests {
         let (_tmp, mut vault) = unlocked_vault(&db);
         {
             let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Once")).expect("stage");
+            add_entry(working, &gaddr("/"), &simple_input("Once")).expect("stage");
         }
         save_pending(&mut vault).expect("first save");
         let err = save_pending(&mut vault).expect_err("second save, nothing pending");
@@ -1965,7 +1970,7 @@ mod tests {
         // mode back to the umask default (typically 0644).
         {
             let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Hardened")).expect("stage add");
+            add_entry(working, &gaddr("/"), &simple_input("Hardened")).expect("stage add");
         }
         save_pending(&mut vault).expect("save");
 
@@ -2003,7 +2008,7 @@ mod tests {
             ],
             attachments: Vec::new(),
         };
-        add_entry(&mut working, &path("/"), &input).expect("add legacy otp entry");
+        add_entry(&mut working, &gaddr("/"), &input).expect("add legacy otp entry");
         let d = diff_pending(&canonical, &working);
         let a = d
             .added

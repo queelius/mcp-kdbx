@@ -10,8 +10,8 @@
 //! because every call goes through [`KdbxServer::vault`].
 
 use crate::adapter::{KdbxServer, locate_entry, responses, views};
+use crate::kdbx_core::address::GroupAddress;
 use crate::kdbx_core::error::ErrorCode;
-use crate::kdbx_core::path::VaultPath;
 use crate::kdbx_core::search::{self, Field};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
@@ -20,17 +20,26 @@ use rmcp::{schemars, tool, tool_router};
 /// listed. Defaults to the root path `/` when omitted.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ListGroupsParams {
-    /// The path of the parent group, like `/Web`. Defaults to `/` (the root
-    /// group) when omitted.
-    #[serde(default = "default_root_path")]
-    pub parent_path: String,
+    /// The path of the parent group, like `/Web`. Give at most one of
+    /// `parent_path` or `uuid`; with neither, the root group `/` is listed.
+    #[serde(default)]
+    pub parent_path: Option<String>,
+    /// The parent group's uuid (as returned by a previous kdbx_list_groups).
+    #[serde(default)]
+    pub uuid: Option<String>,
 }
 
 /// Input for `kdbx_list_entries`: the group whose direct entries are listed.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ListEntriesParams {
-    /// The path of the group whose entries to list, like `/Web/Banking`.
-    pub group_path: String,
+    /// The path of the group whose entries to list, like `/Web/Banking`. Give
+    /// exactly one of `group_path` or `uuid`.
+    #[serde(default)]
+    pub group_path: Option<String>,
+    /// The group's uuid (as returned by kdbx_list_groups). Give exactly one of
+    /// `group_path` or `uuid`.
+    #[serde(default)]
+    pub uuid: Option<String>,
 }
 
 /// Input for `kdbx_list_attachments`: the entry whose attachment metadata is
@@ -72,16 +81,11 @@ pub struct FindEntryParams {
     pub fields: Option<Vec<Field>>,
 }
 
-/// The default `parent_path` for `kdbx_list_groups`: the root group.
-fn default_root_path() -> String {
-    "/".to_string()
-}
-
 #[tool_router(router = reads_router, vis = "pub(crate)")]
 impl KdbxServer {
     /// Read: list the direct child groups of a parent group.
     #[tool(
-        description = "List the direct child groups of a group. Provide parent_path (defaults to '/', the root). Returns each child group's name, path, uuid, entry and subgroup counts, and notes. Metadata only."
+        description = "List the direct child groups of a group. Provide parent_path or the parent's uuid (with neither, the root '/'). Returns each child group's name, path, uuid, entry and subgroup counts, and notes. Metadata only."
     )]
     async fn kdbx_list_groups(&self, Parameters(params): Parameters<ListGroupsParams>) -> String {
         let mut vault = self.vault().await;
@@ -92,11 +96,14 @@ impl KdbxServer {
             Ok(db) => db,
             Err(e) => return responses::err(&e),
         };
-        let parent = match VaultPath::parse(&params.parent_path) {
-            Ok(p) => p,
-            Err(e) => return responses::err(&e),
+        // With neither parent_path nor uuid, list the root group's children.
+        let parent = match (&params.parent_path, &params.uuid) {
+            (None, None) => Ok(GroupAddress::root()),
+            (path, uuid) => {
+                GroupAddress::from_parts(path.as_deref(), uuid.as_deref(), "parent_path", "uuid")
+            }
         };
-        let parent_id = match parent.resolve_group(db) {
+        let parent_id = match parent.and_then(|p| p.resolve(db)) {
             Ok(id) => id,
             Err(e) => return responses::err(&e),
         };
@@ -115,7 +122,7 @@ impl KdbxServer {
 
     /// Read: list the direct entries of a group.
     #[tool(
-        description = "List the direct entries of a group. Provide group_path. Returns each entry's title, path, uuid, username, url, a notes preview, standard and custom field names with protected flags, attachment and otp flags, and the modified timestamp. Metadata only: no passwords or protected values. A username, url, or notes field marked protected is returned as null and flagged protected in standard_field_names; read it with kdbx_reveal_protected."
+        description = "List the direct entries of a group. Provide group_path or the group's uuid. Returns each entry's title, path, uuid, username, url, a notes preview, standard and custom field names with protected flags, attachment and otp flags, and the modified timestamp. Metadata only: no passwords or protected values. A username, url, or notes field marked protected is returned as null and flagged protected in standard_field_names; read it with kdbx_reveal_protected."
     )]
     async fn kdbx_list_entries(&self, Parameters(params): Parameters<ListEntriesParams>) -> String {
         let mut vault = self.vault().await;
@@ -126,11 +133,14 @@ impl KdbxServer {
             Ok(db) => db,
             Err(e) => return responses::err(&e),
         };
-        let group_path = match VaultPath::parse(&params.group_path) {
-            Ok(p) => p,
-            Err(e) => return responses::err(&e),
-        };
-        let group_id = match group_path.resolve_group(db) {
+        let group_id = match GroupAddress::from_parts(
+            params.group_path.as_deref(),
+            params.uuid.as_deref(),
+            "group_path",
+            "uuid",
+        )
+        .and_then(|g| g.resolve(db))
+        {
             Ok(id) => id,
             Err(e) => return responses::err(&e),
         };
@@ -232,15 +242,5 @@ impl KdbxServer {
             "matched_count": results.matched_count,
             "truncated": results.truncated,
         }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_root_path_is_slash() {
-        assert_eq!(default_root_path(), "/");
     }
 }

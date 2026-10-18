@@ -18,10 +18,10 @@
 
 use crate::adapter::views::format_system_time;
 use crate::adapter::{KdbxServer, responses};
-use crate::kdbx_core::address::EntryAddress;
+use crate::kdbx_core::address::{EntryAddress, GroupAddress};
 use crate::kdbx_core::audit::{AuditEvent, StageDiscardReason, WriteTool};
 use crate::kdbx_core::error::{CoreError, ErrorCode};
-use crate::kdbx_core::path::{VaultPath, vault_path_to_entry};
+use crate::kdbx_core::path::vault_path_to_entry;
 use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::stage;
 use crate::kdbx_core::vault_file::SaveStep;
@@ -55,7 +55,13 @@ pub struct AttachmentSpec {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AddEntryParams {
     /// The group path to add the entry under, for example `/Web/` or `/`.
-    pub group_path: String,
+    /// Give exactly one of `group_path` or `group_uuid`.
+    #[serde(default)]
+    pub group_path: Option<String>,
+    /// The uuid of the group to add the entry under (as returned by
+    /// kdbx_list_groups). Give exactly one of `group_path` or `group_uuid`.
+    #[serde(default)]
+    pub group_uuid: Option<String>,
     /// The entry title (the Title field).
     pub title: String,
     /// Custom and standard fields, keyed by name. Each carries a value and a
@@ -95,7 +101,7 @@ impl KdbxServer {
     /// and an unlocked vault. The entry is added to the working db only; it
     /// reaches disk on `kdbx_save_pending`.
     #[tool(
-        description = "Stage a new entry under a group. Requires writes to be enabled and the vault unlocked. The entry is staged in memory, not written to disk: commit it with kdbx_save_pending. Fields and attachments are optional maps keyed by name."
+        description = "Stage a new entry under a group, named by group_path or group_uuid. Requires writes to be enabled and the vault unlocked. The entry is staged in memory, not written to disk: commit it with kdbx_save_pending. Fields and attachments are optional maps keyed by name."
     )]
     async fn kdbx_add_entry(&self, Parameters(params): Parameters<AddEntryParams>) -> String {
         if !self.writes_allowed() {
@@ -107,8 +113,13 @@ impl KdbxServer {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
-        let group_path = match VaultPath::parse(&params.group_path) {
-            Ok(p) => p,
+        let group = match GroupAddress::from_parts(
+            params.group_path.as_deref(),
+            params.group_uuid.as_deref(),
+            "group_path",
+            "group_uuid",
+        ) {
+            Ok(g) => g,
             Err(e) => return responses::err(&e),
         };
 
@@ -160,7 +171,7 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let entry_id = match stage::add_entry(working, &group_path, &input) {
+        let entry_id = match stage::add_entry(working, &group, &input) {
             Ok(id) => id,
             Err(e) => return responses::err(&e),
         };
