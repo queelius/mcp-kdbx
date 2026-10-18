@@ -14,10 +14,9 @@
 //! emitting and returning, so the audit emit and the response do not borrow the
 //! vault guard.
 
-use crate::adapter::{KdbxServer, responses};
+use crate::adapter::{KdbxServer, canonical_entry_path, locate_entry, responses};
 use crate::kdbx_core::audit::{AuditEvent, hash_revealed};
 use crate::kdbx_core::error::{CoreError, ErrorCode};
-use crate::kdbx_core::path::VaultPath;
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
@@ -27,36 +26,60 @@ use rmcp::{schemars, tool, tool_router};
 /// section 3, "Attachment semantics"). The warn is operational signal only.
 const ATTACHMENT_WARN_BYTES: usize = 10 * 1024 * 1024;
 
-/// Input for `kdbx_reveal_password`: the entry path.
+/// Input for `kdbx_reveal_password`: the entry, by path or uuid.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RevealPasswordParams {
-    /// Path to the entry whose `Password` field should be revealed.
-    pub path: String,
+    /// Path to the entry whose `Password` field should be revealed. Give
+    /// exactly one of `path` or `uuid`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The entry's uuid, as returned by the read tools. Give exactly one of
+    /// `path` or `uuid`.
+    #[serde(default)]
+    pub uuid: Option<String>,
 }
 
-/// Input for `kdbx_reveal_protected`: the entry path and the field name.
+/// Input for `kdbx_reveal_protected`: the entry (by path or uuid) and the field
+/// name.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RevealProtectedParams {
-    /// Path to the entry that holds the field.
-    pub path: String,
+    /// Path to the entry that holds the field. Give exactly one of `path` or
+    /// `uuid`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The entry's uuid. Give exactly one of `path` or `uuid`.
+    #[serde(default)]
+    pub uuid: Option<String>,
     /// The name of the protected field to reveal.
     pub field_name: String,
 }
 
-/// Input for `kdbx_download_attachment`: the entry path and the attachment name.
+/// Input for `kdbx_download_attachment`: the entry (by path or uuid) and the
+/// attachment name.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DownloadAttachmentParams {
-    /// Path to the entry that references the attachment.
-    pub entry_path: String,
+    /// Path to the entry that references the attachment. Give exactly one of
+    /// `entry_path` or `uuid`.
+    #[serde(default)]
+    pub entry_path: Option<String>,
+    /// The entry's uuid. Give exactly one of `entry_path` or `uuid`.
+    #[serde(default)]
+    pub uuid: Option<String>,
     /// The attachment's per-entry name (its filename key on the entry).
     pub name: String,
 }
 
-/// Input for `kdbx_get_otp`: the entry path and an optional evaluation time.
+/// Input for `kdbx_get_otp`: the entry (by path or uuid) and an optional
+/// evaluation time.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetOtpParams {
-    /// Path to the entry that carries the TOTP configuration.
-    pub path: String,
+    /// Path to the entry that carries the TOTP configuration. Give exactly one
+    /// of `path` or `uuid`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The entry's uuid. Give exactly one of `path` or `uuid`.
+    #[serde(default)]
+    pub uuid: Option<String>,
     /// The Unix time (seconds) at which to compute the code. Defaults to now.
     #[serde(default)]
     pub time_unix: Option<u64>,
@@ -82,18 +105,11 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let path = match VaultPath::parse(&params.path) {
-            Ok(p) => p,
+        let entry = match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+            Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let entry_id = match path.resolve_entry(db) {
-            Ok(id) => id,
-            Err(e) => return responses::err(&e),
-        };
-        let entry = match db.entry(entry_id) {
-            Some(e) => e,
-            None => return responses::err(&ErrorCode::EntryNotFound.into()),
-        };
+        let target_path = canonical_entry_path(db, &entry);
 
         // Read the value into an owned String before emitting and returning, so
         // we do not hold a borrow into the db across the audit emit.
@@ -109,7 +125,7 @@ impl KdbxServer {
         let target_uuid = entry.id().uuid().to_string();
 
         self.emit(AuditEvent::RevealPassword {
-            target_path: params.path.clone(),
+            target_path,
             target_uuid,
             sha256: hash_revealed(&password),
         });
@@ -136,18 +152,11 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let path = match VaultPath::parse(&params.path) {
-            Ok(p) => p,
+        let entry = match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+            Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let entry_id = match path.resolve_entry(db) {
-            Ok(id) => id,
-            Err(e) => return responses::err(&e),
-        };
-        let entry = match db.entry(entry_id) {
-            Some(e) => e,
-            None => return responses::err(&ErrorCode::EntryNotFound.into()),
-        };
+        let target_path = canonical_entry_path(db, &entry);
 
         // Look the field up directly so we can distinguish "no such field"
         // (FIELD_NOT_FOUND) from "present but not protected" (FIELD_NOT_PROTECTED).
@@ -171,7 +180,7 @@ impl KdbxServer {
         let target_uuid = entry.id().uuid().to_string();
 
         self.emit(AuditEvent::RevealProtected {
-            target_path: params.path.clone(),
+            target_path,
             target_uuid,
             field_name: params.field_name.clone(),
             sha256: hash_revealed(&value),
@@ -199,18 +208,16 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let path = match VaultPath::parse(&params.entry_path) {
-            Ok(p) => p,
+        let entry = match locate_entry(
+            db,
+            params.entry_path.as_deref(),
+            params.uuid.as_deref(),
+            "entry_path",
+        ) {
+            Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let entry_id = match path.resolve_entry(db) {
-            Ok(id) => id,
-            Err(e) => return responses::err(&e),
-        };
-        let entry = match db.entry(entry_id) {
-            Some(e) => e,
-            None => return responses::err(&ErrorCode::EntryNotFound.into()),
-        };
+        let target_path = canonical_entry_path(db, &entry);
 
         // Find the attachment by its per-entry name, reading the bytes into an
         // owned Vec so the response and emit do not borrow the db.
@@ -243,7 +250,7 @@ impl KdbxServer {
         let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
         self.emit(AuditEvent::DownloadAttachment {
-            target_path: params.entry_path.clone(),
+            target_path,
             attachment_name: params.name.clone(),
             size_bytes: size_bytes as u64,
             sha256: content_sha256.clone(),
@@ -274,18 +281,11 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let path = match VaultPath::parse(&params.path) {
-            Ok(p) => p,
+        let entry = match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+            Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let entry_id = match path.resolve_entry(db) {
-            Ok(id) => id,
-            Err(e) => return responses::err(&e),
-        };
-        let entry = match db.entry(entry_id) {
-            Some(e) => e,
-            None => return responses::err(&ErrorCode::EntryNotFound.into()),
-        };
+        let target_path = canonical_entry_path(db, &entry);
 
         // Resolve a config (modern otpauth field, then the legacy pair) through
         // the shared resolver, the same one the read views use for has_otp, so
@@ -308,7 +308,7 @@ impl KdbxServer {
 
         // The event records the access, never the code or the secret.
         self.emit(AuditEvent::GetOtp {
-            target_path: params.path.clone(),
+            target_path,
             target_uuid,
         });
 

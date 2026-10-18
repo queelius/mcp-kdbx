@@ -38,29 +38,29 @@ const EXPECTED_TOOLS: &[(&str, &[&str], &[&str])] = &[
     ("kdbx_discard_pending", &[], &[]),
     (
         "kdbx_download_attachment",
-        &["entry_path", "name"],
-        &["entry_path", "name"],
+        &["entry_path", "name", "uuid"],
+        &["name"],
     ),
     ("kdbx_find_entry", &["fields", "query"], &["query"]),
-    ("kdbx_get_entry", &["path"], &["path"]),
-    ("kdbx_get_otp", &["path", "time_unix"], &["path"]),
-    ("kdbx_list_attachments", &["entry_path"], &["entry_path"]),
+    ("kdbx_get_entry", &["path", "uuid"], &[]),
+    ("kdbx_get_otp", &["path", "time_unix", "uuid"], &[]),
+    ("kdbx_list_attachments", &["entry_path", "uuid"], &[]),
     ("kdbx_list_entries", &["group_path"], &["group_path"]),
     ("kdbx_list_groups", &["parent_path"], &[]),
     ("kdbx_lock", &[], &[]),
-    ("kdbx_reveal_password", &["path"], &["path"]),
+    ("kdbx_reveal_password", &["path", "uuid"], &[]),
     (
         "kdbx_reveal_protected",
-        &["field_name", "path"],
-        &["field_name", "path"],
+        &["field_name", "path", "uuid"],
+        &["field_name"],
     ),
     ("kdbx_save_pending", &[], &[]),
     ("kdbx_status", &[], &[]),
     ("kdbx_unlock", &["keyfile_bytes", "password"], &[]),
     (
         "kdbx_update_field",
-        &["field_name", "path", "protected", "value"],
-        &["field_name", "path", "value"],
+        &["field_name", "path", "protected", "uuid", "value"],
+        &["field_name", "value"],
     ),
 ];
 
@@ -575,6 +575,79 @@ fn error_invalid_input_bad_attachment_base64() {
             })
         ),
         "INVALID_INPUT"
+    );
+}
+
+#[test]
+fn error_invalid_input_entry_address_needs_exactly_one_of_path_or_uuid() {
+    let mut server = unlocked("flat.kdbx");
+    let uuid = server.call_ok("kdbx_get_entry", json!({ "path": "/Bank" }))["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Both: refused rather than silently preferring one.
+    let both = server.call_error(
+        "kdbx_reveal_password",
+        json!({ "path": "/Bank", "uuid": uuid }),
+    );
+    assert_eq!(both["code"], json!("INVALID_INPUT"));
+    // Neither.
+    assert_eq!(
+        server.call_error_code("kdbx_get_entry", json!({})),
+        "INVALID_INPUT"
+    );
+    // A malformed uuid.
+    assert_eq!(
+        server.call_error_code("kdbx_get_entry", json!({ "uuid": "not-a-uuid" })),
+        "INVALID_INPUT"
+    );
+    // A well-formed uuid that names no entry.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_get_entry",
+            json!({ "uuid": "6f9619ff-8b86-d011-b42d-00c04fc964ff" })
+        ),
+        "ENTRY_NOT_FOUND"
+    );
+}
+
+#[test]
+fn entry_tools_accept_uuid_addressing() {
+    let (_dir, mut server) = unlocked_writable("with_attachments.kdbx");
+    let uuid = server.call_ok("kdbx_get_entry", json!({ "path": "/Document A" }))["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let detail = server.call_ok("kdbx_get_entry", json!({ "uuid": uuid }));
+    assert_eq!(detail["path"], json!("/Document A"));
+    let listed = server.call_ok("kdbx_list_attachments", json!({ "uuid": uuid }));
+    assert_eq!(listed["attachments"][0]["name"], json!("notes.txt"));
+    let downloaded = server.call_ok(
+        "kdbx_download_attachment",
+        json!({ "uuid": uuid, "name": "notes.txt" }),
+    );
+    assert_eq!(downloaded["size_bytes"], json!("meeting notes\n".len()));
+    let updated = server.call_ok(
+        "kdbx_update_field",
+        json!({ "uuid": uuid, "field_name": "Secret", "value": "s", "protected": true }),
+    );
+    assert_eq!(updated["path"], json!("/Document A"));
+    assert_eq!(updated["uuid"], json!(uuid));
+    let revealed = server.call_ok(
+        "kdbx_reveal_protected",
+        json!({ "uuid": uuid, "field_name": "Secret" }),
+    );
+    assert_eq!(revealed["value"], json!("s"));
+}
+
+#[test]
+fn entry_tools_refuse_a_group_shaped_path() {
+    let mut server = unlocked("flat.kdbx");
+    // "/Bank/" addresses a group (trailing slash); it never names the entry.
+    assert_eq!(
+        server.call_error_code("kdbx_reveal_password", json!({ "path": "/Bank/" })),
+        "ENTRY_NOT_FOUND"
     );
 }
 

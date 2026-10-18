@@ -25,8 +25,9 @@
 //! non-protected one. That is how we decide whether to redact a field change
 //! without ever holding a protected plaintext.
 
+use crate::kdbx_core::address::EntryAddress;
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
-use crate::kdbx_core::path::{VaultPath, vault_path_to_entry};
+use crate::kdbx_core::path::{VaultPath, vault_path_to_entry, vault_path_to_group};
 use crate::kdbx_core::vault::Vault;
 use diff_kdbx::change_set::{Change, EntryChangeKind, FieldChange, ValueChange, ValueDisplay};
 use diff_kdbx::options::DiffOptions;
@@ -86,21 +87,26 @@ pub struct DiffPending {
 }
 
 /// An entry that exists in the working db but not the canonical baseline.
+///
+/// `path` and `group_path` are `None` (JSON `null`) when the record has no
+/// addressable path (an empty title or group name, see
+/// [`vault_path_to_entry`]); `uuid` always identifies it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AddedEntry {
-    pub path: String,
+    pub path: Option<String>,
     pub uuid: String,
     pub title: String,
-    pub group_path: String,
+    pub group_path: Option<String>,
     pub field_count: usize,
     pub has_attachments: bool,
     pub has_otp: bool,
 }
 
-/// An entry present in both dbs whose fields or attachments changed.
+/// An entry present in both dbs whose fields or attachments changed. `path` is
+/// `None` when the record has no addressable path, as for [`AddedEntry`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModifiedEntry {
-    pub path: String,
+    pub path: Option<String>,
     pub uuid: String,
     pub title: String,
     pub field_changes: Vec<FieldChangeOut>,
@@ -141,6 +147,25 @@ pub struct AttachmentChangeOut {
     pub name: String,
     /// One of "added", "removed", "modified".
     pub change: String,
+}
+
+impl DiffPending {
+    /// One human-readable label per staged entry (added, then modified): its
+    /// vault path, or its UUID when it has no addressable path. The lock
+    /// discard summary and the `stage_discarded` audit event both use this, so
+    /// they cannot disagree. A path always starts with `/` and a UUID never
+    /// does, so the two forms stay distinguishable.
+    pub fn entry_labels(&self) -> Vec<String> {
+        let added = self
+            .added
+            .iter()
+            .map(|a| a.path.clone().unwrap_or_else(|| a.uuid.clone()));
+        let modified = self
+            .modified
+            .iter()
+            .map(|m| m.path.clone().unwrap_or_else(|| m.uuid.clone()));
+        added.chain(modified).collect()
+    }
 }
 
 /// The counts shown at the top of the diff.
@@ -267,23 +292,24 @@ pub fn add_entry(
     Ok(new_id)
 }
 
-/// Update or set a single field on the entry named by `entry_path`.
+/// Update or set a single field on the entry named by `target` (a vault path or
+/// a record UUID). Returns the entry's id.
 ///
 /// `protected = None` preserves an existing field's protection state (and
 /// defaults to unprotected for a new field); `Some(b)` forces it. An empty
 /// value is allowed and clears the field (the Password-regenerate workflow).
-/// Propagates `ENTRY_NOT_FOUND` when the path does not resolve to an entry, and
-/// validates the field name.
+/// Propagates `ENTRY_NOT_FOUND` when the target does not resolve to an entry,
+/// and validates the field name.
 pub fn update_field(
     working: &mut Database,
-    entry_path: &VaultPath,
+    target: &EntryAddress,
     field_name: &str,
     value: &str,
     protected: Option<bool>,
-) -> CoreResult<()> {
+) -> CoreResult<EntryId> {
     validate_field_name(field_name)?;
 
-    let entry_id = entry_path.resolve_entry(working)?;
+    let entry_id = target.resolve(working)?;
 
     // Decide the protection state before taking the mutable borrow: when the
     // caller did not force it, read the current field's state (false when the
@@ -302,7 +328,7 @@ pub fn update_field(
     let mut entry_mut = working.entry_mut(entry_id).ok_or_else(|| {
         CoreError::new(ErrorCode::EntryNotFound)
             .with_message("entry disappeared between resolve and write")
-            .with_details(serde_json::json!({ "path": entry_path.format() }))
+            .with_details(serde_json::json!({ "uuid": entry_id.uuid().to_string() }))
     })?;
 
     entry_mut.edit(|e| {
@@ -314,7 +340,7 @@ pub fn update_field(
         e.set(name, v);
     });
 
-    Ok(())
+    Ok(entry_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -360,16 +386,18 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
         }
     }
 
-    // Stable order: sort each list by (group_path, title). For modified entries
-    // we have the full path but not a separate group_path field, so we derive
-    // the group path from the entry's path via VaultPath::parent.
+    // Stable order: sort each list by (group_path, title), with the uuid as a
+    // final tie-break so same-titled siblings order deterministically. Modified
+    // entries carry no group_path field, so derive it from the working db.
     added.sort_by(|a, b| {
-        (a.group_path.as_str(), a.title.as_str()).cmp(&(b.group_path.as_str(), b.title.as_str()))
+        (&a.group_path, &a.title, &a.uuid).cmp(&(&b.group_path, &b.title, &b.uuid))
     });
-    modified.sort_by(|a, b| {
-        let ga = group_path_of(&a.path);
-        let gb = group_path_of(&b.path);
-        (ga.as_str(), a.title.as_str()).cmp(&(gb.as_str(), b.title.as_str()))
+    modified.sort_by_cached_key(|m| {
+        (
+            group_path_of(working, &m.uuid),
+            m.title.clone(),
+            m.uuid.clone(),
+        )
     });
 
     let num_added = added.len();
@@ -386,14 +414,20 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
     }
 }
 
-/// The containing group path of a formatted entry path, used as a sort key.
-/// Falls back to the path itself when it does not parse (which should not
-/// happen for paths we built with `vault_path_to_entry`).
-fn group_path_of(entry_path: &str) -> String {
-    match VaultPath::parse(entry_path) {
-        Ok(p) => p.parent().format(),
-        Err(_) => entry_path.to_string(),
-    }
+/// The vault path of the group holding the entry whose hyphenated UUID is
+/// `uuid`, used as a sort key. `None` when the entry is gone or its group has
+/// no addressable path.
+fn group_path_of(working: &Database, uuid: &str) -> Option<String> {
+    let entry = working
+        .iter_all_entries()
+        .find(|e| e.id().uuid().hyphenated().to_string() == uuid)?;
+    containing_group_path(working, &entry)
+}
+
+/// The vault path of the group that holds `entry`, or `None` when that group
+/// has no addressable path.
+fn containing_group_path(working: &Database, entry: &keepass::db::EntryRef<'_>) -> Option<String> {
+    vault_path_to_group(working, entry.parent().id()).map(|p| p.format())
 }
 
 /// Build an [`AddedEntry`] by looking up `uuid` in the working db.
@@ -401,17 +435,10 @@ fn map_added_entry(working: &Database, uuid: uuid::Uuid) -> Option<AddedEntry> {
     let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
     let eid = entry_ref.id();
 
-    // Build the path once; derive the group path from its parent. The entry was
-    // just found in `working`, so this resolves; "/" is a defensive fallback.
-    let vpath = vault_path_to_entry(working, eid);
-    let path = vpath
-        .as_ref()
-        .map(|p| p.format())
-        .unwrap_or_else(|| "/".to_string());
-    let group_path = vpath
-        .as_ref()
-        .map(|p| p.parent().format())
-        .unwrap_or_else(|| "/".to_string());
+    // Both paths are None for a record with no addressable path. There is no
+    // fallback string: a placeholder like "/" would alias the root group.
+    let path = vault_path_to_entry(working, eid).map(|p| p.format());
+    let group_path = containing_group_path(working, &entry_ref);
 
     let title = entry_ref.get_title().unwrap_or("").to_string();
     let field_count = entry_ref.fields.len();
@@ -449,9 +476,7 @@ fn map_modified_entry(
     let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
     let eid = entry_ref.id();
 
-    let path = vault_path_to_entry(working, eid)
-        .map(|p| p.format())
-        .unwrap_or_else(|| "/".to_string());
+    let path = vault_path_to_entry(working, eid).map(|p| p.format());
     let title = entry_ref.get_title().unwrap_or("").to_string();
 
     let mut field_out: Vec<FieldChangeOut> = Vec::new();
@@ -823,6 +848,10 @@ mod tests {
         VaultPath::parse(s).expect("parse path")
     }
 
+    fn addr(s: &str) -> EntryAddress {
+        EntryAddress::Path(path(s))
+    }
+
     fn simple_input(title: &str) -> EntryInput {
         EntryInput {
             title: title.to_string(),
@@ -978,7 +1007,7 @@ mod tests {
         let mut db = build_db();
         update_field(
             &mut db,
-            &path("/Existing"),
+            &addr("/Existing"),
             "URL",
             "https://new.example.com",
             None,
@@ -994,7 +1023,7 @@ mod tests {
         let mut db = build_db();
         // Password starts protected; update with protected: None must keep it
         // protected.
-        update_field(&mut db, &path("/Existing"), "Password", "new-secret", None)
+        update_field(&mut db, &addr("/Existing"), "Password", "new-secret", None)
             .expect("update password");
         let id = path("/Existing").resolve_entry(&db).expect("resolve");
         let entry = db.entry(id).expect("entry");
@@ -1005,7 +1034,7 @@ mod tests {
         // URL starts unprotected; None keeps it unprotected.
         update_field(
             &mut db,
-            &path("/Existing"),
+            &addr("/Existing"),
             "URL",
             "https://x.example.com",
             None,
@@ -1019,7 +1048,7 @@ mod tests {
     #[test]
     fn update_field_some_true_forces_protection() {
         let mut db = build_db();
-        update_field(&mut db, &path("/Existing"), "URL", "secret-url", Some(true))
+        update_field(&mut db, &addr("/Existing"), "URL", "secret-url", Some(true))
             .expect("force protect");
         let id = path("/Existing").resolve_entry(&db).expect("resolve");
         let url = db
@@ -1035,7 +1064,7 @@ mod tests {
     #[test]
     fn update_field_empty_value_clears() {
         let mut db = build_db();
-        update_field(&mut db, &path("/Existing"), "URL", "", None).expect("clear");
+        update_field(&mut db, &addr("/Existing"), "URL", "", None).expect("clear");
         let id = path("/Existing").resolve_entry(&db).expect("resolve");
         assert_eq!(db.entry(id).unwrap().get("URL"), Some(""));
     }
@@ -1043,7 +1072,7 @@ mod tests {
     #[test]
     fn update_field_bad_path_is_entry_not_found() {
         let mut db = build_db();
-        let err = update_field(&mut db, &path("/Ghost"), "URL", "x", None).expect_err("bad entry");
+        let err = update_field(&mut db, &addr("/Ghost"), "URL", "x", None).expect_err("bad entry");
         assert_eq!(err.code_enum(), ErrorCode::EntryNotFound);
     }
 
@@ -1089,8 +1118,8 @@ mod tests {
         assert_eq!(d.added.len(), 1);
         let a = &d.added[0];
         assert_eq!(a.title, "Brand New");
-        assert_eq!(a.path, "/Web/Brand New");
-        assert_eq!(a.group_path, "/Web");
+        assert_eq!(a.path.as_deref(), Some("/Web/Brand New"));
+        assert_eq!(a.group_path.as_deref(), Some("/Web"));
         // Title plus the two fields.
         assert_eq!(a.field_count, 3);
         assert!(!a.has_attachments);
@@ -1103,7 +1132,7 @@ mod tests {
         let mut working = canonical.clone();
         update_field(
             &mut working,
-            &path("/Existing"),
+            &addr("/Existing"),
             "URL",
             "https://new.example.com",
             None,
@@ -1114,7 +1143,7 @@ mod tests {
         assert_eq!(d.summary.num_modified, 1);
         let m = &d.modified[0];
         assert_eq!(m.title, "Existing");
-        assert_eq!(m.path, "/Existing");
+        assert_eq!(m.path.as_deref(), Some("/Existing"));
         // The URL field change must carry before/after, protected false.
         let fc = m
             .field_changes
@@ -1142,7 +1171,7 @@ mod tests {
         let mut working = canonical.clone();
         update_field(
             &mut working,
-            &path("/Existing"),
+            &addr("/Existing"),
             "Password",
             "new-secret",
             None,
@@ -1180,7 +1209,7 @@ mod tests {
         // A NEW protected field "ApiKey" on the existing entry. protected: true.
         update_field(
             &mut working,
-            &path("/Existing"),
+            &addr("/Existing"),
             "ApiKey",
             SECRET_PLAINTEXT,
             Some(true),

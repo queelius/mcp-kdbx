@@ -65,6 +65,9 @@ impl Level {
 /// One audited action. Each variant carries the event-specific detail fields
 /// named in the spec's "Logged events" table (section 6).
 ///
+/// `target_path` is the canonical vault path of the record acted on, or `None`
+/// (JSON `null`) when the record has no addressable path and was named by UUID.
+///
 /// Field names on the variants match the snake_case keys that appear in the
 /// rendered `details` object, so the mapping in [`AuditEvent::details_json`]
 /// stays a direct transcription with no renaming surprises.
@@ -92,7 +95,7 @@ pub enum AuditEvent {
     /// A write was staged into the working database (not yet on disk).
     WriteStaged {
         tool: String,
-        target_path: String,
+        target_path: Option<String>,
         target_uuid: String,
         /// Present only for field-level writes; null otherwise.
         field_name: Option<String>,
@@ -123,13 +126,13 @@ pub enum AuditEvent {
     },
     /// A password field was revealed. `sha256` is [`hash_revealed`] of the value.
     RevealPassword {
-        target_path: String,
+        target_path: Option<String>,
         target_uuid: String,
         sha256: String,
     },
     /// A non-password protected field was revealed.
     RevealProtected {
-        target_path: String,
+        target_path: Option<String>,
         target_uuid: String,
         field_name: String,
         sha256: String,
@@ -140,14 +143,14 @@ pub enum AuditEvent {
     /// [`hash_revealed`] (which is for string secrets). It identifies which
     /// attachment was taken without storing its content.
     DownloadAttachment {
-        target_path: String,
+        target_path: Option<String>,
         attachment_name: String,
         size_bytes: u64,
         sha256: String,
     },
     /// A TOTP code was computed. The code itself is never logged.
     GetOtp {
-        target_path: String,
+        target_path: Option<String>,
         target_uuid: String,
     },
 }
@@ -445,7 +448,7 @@ mod tests {
             (
                 AuditEvent::WriteStaged {
                     tool: "kdbx_update_field".to_string(),
-                    target_path: "/Web/GitHub".to_string(),
+                    target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                     field_name: Some("Password".to_string()),
                 },
@@ -490,7 +493,7 @@ mod tests {
             ),
             (
                 AuditEvent::RevealPassword {
-                    target_path: "/Web/GitHub".to_string(),
+                    target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                     sha256: "deadbeef".to_string(),
                 },
@@ -499,7 +502,7 @@ mod tests {
             ),
             (
                 AuditEvent::RevealProtected {
-                    target_path: "/Web/GitHub".to_string(),
+                    target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                     field_name: "RecoveryKey".to_string(),
                     sha256: "deadbeef".to_string(),
@@ -509,7 +512,7 @@ mod tests {
             ),
             (
                 AuditEvent::DownloadAttachment {
-                    target_path: "/Web/GitHub".to_string(),
+                    target_path: Some("/Web/GitHub".to_string()),
                     attachment_name: "key.pem".to_string(),
                     size_bytes: 2048,
                     sha256: "deadbeef".to_string(),
@@ -519,7 +522,7 @@ mod tests {
             ),
             (
                 AuditEvent::GetOtp {
-                    target_path: "/Web/GitHub".to_string(),
+                    target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                 },
                 "get_otp",
@@ -579,7 +582,7 @@ mod tests {
         // Spot-check a few variants against the spec's details column.
         let staged = AuditEvent::WriteStaged {
             tool: "kdbx_add_entry".to_string(),
-            target_path: "/Web/New".to_string(),
+            target_path: Some("/Web/New".to_string()),
             target_uuid: "uuid-1".to_string(),
             field_name: None,
         };
@@ -590,7 +593,7 @@ mod tests {
         assert_eq!(d["field_name"], Value::Null);
 
         let reveal = AuditEvent::RevealProtected {
-            target_path: "/Web/X".to_string(),
+            target_path: Some("/Web/X".to_string()),
             target_uuid: "uuid-2".to_string(),
             field_name: "Secret".to_string(),
             sha256: "abc123".to_string(),
@@ -600,7 +603,7 @@ mod tests {
         assert_eq!(d["sha256"], json!("abc123"));
 
         let otp = AuditEvent::GetOtp {
-            target_path: "/Web/X".to_string(),
+            target_path: Some("/Web/X".to_string()),
             target_uuid: "uuid-3".to_string(),
         };
         let d = otp.details_json();

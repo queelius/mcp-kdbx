@@ -9,7 +9,7 @@
 //! table, so these tools emit no audit events; they still count as activity
 //! because every call goes through [`KdbxServer::vault`].
 
-use crate::adapter::{KdbxServer, responses, views};
+use crate::adapter::{KdbxServer, locate_entry, responses, views};
 use crate::kdbx_core::error::ErrorCode;
 use crate::kdbx_core::path::VaultPath;
 use crate::kdbx_core::search::{self, Field};
@@ -34,18 +34,28 @@ pub struct ListEntriesParams {
 }
 
 /// Input for `kdbx_list_attachments`: the entry whose attachment metadata is
-/// listed.
+/// listed, by path or uuid.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ListAttachmentsParams {
-    /// The path of the entry, like `/Web/Banking/MyBank`.
-    pub entry_path: String,
+    /// The path of the entry, like `/Web/Banking/MyBank`. Give exactly one of
+    /// `entry_path` or `uuid`.
+    #[serde(default)]
+    pub entry_path: Option<String>,
+    /// The entry's uuid. Give exactly one of `entry_path` or `uuid`.
+    #[serde(default)]
+    pub uuid: Option<String>,
 }
 
-/// Input for `kdbx_get_entry`: the entry to fetch in detail.
+/// Input for `kdbx_get_entry`: the entry to fetch in detail, by path or uuid.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetEntryParams {
-    /// The path of the entry, like `/Web/Banking/MyBank`.
-    pub path: String,
+    /// The path of the entry, like `/Web/Banking/MyBank`. Give exactly one of
+    /// `path` or `uuid`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The entry's uuid. Give exactly one of `path` or `uuid`.
+    #[serde(default)]
+    pub uuid: Option<String>,
 }
 
 /// Input for `kdbx_find_entry`: a substring query and an optional field set.
@@ -151,12 +161,13 @@ impl KdbxServer {
             Ok(db) => db,
             Err(e) => return responses::err(&e),
         };
-        let entry_path = match VaultPath::parse(&params.entry_path) {
-            Ok(p) => p,
-            Err(e) => return responses::err(&e),
-        };
-        let entry_id = match entry_path.resolve_entry(db) {
-            Ok(id) => id,
+        let entry_id = match locate_entry(
+            db,
+            params.entry_path.as_deref(),
+            params.uuid.as_deref(),
+            "entry_path",
+        ) {
+            Ok(e) => e.id(),
             Err(e) => return responses::err(&e),
         };
         // attachment_list returns the full { attachments: [...] } object, which
@@ -180,14 +191,11 @@ impl KdbxServer {
             Ok(db) => db,
             Err(e) => return responses::err(&e),
         };
-        let path = match VaultPath::parse(&params.path) {
-            Ok(p) => p,
-            Err(e) => return responses::err(&e),
-        };
-        let entry_id = match path.resolve_entry(db) {
-            Ok(id) => id,
-            Err(e) => return responses::err(&e),
-        };
+        let entry_id =
+            match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+                Ok(e) => e.id(),
+                Err(e) => return responses::err(&e),
+            };
         match views::entry_detail(db, entry_id) {
             Some(data) => responses::ok(data),
             None => responses::err(&ErrorCode::EntryNotFound.into()),

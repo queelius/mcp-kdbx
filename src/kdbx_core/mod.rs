@@ -9,6 +9,7 @@
 //! - `error`: the typed error set and protocol-facing carrier (`CoreError`).
 //! - `config`: environment-variable configuration and validation.
 //! - `path`: `VaultPath` parsing, formatting, and resolution against a database.
+//! - `address`: `EntryAddress`, the path-or-UUID way entry tools name an entry.
 //! - `vault`: the locked/unlocked state machine over canonical and working dbs.
 //! - `unlock`: master-password source resolution (input, env, command).
 //! - `audit`: the JSONL audit-log events and sha256 reveal hashing.
@@ -20,6 +21,7 @@
 //! - `visibility`: the one rule for which field values may cross out as
 //!   metadata (unprotected, or the Title address), shared by views and search.
 
+pub mod address;
 pub mod audit;
 pub mod config;
 pub mod error;

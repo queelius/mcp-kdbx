@@ -1148,3 +1148,41 @@ against them.
     `protected` flag. Hiding it would require an addressing scheme that does
     not embed titles (UUID-only paths), which is out of scope for v0.1.
   - Password is still never emitted by any view, protected or not.
+
+# Implementation notes (review fix batch, 2026-10-18)
+
+Deviations and clarifications from the second review fix batch. Like the notes
+above, these are the authoritative wire contract; the conformance and
+integration tests assert them.
+
+- **Paths never alias another record.** An entry with an empty Title used to
+  format as `/Group/`, which parses as the group path `/Group`, and entry
+  resolution ignored the trailing slash, so `/Group/` resolved to a different
+  entry (a sibling of the group titled `Group`) and reveal or update acted on
+  the wrong record. Two rules close this:
+  - A record has a vault path only when every segment of that path has a
+    non-empty name. An entry with an empty (or missing) Title, and any record
+    under a group with an empty name, has no path: read views, the stage diff
+    (`path`, `group_path`), `kdbx_update_field`, and audit `target_path`
+    report `null` for it. The path grammar has no spelling for an empty name,
+    so the alternative (emitting a placeholder) would always alias something.
+    Every path the server emits parses and resolves back to the record it was
+    built from (a unit test asserts this over awkward titles).
+  - Entry tools refuse a group-shaped path. A path ending in `/` (including
+    the root `/`) always addresses a group, so entry resolution returns
+    `ENTRY_NOT_FOUND` for it instead of matching an entry. Group tools still
+    accept `/Web` and `/Web/` alike.
+- **UUID addressing for entry tools.** `kdbx_get_entry`,
+  `kdbx_list_attachments`, `kdbx_reveal_password`, `kdbx_reveal_protected`,
+  `kdbx_download_attachment`, `kdbx_get_otp`, and `kdbx_update_field` accept an
+  optional `uuid` (the record UUID every read view returns) alongside their
+  path parameter (`path`, or `entry_path` for the two attachment tools), which
+  is now optional too. Exactly one of the two must be given: both, or neither,
+  or a malformed uuid is `INVALID_INPUT`; a well-formed uuid that names no
+  entry is `ENTRY_NOT_FOUND`. This is how an agent reaches a record with no
+  path, and it is the cross-session-stable way to name any entry.
+  `kdbx_update_field` now also returns the entry's `uuid`, and its `path` is
+  the canonical path of the entry written (re-derived after the write).
+- **Discard summaries.** `pending_discarded_summary` (on `VAULT_LOCKED`) and the
+  `stage_discarded` audit `summary` list each staged entry's vault path, or its
+  UUID when it has no path. A path always starts with `/`; a UUID never does.

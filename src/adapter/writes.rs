@@ -18,6 +18,7 @@
 
 use crate::adapter::views::format_system_time;
 use crate::adapter::{KdbxServer, responses};
+use crate::kdbx_core::address::EntryAddress;
 use crate::kdbx_core::audit::AuditEvent;
 use crate::kdbx_core::error::{CoreError, ErrorCode};
 use crate::kdbx_core::path::{VaultPath, vault_path_to_entry};
@@ -63,11 +64,17 @@ pub struct AddEntryParams {
     pub attachments: HashMap<String, AttachmentSpec>,
 }
 
-/// Input for `kdbx_update_field`: which entry, which field, and the new value.
+/// Input for `kdbx_update_field`: which entry (by path or uuid), which field,
+/// and the new value.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UpdateFieldParams {
-    /// The entry path, for example `/Web/GitHub`.
-    pub path: String,
+    /// The entry path, for example `/Web/GitHub`. Give exactly one of `path`
+    /// or `uuid`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The entry's uuid. Give exactly one of `path` or `uuid`.
+    #[serde(default)]
+    pub uuid: Option<String>,
     /// The field name to set or change.
     pub field_name: String,
     /// The new value. An empty value clears the field.
@@ -154,10 +161,9 @@ impl KdbxServer {
         };
 
         // Capture the audit data into owned values before returning. The new
-        // entry's path is built from the working db; the uuid comes off the id.
-        let path = vault_path_to_entry(working, entry_id)
-            .map(|p| p.format())
-            .unwrap_or_else(|| group_path.format());
+        // entry's path is built from the working db (None only when its group
+        // has no addressable path); the uuid comes off the id.
+        let path = vault_path_to_entry(working, entry_id).map(|p| p.format());
         let uuid = entry_id.uuid().to_string();
 
         self.emit(AuditEvent::WriteStaged {
@@ -189,8 +195,12 @@ impl KdbxServer {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
-        let path = match VaultPath::parse(&params.path) {
-            Ok(p) => p,
+        let target = match EntryAddress::from_parts(
+            params.path.as_deref(),
+            params.uuid.as_deref(),
+            "path",
+        ) {
+            Ok(t) => t,
             Err(e) => return responses::err(&e),
         };
 
@@ -199,35 +209,32 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        if let Err(e) = stage::update_field(
+        let entry_id = match stage::update_field(
             working,
-            &path,
+            &target,
             &params.field_name,
             &params.value,
             params.protected,
         ) {
-            return responses::err(&e);
-        }
+            Ok(id) => id,
+            Err(e) => return responses::err(&e),
+        };
 
-        // Resolve the entry's uuid for the audit event. The write just succeeded,
-        // so the path resolves; fall back to an empty uuid defensively.
-        let uuid = path
-            .resolve_entry(working)
-            .ok()
-            .and_then(|id| working.entry(id).map(|e| e.id().uuid().to_string()))
-            .unwrap_or_default();
-
-        let path_str = path.format();
+        // Report the canonical path of the entry actually written (re-derived
+        // after the write, since a Title change moves it) and its uuid.
+        let path = vault_path_to_entry(working, entry_id).map(|p| p.format());
+        let uuid = entry_id.uuid().to_string();
         self.emit(AuditEvent::WriteStaged {
             tool: "kdbx_update_field".to_string(),
-            target_path: path_str.clone(),
-            target_uuid: uuid,
+            target_path: path.clone(),
+            target_uuid: uuid.clone(),
             field_name: Some(params.field_name.clone()),
         });
 
         responses::ok(serde_json::json!({
             "staged": true,
-            "path": path_str,
+            "path": path,
+            "uuid": uuid,
             "field_name": params.field_name,
         }))
     }
@@ -343,18 +350,12 @@ impl KdbxServer {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
-        // Capture the discarded changes' paths before the working copy is reset.
-        // The immutable diff borrow ends once the owned paths are collected, so
-        // the mutable discard borrow that follows does not conflict.
+        // Capture the discarded changes' labels before the working copy is
+        // reset. The immutable diff borrow ends once the owned labels are
+        // collected, so the mutable discard borrow that follows does not
+        // conflict.
         let summary: Vec<String> = match vault.canonical_and_working() {
-            Ok((canonical, working)) => {
-                let diff = stage::diff_pending(canonical, working);
-                diff.added
-                    .iter()
-                    .map(|a| a.path.clone())
-                    .chain(diff.modified.iter().map(|m| m.path.clone()))
-                    .collect()
-            }
+            Ok((canonical, working)) => stage::diff_pending(canonical, working).entry_labels(),
             Err(_) => Vec::new(),
         };
 

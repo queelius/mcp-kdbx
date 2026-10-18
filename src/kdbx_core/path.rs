@@ -258,19 +258,24 @@ impl VaultPath {
         self.step_into_group(db, current_group, &self.segments[last])
     }
 
-    /// Resolve and require an entry, forcing the final segment to resolve as an
-    /// entry regardless of a trailing slash.
+    /// Resolve and require an entry.
     ///
-    /// Like [`resolve_group`](Self::resolve_group), this forces the final-segment
-    /// kind rather than depending on the `is_group` flag. The intermediate
-    /// segments are group steps (`GroupNotFound` if one is missing); only the
-    /// last must be an entry (`EntryNotFound` if not). The root path has no
-    /// entry, so it is `EntryNotFound`.
+    /// The intermediate segments are group steps (`GroupNotFound` if one is
+    /// missing); only the last must be an entry (`EntryNotFound` if not).
+    ///
+    /// A group-shaped path (one that ends in `/`, including the root path `/`)
+    /// is refused with `EntryNotFound`: a trailing slash always addresses a
+    /// group, so it never names an entry. Before this rule, `/Email/` silently
+    /// resolved to an entry titled "Email", so an untitled entry inside group
+    /// "Email" (which once formatted as `/Email/`) aliased that other entry.
+    /// Unlike [`resolve_group`](Self::resolve_group), which accepts `/Web` and
+    /// `/Web/` alike, entry resolution is strict in this one direction.
     pub fn resolve_entry(&self, db: &Database) -> CoreResult<EntryId> {
         let root_id = db.root().id();
-        if self.segments.is_empty() {
+        // The root path is group-shaped too; the emptiness check is defensive.
+        if self.is_group || self.segments.is_empty() {
             return Err(CoreError::new(ErrorCode::EntryNotFound)
-                .with_message("the root path is a group, not an entry")
+                .with_message("a path ending in '/' addresses a group, not an entry")
                 .with_details(serde_json::json!({ "path": self.format() })));
         }
         let mut current_group = root_id;
@@ -549,11 +554,15 @@ fn nfc_normalize(input: &str) -> String {
 /// it, because same-named siblings receive the same UUID-ordered `:N` ordinal
 /// the resolver applies. The read tools and the stage diff use this to report
 /// the path of a record they hold by id.
+///
+/// Returns `None` as well when the entry has no addressable path: its title is
+/// empty or some ancestor group's name is empty (see [`addressable`]). Such a
+/// record is still reachable by UUID ([`crate::kdbx_core::address`]).
 pub fn vault_path_to_entry(db: &Database, target: EntryId) -> Option<VaultPath> {
     let root = db.root().id();
     let mut segments = Vec::new();
     if collect_entry_segments(db, root, target, &mut segments) {
-        Some(VaultPath {
+        addressable(VaultPath {
             segments,
             is_group: false,
         })
@@ -564,7 +573,9 @@ pub fn vault_path_to_entry(db: &Database, target: EntryId) -> Option<VaultPath> 
 
 /// Build the canonical [`VaultPath`] of the group `target` in `db`, or `None`
 /// when no group with that id exists. The root group maps to the bare root path
-/// `/`. Inverse of [`VaultPath::resolve_group`]; see [`vault_path_to_entry`].
+/// `/`. Inverse of [`VaultPath::resolve_group`]; see [`vault_path_to_entry`],
+/// including its rule that a group with an empty name (or under one) has no
+/// path.
 pub fn vault_path_to_group(db: &Database, target: GroupId) -> Option<VaultPath> {
     let root = db.root().id();
     if target == root {
@@ -575,12 +586,32 @@ pub fn vault_path_to_group(db: &Database, target: GroupId) -> Option<VaultPath> 
     }
     let mut segments = Vec::new();
     if collect_group_segments(db, root, target, &mut segments) {
-        Some(VaultPath {
+        addressable(VaultPath {
             segments,
             is_group: true,
         })
     } else {
         None
+    }
+}
+
+/// Keep a built path only when it is addressable: every segment has a
+/// non-empty name.
+///
+/// The path grammar has no spelling for an empty name. An empty final entry
+/// segment would format as a trailing slash (a group path) and an empty group
+/// segment as `//` (rejected by [`VaultPath::parse`]) or as the bare root `/`.
+/// Emitting either would hand the agent a path that resolves to a different
+/// record, or to nothing, so the rule is: a record whose path would contain an
+/// empty segment has no path. Views report `path: null` for it and callers
+/// address it by UUID instead. This is the one place that rule lives, so every
+/// path the server emits round-trips through `parse` + `resolve_*` back to the
+/// record it was built from.
+fn addressable(path: VaultPath) -> Option<VaultPath> {
+    if path.segments.iter().any(|seg| seg.name.is_empty()) {
+        None
+    } else {
+        Some(path)
     }
 }
 
@@ -1341,6 +1372,125 @@ mod tests {
         // Parent of a top-level entry is the root; parent of root is root.
         assert_eq!(VaultPath::parse("/MyBank").unwrap().parent().format(), "/");
         assert!(VaultPath::parse("/").unwrap().parent().is_root());
+    }
+
+    // Aliasing: a formatted path must never resolve to a different record.
+
+    /// The review probe's shape: a root entry titled "Email" plus a group
+    /// "Email" holding an entry with no title. Returns (db, root entry id,
+    /// untitled entry id).
+    fn db_with_untitled_entry_in_same_named_group() -> (Database, EntryId, EntryId) {
+        let mut db = Database::new();
+        let root_entry = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| {
+                e.set_unprotected(fields::TITLE, "Email");
+                e.set_protected(fields::PASSWORD, "root-email-secret");
+            })
+            .id();
+        let gid = db
+            .root_mut()
+            .add_group()
+            .edit(|g| g.name = "Email".to_string())
+            .id();
+        let untitled = db
+            .group_mut(gid)
+            .unwrap()
+            .add_entry()
+            .edit(|e| e.set_protected(fields::PASSWORD, "untitled-secret"))
+            .id();
+        (db, root_entry, untitled)
+    }
+
+    #[test]
+    fn untitled_entry_has_no_path() {
+        // An empty title would format as "/Email/", which parses as the group
+        // path "/Email" and (before the fix) resolved to the root entry titled
+        // "Email". The untitled entry must have no path at all.
+        let (db, _root_entry, untitled) = db_with_untitled_entry_in_same_named_group();
+        assert!(vault_path_to_entry(&db, untitled).is_none());
+    }
+
+    #[test]
+    fn unnamed_group_has_no_path_and_neither_do_its_entries() {
+        // A top-level group with an empty name would format as "/", aliasing
+        // the root group; an entry inside it would format as "//Title", which
+        // does not even parse. Neither gets a path.
+        let mut db = Database::new();
+        let gid = db.root_mut().add_group().id();
+        let eid = db
+            .group_mut(gid)
+            .unwrap()
+            .add_entry()
+            .edit(|e| e.set_unprotected(fields::TITLE, "Inside"))
+            .id();
+        assert!(vault_path_to_group(&db, gid).is_none());
+        assert!(vault_path_to_entry(&db, eid).is_none());
+    }
+
+    #[test]
+    fn resolve_entry_rejects_a_group_shaped_path() {
+        // "/Email/" addresses a group. resolve_entry used to ignore the trailing
+        // slash and match the root entry titled "Email"; it must refuse instead.
+        let (db, _root_entry, _untitled) = db_with_untitled_entry_in_same_named_group();
+        let err = VaultPath::parse("/Email/")
+            .unwrap()
+            .resolve_entry(&db)
+            .expect_err("a trailing slash never names an entry");
+        assert_eq!(err.code_enum(), ErrorCode::EntryNotFound);
+        // The entry-shaped path still reaches the root entry.
+        assert!(
+            VaultPath::parse("/Email")
+                .unwrap()
+                .resolve_entry(&db)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn every_emitted_entry_path_resolves_back_to_its_own_entry() {
+        // The non-aliasing property over a database full of awkward names: for
+        // every entry, a path is either absent or it parses and resolves to
+        // exactly that entry (never to another node).
+        let (mut db, _, _) = db_with_untitled_entry_in_same_named_group();
+        let awkward = [
+            "a/b",
+            "back\\slash",
+            "Build:2",
+            ":3",
+            "Email",
+            "Email",
+            "trailing ",
+        ];
+        for title in awkward {
+            db.root_mut()
+                .add_entry()
+                .edit(|e| e.set_unprotected(fields::TITLE, title));
+        }
+        let unnamed = db.root_mut().add_group().id();
+        db.group_mut(unnamed)
+            .unwrap()
+            .add_entry()
+            .edit(|e| e.set_unprotected(fields::TITLE, "Lost"));
+
+        let ids: Vec<EntryId> = db.iter_all_entries().map(|e| e.id()).collect();
+        let mut with_path = 0;
+        for id in ids {
+            if let Some(p) = vault_path_to_entry(&db, id) {
+                with_path += 1;
+                let reparsed = VaultPath::parse(&p.format()).expect("emitted path parses");
+                assert_eq!(
+                    reparsed.resolve_entry(&db).expect("emitted path resolves"),
+                    id,
+                    "path {} aliases another entry",
+                    p.format()
+                );
+            }
+        }
+        // Root "Email" plus the seven awkward titles; the untitled entry and the
+        // entry under the unnamed group have none.
+        assert_eq!(with_path, 8);
     }
 
     #[test]

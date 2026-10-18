@@ -20,8 +20,10 @@ pub mod reveals;
 pub mod views;
 pub mod writes;
 
+use crate::kdbx_core::address::EntryAddress;
 use crate::kdbx_core::audit::{AuditEvent, AuditLog};
 use crate::kdbx_core::config::Config;
+use crate::kdbx_core::error::{CoreError, ErrorCode};
 use crate::kdbx_core::vault::Vault;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -149,6 +151,33 @@ impl KdbxServer {
             }
         }
     }
+}
+
+/// Locate the entry an entry-targeting tool names, by vault path or by UUID
+/// (exactly one; see [`EntryAddress::from_parts`]). `path_param` is the tool's
+/// path parameter name (`path` or `entry_path`), echoed in the error message.
+///
+/// Every entry tool resolves its target through here, so path and UUID
+/// addressing behave identically across reads, reveals, and writes.
+pub(crate) fn locate_entry<'a>(
+    db: &'a keepass::Database,
+    path: Option<&str>,
+    uuid: Option<&str>,
+    path_param: &str,
+) -> Result<keepass::db::EntryRef<'a>, CoreError> {
+    let id = EntryAddress::from_parts(path, uuid, path_param)?.resolve(db)?;
+    db.entry(id)
+        .ok_or_else(|| CoreError::new(ErrorCode::EntryNotFound))
+}
+
+/// The canonical vault path of `entry`, or `None` when it has no addressable
+/// path. Audit events and responses report this rather than echoing the
+/// caller's input, so they name the record actually touched.
+pub(crate) fn canonical_entry_path(
+    db: &keepass::Database,
+    entry: &keepass::db::EntryRef<'_>,
+) -> Option<String> {
+    crate::kdbx_core::path::vault_path_to_entry(db, entry.id()).map(|p| p.format())
 }
 
 /// Map a level name (`error`/`warn`/`info`/`debug`/`trace`) to a verbosity rank,

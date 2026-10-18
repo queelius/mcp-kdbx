@@ -59,7 +59,8 @@ impl LockReason {
 /// The adapter takes this once (via [`Vault::take_last_lock`]) and attaches it
 /// to the next `VAULT_LOCKED` error. `reason` is the [`LockReason::label`]
 /// string; `pending_discarded_count` is the number of added plus modified
-/// entries that were dropped; `summary` is their human-readable vault paths.
+/// entries that were dropped; `summary` labels them (vault path, or UUID for a
+/// record with no addressable path, see `DiffPending::entry_labels`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockInfo {
     /// The lock reason as a stable label: `"manual"`, `"idle_timeout"`, or
@@ -67,7 +68,8 @@ pub struct LockInfo {
     pub reason: String,
     /// How many staged entries (added plus modified) the lock discarded.
     pub pending_discarded_count: usize,
-    /// The vault paths of the discarded added and modified entries.
+    /// The discarded added and modified entries: each one's vault path, or its
+    /// UUID when it has no addressable path.
     pub summary: Vec<String>,
 }
 
@@ -236,10 +238,7 @@ impl Vault {
             } => {
                 let diff = crate::kdbx_core::stage::diff_pending(canonical_db, working_db);
                 let count = diff.summary.num_added + diff.summary.num_modified;
-                let mut paths: Vec<String> = Vec::with_capacity(count);
-                paths.extend(diff.added.iter().map(|a| a.path.clone()));
-                paths.extend(diff.modified.iter().map(|m| m.path.clone()));
-                (count, paths)
+                (count, diff.entry_labels())
             }
             VaultState::Locked => (0, Vec::new()),
         };
