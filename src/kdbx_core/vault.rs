@@ -2,9 +2,9 @@
 //!
 //! A [`Vault`] is either `Locked` (no secrets in memory) or `Unlocked`, holding
 //! the parsed canonical database, a working clone the write tools mutate, the
-//! master key, and two timestamps (last activity for the Phase 2 idle timer, and
-//! the file mtime captured at unlock for the Phase 3 external-modification
-//! check). See spec section 2 ("State machine", "Unlock sequence", "Lock
+//! master key, the last-activity timestamp for the idle timer, and the
+//! fingerprint (content sha256 plus mtime) of the file the canonical db came
+//! from, for the save path's external-modification check. See spec section 2 ("State machine", "Unlock sequence", "Lock
 //! sequence") and section 3 ("Working-copy model").
 //!
 //! This module is deliberately free of MCP types, audit emission, and idle-timer
@@ -22,6 +22,7 @@
 //! structure to clear.
 
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
+use crate::kdbx_core::vault_file::{FileFingerprint, read_with_fingerprint};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 use zeroize::Zeroize;
@@ -29,7 +30,11 @@ use zeroize::Zeroize;
 /// Why a lock happened. Passed into [`Vault::lock`] so the caller can record it
 /// in the audit log. Phase 1 does not emit audit events from this module; the
 /// reason is threaded through for the Phase 3 adapter and for tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes as its snake_case name (`"manual"`, `"idle_timeout"`,
+/// `"shutdown"`) in audit events and lock reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LockReason {
     /// An explicit `kdbx_lock` tool call.
     Manual,
@@ -39,36 +44,77 @@ pub enum LockReason {
     Shutdown,
 }
 
-impl LockReason {
-    /// The stable lowercase label used in audit events and the [`LockInfo`]
-    /// returned to the adapter. The adapter attaches this to the
-    /// `VAULT_LOCKED` error so the first call after a lock can say why.
-    pub fn label(self) -> &'static str {
-        match self {
-            LockReason::Manual => "manual",
-            LockReason::IdleTimeout => "idle_timeout",
-            LockReason::Shutdown => "shutdown",
-        }
-    }
-}
-
 /// What a lock discarded, captured at lock time so the first tool call after a
 /// lock can report what staged work was thrown away (spec section 2, "Pending
 /// changes on lock").
 ///
 /// The adapter takes this once (via [`Vault::take_last_lock`]) and attaches it
-/// to the next `VAULT_LOCKED` error. `reason` is the [`LockReason::label`]
-/// string; `pending_discarded_count` is the number of added plus modified
-/// entries that were dropped; `summary` is their human-readable vault paths.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// to the next `VAULT_LOCKED` error. `reason` is the [`LockReason`]; `pending_discarded_count` is the number of added plus modified
+/// entries that were dropped; `summary` labels them (vault path, or UUID for a
+/// record with no addressable path, see `DiffPending::entry_labels`).
+///
+/// It serializes to the wire shape every report uses (the `VAULT_LOCKED`
+/// details, `kdbx_status.last_lock`, `kdbx_unlock.previous_lock`):
+/// `{ lock_reason, pending_discarded_count, pending_discarded_summary }`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LockInfo {
-    /// The lock reason as a stable label: `"manual"`, `"idle_timeout"`, or
-    /// `"shutdown"`.
-    pub reason: String,
+    /// Why the lock happened.
+    #[serde(rename = "lock_reason")]
+    pub reason: LockReason,
     /// How many staged entries (added plus modified) the lock discarded.
     pub pending_discarded_count: usize,
-    /// The vault paths of the discarded added and modified entries.
+    /// The discarded added and modified entries: each one's vault path, or its
+    /// UUID when it has no addressable path.
+    #[serde(rename = "pending_discarded_summary")]
     pub summary: Vec<String>,
+}
+
+/// Why a vault file could not be read, for the `VAULT_UNREADABLE` error. Every
+/// reason is found before any key is checked, so naming it reveals nothing
+/// about the password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadableReason {
+    /// The file does not start with the KeePass signature.
+    NotKdbx,
+    /// A KeePass file of a version keepass cannot open (KeePass 2 pre-release,
+    /// or an unknown KDBX major version).
+    UnsupportedVersion,
+    /// The file ends before its version header does.
+    Truncated,
+    /// The outer header does not parse or fails its sha256 integrity check.
+    CorruptHeader,
+}
+
+/// Classify a keepass open failure. Errors raised while reading the version
+/// signature and the outer header (all before the key is derived and checked)
+/// become `VAULT_UNREADABLE` with an [`UnreadableReason`]. Everything else
+/// (a wrong key, and any error that can only be reached after decryption with
+/// some key) stays `AUTH_FAILED`, the conservative answer: it never tells a
+/// wrong-key attempt apart from anything else.
+fn open_error(e: &keepass::error::DatabaseOpenError) -> CoreError {
+    use keepass::error::{
+        DatabaseFormatError as Fmt, DatabaseOpenError as Open, DatabaseVersionParseError as Ver,
+        Kdbx3OpenError, Kdbx4OpenError,
+    };
+    let reason = match e {
+        Open::VersionParse(Ver::InvalidKDBXIdentifier) => Some(UnreadableReason::NotKdbx),
+        Open::VersionParse(Ver::InvalidKDBXVersion { .. }) | Open::UnsupportedVersion => {
+            Some(UnreadableReason::UnsupportedVersion)
+        }
+        Open::VersionParse(Ver::UnexpectedEof) => Some(UnreadableReason::Truncated),
+        Open::Format(Fmt::Kdbx4(Kdbx4OpenError::OuterHeader(_)))
+        | Open::Format(Fmt::Kdbx4(Kdbx4OpenError::HeaderHashMismatch))
+        | Open::Format(Fmt::Kdbx3(Kdbx3OpenError::OuterHeader(_))) => {
+            Some(UnreadableReason::CorruptHeader)
+        }
+        _ => None,
+    };
+    match reason {
+        Some(reason) => CoreError::new(ErrorCode::VaultUnreadable)
+            .with_details(serde_json::json!({ "reason": reason })),
+        None => CoreError::new(ErrorCode::AuthFailed),
+    }
 }
 
 /// The two states a vault can be in.
@@ -101,10 +147,11 @@ pub enum VaultState {
         /// When the vault was last touched by a tool call. The Phase 2 idle
         /// timer reads this; [`Vault::touch`] updates it.
         last_activity: Instant,
-        /// The vault file's mtime at unlock time. The Phase 3 save path compares
-        /// the current mtime against this to refuse writes when the file changed
-        /// out from under us.
-        file_mtime_at_unlock: SystemTime,
+        /// The identity of the vault file this session's canonical db came
+        /// from: the sha256 of the exact bytes parsed at unlock (or written by
+        /// the last save) plus the mtime seen on that handle. The save path
+        /// re-reads the file and refuses when the content differs.
+        file_baseline: FileFingerprint,
     },
 }
 
@@ -116,8 +163,8 @@ pub struct Vault {
     /// The current lock state.
     state: VaultState,
     /// What the most recent lock discarded, if any, and not yet reported. Set
-    /// by [`lock`](Self::lock) when there was staged work, cleared by a
-    /// successful [`unlock`](Self::unlock) and by [`take_last_lock`](Self::take_last_lock).
+    /// by [`lock`](Self::lock), handed back (and cleared) by a successful
+    /// [`unlock`](Self::unlock) and by [`take_last_lock`](Self::take_last_lock).
     last_lock: Option<LockInfo>,
 }
 
@@ -149,30 +196,34 @@ impl Vault {
     ///
     /// Calling this while already unlocked is [`ErrorCode::VaultAlreadyUnlocked`].
     ///
+    /// On success, returns what the most recent lock discarded, if it was not
+    /// yet reported, and consumes it: `kdbx_unlock` reports it in its
+    /// response, so an agent whose first call after an idle lock is the unlock
+    /// still learns its staged changes were dropped. A failed unlock leaves it
+    /// in place.
+    ///
     /// This method only resolves a key from the `password` (and `keyfile`)
     /// arguments it is given. Resolving the password from env vars or a
     /// shell-out command is the unlock module's job (Task 7); it calls this with
     /// the resolved password.
-    pub fn unlock(&mut self, password: &str, keyfile: Option<&[u8]>) -> CoreResult<()> {
+    pub fn unlock(
+        &mut self,
+        password: &str,
+        keyfile: Option<&[u8]>,
+    ) -> CoreResult<Option<LockInfo>> {
         if self.is_unlocked() {
             return Err(ErrorCode::VaultAlreadyUnlocked.into());
         }
 
-        let bytes = std::fs::read(&self.path).map_err(|e| {
+        // Read the bytes and their fingerprint through one handle, so the
+        // external-modification baseline is exactly the content we parse.
+        let (bytes, file_baseline) = read_with_fingerprint(&self.path).map_err(|e| {
             CoreError::new(ErrorCode::VaultNotFound).with_message(format!(
                 "could not read vault file at {}: {}",
                 self.path.display(),
                 e
             ))
         })?;
-
-        // Capture the mtime now, before decryption, so the external-modification
-        // baseline reflects the bytes we actually parsed. If the metadata read
-        // fails, fall back to the current time, which is conservative: the
-        // Phase 3 save check would then refuse on any later modification.
-        let file_mtime_at_unlock = std::fs::metadata(&self.path)
-            .and_then(|m| m.modified())
-            .unwrap_or_else(|_| SystemTime::now());
 
         let mut key = keepass::DatabaseKey::new().with_password(password);
         if let Some(keyfile_bytes) = keyfile {
@@ -184,7 +235,7 @@ impl Vault {
         }
 
         let canonical_db = keepass::Database::open(&mut std::io::Cursor::new(&bytes), key.clone())
-            .map_err(|_| CoreError::new(ErrorCode::AuthFailed))?;
+            .map_err(|e| open_error(&e))?;
 
         let working_db = canonical_db.clone();
 
@@ -193,15 +244,13 @@ impl Vault {
             working_db,
             key,
             last_activity: Instant::now(),
-            file_mtime_at_unlock,
+            file_baseline,
         };
 
-        // A fresh session has no prior discard to report. Clear any LockInfo
-        // left over from an earlier lock so the next VAULT_LOCKED (if it ever
-        // comes) reflects this session, not a stale one.
-        self.last_lock = None;
-
-        Ok(())
+        // Hand back the prior lock's discard summary (consuming it): the caller
+        // reports it, and the next VAULT_LOCKED, if any, then reflects this
+        // session rather than a stale one.
+        Ok(self.last_lock.take())
     }
 
     /// Move from `Unlocked` back to `Locked`, returning the count of pending
@@ -216,8 +265,7 @@ impl Vault {
     /// The master key is zeroed before the state transition; dropping the
     /// `Unlocked` state then drops both databases, which is what discards the
     /// pending stage (the working db is the stage). `reason` is recorded in the
-    /// stashed [`LockInfo`] (as its [`label`](LockReason::label)) so the caller
-    /// can say why.
+    /// stashed [`LockInfo`] so the caller can say why.
     ///
     /// Locking an already-locked vault is a no-op that returns 0 and leaves
     /// `last_lock` untouched.
@@ -236,10 +284,7 @@ impl Vault {
             } => {
                 let diff = crate::kdbx_core::stage::diff_pending(canonical_db, working_db);
                 let count = diff.summary.num_added + diff.summary.num_modified;
-                let mut paths: Vec<String> = Vec::with_capacity(count);
-                paths.extend(diff.added.iter().map(|a| a.path.clone()));
-                paths.extend(diff.modified.iter().map(|m| m.path.clone()));
-                (count, paths)
+                (count, diff.entry_labels())
             }
             VaultState::Locked => (0, Vec::new()),
         };
@@ -253,7 +298,7 @@ impl Vault {
                 key.zeroize();
                 // Stash what this lock discarded for the next VAULT_LOCKED.
                 self.last_lock = Some(LockInfo {
-                    reason: reason.label().to_string(),
+                    reason,
                     pending_discarded_count: count,
                     summary,
                 });
@@ -273,6 +318,13 @@ impl Vault {
     /// (no lock since the last unlock, or it was already taken).
     pub fn take_last_lock(&mut self) -> Option<LockInfo> {
         self.last_lock.take()
+    }
+
+    /// Peek at the most recent lock's discard summary without consuming it.
+    /// `kdbx_status` reports it this way, so asking for status never hides
+    /// the summary from the next `VAULT_LOCKED` or unlock.
+    pub fn last_lock(&self) -> Option<&LockInfo> {
+        self.last_lock.as_ref()
     }
 
     /// True when the vault is unlocked.
@@ -414,18 +466,24 @@ impl Vault {
         }
     }
 
-    /// The vault file's mtime as captured at unlock. The save path compares the
-    /// current on-disk mtime against this to detect external modification.
+    /// The fingerprint of the vault file the canonical db corresponds to:
+    /// recorded at unlock, replaced by each successful save. The save path
+    /// compares the on-disk content against it.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn file_baseline(&self) -> CoreResult<FileFingerprint> {
+        match &self.state {
+            VaultState::Unlocked { file_baseline, .. } => Ok(*file_baseline),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// The vault file's mtime as observed with the baseline content (at unlock
+    /// or the last save). Reporting only: conflict detection uses the content.
     ///
     /// [`ErrorCode::VaultLocked`] when locked.
     pub fn mtime_at_unlock(&self) -> CoreResult<SystemTime> {
-        match &self.state {
-            VaultState::Unlocked {
-                file_mtime_at_unlock,
-                ..
-            } => Ok(*file_mtime_at_unlock),
-            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
-        }
+        self.file_baseline().map(|b| b.mtime())
     }
 
     /// Borrow the working db and the master key together, for serializing the
@@ -481,19 +539,19 @@ impl Vault {
 
     /// Record that the working db was successfully written to disk: adopt it as
     /// the new canonical baseline (so `has_pending_changes` settles to false) and
-    /// update the external-modification mtime to the freshly written file's.
+    /// replace the file baseline with the fingerprint of the bytes written.
     ///
     /// [`ErrorCode::VaultLocked`] when locked.
-    pub fn mark_saved(&mut self, new_mtime: SystemTime) -> CoreResult<()> {
+    pub fn mark_saved(&mut self, written: FileFingerprint) -> CoreResult<()> {
         match &mut self.state {
             VaultState::Unlocked {
                 canonical_db,
                 working_db,
-                file_mtime_at_unlock,
+                file_baseline,
                 ..
             } => {
                 *canonical_db = working_db.clone();
-                *file_mtime_at_unlock = new_mtime;
+                *file_baseline = written;
                 Ok(())
             }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
@@ -576,6 +634,52 @@ mod tests {
             .expect_err("wrong password should fail");
         assert_eq!(err.code_enum(), ErrorCode::AuthFailed);
         assert!(!vault.is_unlocked());
+    }
+
+    /// Unlock a vault whose file holds `bytes`, returning the error.
+    fn unlock_bytes(bytes: &[u8], password: &str) -> CoreError {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+        let mut vault = Vault::new(tmp.path().to_path_buf());
+        let err = vault.unlock(password, None).expect_err("must fail");
+        assert!(!vault.is_unlocked());
+        err
+    }
+
+    fn fixture_bytes() -> Vec<u8> {
+        let (_tmp, path) = write_fixture();
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn unreadable_vault_files_are_distinguished_from_a_wrong_key() {
+        // Each of these fails before any key is checked, so naming the reason
+        // reveals nothing about the password. A wrong key stays AUTH_FAILED.
+        let reason = |e: &CoreError| e.details().unwrap()["reason"].clone();
+
+        let err = unlock_bytes(b"this is not a keepass file at all", TEST_PASSWORD);
+        assert_eq!(err.code_enum(), ErrorCode::VaultUnreadable);
+        assert_eq!(reason(&err), serde_json::json!("not_kdbx"));
+
+        let err = unlock_bytes(b"\x03\xd9", TEST_PASSWORD);
+        assert_eq!(err.code_enum(), ErrorCode::VaultUnreadable);
+        assert_eq!(reason(&err), serde_json::json!("truncated"));
+
+        let mut unsupported = fixture_bytes();
+        unsupported[10] = 9; // major version 9
+        let err = unlock_bytes(&unsupported, TEST_PASSWORD);
+        assert_eq!(err.code_enum(), ErrorCode::VaultUnreadable);
+        assert_eq!(reason(&err), serde_json::json!("unsupported_version"));
+
+        let mut corrupt = fixture_bytes();
+        corrupt[40] ^= 0xff; // inside the outer header
+        let err = unlock_bytes(&corrupt, TEST_PASSWORD);
+        assert_eq!(err.code_enum(), ErrorCode::VaultUnreadable);
+        assert_eq!(reason(&err), serde_json::json!("corrupt_header"));
+
+        let err = unlock_bytes(&fixture_bytes(), "the-wrong-password");
+        assert_eq!(err.code_enum(), ErrorCode::AuthFailed);
     }
 
     #[test]
@@ -747,11 +851,13 @@ mod tests {
         }
         assert!(vault.has_pending_changes());
 
-        // Marking saved adopts working as the new canonical baseline and updates
-        // the external-modification mtime.
+        // Marking saved adopts working as the new canonical baseline and
+        // replaces the file fingerprint.
         let new_mtime = SystemTime::now() + Duration::from_secs(5);
-        vault.mark_saved(new_mtime).expect("mark saved");
+        let written = FileFingerprint::new(b"new bytes", new_mtime);
+        vault.mark_saved(written).expect("mark saved");
         assert!(!vault.has_pending_changes());
+        assert_eq!(vault.file_baseline().expect("unlocked"), written);
         assert_eq!(vault.mtime_at_unlock().expect("unlocked"), new_mtime);
     }
 
@@ -768,10 +874,11 @@ mod tests {
     }
 
     #[test]
-    fn lock_reason_labels_are_stable() {
-        assert_eq!(LockReason::Manual.label(), "manual");
-        assert_eq!(LockReason::IdleTimeout.label(), "idle_timeout");
-        assert_eq!(LockReason::Shutdown.label(), "shutdown");
+    fn lock_reason_wire_names_are_stable() {
+        let name = |r| serde_json::to_value(r).unwrap();
+        assert_eq!(name(LockReason::Manual), "manual");
+        assert_eq!(name(LockReason::IdleTimeout), "idle_timeout");
+        assert_eq!(name(LockReason::Shutdown), "shutdown");
     }
 
     #[test]
@@ -785,7 +892,7 @@ mod tests {
         assert_eq!(discarded, 1);
 
         let info = vault.take_last_lock().expect("a discard to report");
-        assert_eq!(info.reason, "idle_timeout");
+        assert_eq!(info.reason, LockReason::IdleTimeout);
         assert_eq!(info.pending_discarded_count, 1);
         assert_eq!(info.summary.len(), 1);
         // The summary holds the human path of the modified entry.
@@ -807,7 +914,7 @@ mod tests {
         // A clean lock still records a LockInfo so the adapter can report the
         // reason; the count is zero and the summary empty.
         let info = vault.take_last_lock().expect("clean lock still records");
-        assert_eq!(info.reason, "manual");
+        assert_eq!(info.reason, LockReason::Manual);
         assert_eq!(info.pending_discarded_count, 0);
         assert!(info.summary.is_empty());
     }
@@ -821,17 +928,47 @@ mod tests {
     }
 
     #[test]
-    fn unlock_clears_prior_last_lock() {
+    fn unlock_hands_back_the_prior_lock_info_once() {
+        // An agent whose first call after an idle lock is kdbx_unlock must
+        // still learn what the lock discarded: unlock returns it (and consumes
+        // it, since the caller now reports it).
         let (_tmp, path) = write_fixture();
         let mut vault = Vault::new(path);
-        vault.unlock(TEST_PASSWORD, None).expect("first unlock");
+        assert_eq!(
+            vault.unlock(TEST_PASSWORD, None).expect("first unlock"),
+            None
+        );
+        stage_one_change(&mut vault);
+        vault.lock(LockReason::IdleTimeout);
+
+        // Peeking (what kdbx_status does) does not consume it.
+        assert_eq!(
+            vault.last_lock().map(|l| l.pending_discarded_count),
+            Some(1)
+        );
+        assert_eq!(
+            vault.last_lock().map(|l| l.pending_discarded_count),
+            Some(1)
+        );
+
+        let prior = vault
+            .unlock(TEST_PASSWORD, None)
+            .expect("second unlock")
+            .expect("the discard is reported");
+        assert_eq!(prior.reason, LockReason::IdleTimeout);
+        assert_eq!(prior.pending_discarded_count, 1);
+        assert!(vault.last_lock().is_none(), "consumed by the unlock");
+    }
+
+    #[test]
+    fn failed_unlock_keeps_the_prior_lock_info() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
         stage_one_change(&mut vault);
         vault.lock(LockReason::Manual);
-
-        // A fresh unlock clears the stashed discard: a new session has nothing
-        // prior to report.
-        vault.unlock(TEST_PASSWORD, None).expect("second unlock");
-        assert!(vault.take_last_lock().is_none());
+        vault.unlock("wrong", None).expect_err("wrong password");
+        assert!(vault.last_lock().is_some(), "still there to report");
     }
 
     #[test]

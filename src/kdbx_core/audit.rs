@@ -31,39 +31,81 @@
 //! verbosity, not by emitting redacted copies of those payloads here. If the
 //! capture is added later, it must restore a redaction layer before logging.
 
+use crate::kdbx_core::error::ErrorCode;
+use crate::kdbx_core::unlock::UnlockSource;
+use crate::kdbx_core::vault::{LockReason, UnreadableReason};
+use crate::kdbx_core::vault_file::{LockUnavailable, SaveStep};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
 
-/// Severity level for an audit event, mapped from the spec's per-event level
-/// column. The wire form is lowercase (see [`Level::as_str`]) to match the
-/// envelope shape in spec section 6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Severity level, shared by audit events and the `KDBX_LOG_LEVEL` setting.
+///
+/// The variants are declared least verbose first, so the derived `Ord` is the
+/// verbosity order: an event is emitted when `event.level() <= configured`.
+/// The wire and config spelling is the lowercase variant name, via serde (the
+/// envelope's `level` field, and [`Level::from_str`] for the env var), so
+/// there is no string table to keep in step.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Level {
     Error,
     Warn,
+    /// The default level. Captures lifecycle and reveal events.
+    #[default]
     Info,
     Debug,
     Trace,
 }
 
-impl Level {
-    /// The lowercase wire string for this level.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Level::Error => "error",
-            Level::Warn => "warn",
-            Level::Info => "info",
-            Level::Debug => "debug",
-            Level::Trace => "trace",
-        }
+impl std::str::FromStr for Level {
+    type Err = serde::de::value::Error;
+
+    /// Parse the lowercase level name (case-sensitive). Anything else is an
+    /// error, so a misspelled `KDBX_LOG_LEVEL` does not silently default.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        use serde::de::IntoDeserializer;
+        Level::deserialize(raw.into_deserializer())
     }
+}
+
+/// Which write tool staged a change (the `write_staged` event's `tool`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteTool {
+    KdbxAddEntry,
+    KdbxUpdateField,
+}
+
+/// Why the stage was discarded (the `stage_discarded` event's `reason`). A
+/// lock also drops the stage, but that is reported as `vault_locked` with a
+/// [`LockReason`]; this event covers the explicit tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageDiscardReason {
+    /// `kdbx_discard_pending`.
+    Manual,
 }
 
 /// One audited action. Each variant carries the event-specific detail fields
 /// named in the spec's "Logged events" table (section 6).
+///
+/// `target_path` is the canonical vault path of the record acted on, or `None`
+/// (JSON `null`) when the record has no addressable path and was named by UUID.
 ///
 /// Field names on the variants match the snake_case keys that appear in the
 /// rendered `details` object, so the mapping in [`AuditEvent::details_json`]
@@ -77,29 +119,40 @@ pub enum AuditEvent {
         writes_allowed: bool,
         idle_timeout_seconds: u64,
     },
-    /// A vault was unlocked. `unlock_source` is one of "input", "env", "cmd".
+    /// A vault was unlocked.
     VaultUnlocked {
-        unlock_source: String,
+        unlock_source: UnlockSource,
         file_mtime: String,
     },
     /// A vault was locked (idle, explicit, or shutdown).
     VaultLocked {
-        reason: String,
+        reason: LockReason,
         pending_discarded_count: u64,
     },
+    /// An unlock failed before any key was checked: the vault file is not a
+    /// readable KDBX database (`VAULT_UNREADABLE`). Distinct from
+    /// `auth_failed`, which is a wrong key. `reason` is null only if the
+    /// error carried none, which the vault never does.
+    UnlockFailed {
+        unlock_source: UnlockSource,
+        reason: Option<UnreadableReason>,
+    },
     /// Authentication failed. `source` matches the unlock source that failed.
-    AuthFailed { source: String, error_code: String },
+    AuthFailed {
+        source: UnlockSource,
+        error_code: ErrorCode,
+    },
     /// A write was staged into the working database (not yet on disk).
     WriteStaged {
-        tool: String,
-        target_path: String,
+        tool: WriteTool,
+        target_path: Option<String>,
         target_uuid: String,
         /// Present only for field-level writes; null otherwise.
         field_name: Option<String>,
     },
     /// The pending stage was discarded. `summary` carries paths only, no values.
     StageDiscarded {
-        reason: String,
+        reason: StageDiscardReason,
         num_dropped: u64,
         summary: Vec<String>,
     },
@@ -115,21 +168,22 @@ pub enum AuditEvent {
         conflict_mtime: String,
         pending_changes: u64,
     },
-    /// Save failed mid-flight. `failure_step` names where it stopped.
+    /// Save failed mid-flight. `failure_step` names where it stopped (null
+    /// only if the error carried no step, which the save path never does).
     SaveFailed {
-        failure_step: String,
+        failure_step: Option<SaveStep>,
         error_message: String,
         pending_changes: u64,
     },
     /// A password field was revealed. `sha256` is [`hash_revealed`] of the value.
     RevealPassword {
-        target_path: String,
+        target_path: Option<String>,
         target_uuid: String,
         sha256: String,
     },
     /// A non-password protected field was revealed.
     RevealProtected {
-        target_path: String,
+        target_path: Option<String>,
         target_uuid: String,
         field_name: String,
         sha256: String,
@@ -140,15 +194,24 @@ pub enum AuditEvent {
     /// [`hash_revealed`] (which is for string secrets). It identifies which
     /// attachment was taken without storing its content.
     DownloadAttachment {
-        target_path: String,
+        target_path: Option<String>,
+        target_uuid: String,
         attachment_name: String,
         size_bytes: u64,
         sha256: String,
     },
+    /// A save proceeded without the inter-instance writer lock because the
+    /// filesystem cannot lock (the content check still ran).
+    WriterLockUnavailable { reason: LockUnavailable },
     /// A TOTP code was computed. The code itself is never logged.
     GetOtp {
-        target_path: String,
+        target_path: Option<String>,
         target_uuid: String,
+        /// The `time_unix` the caller asked for, or `None` for "now".
+        requested_time_unix: Option<u64>,
+        /// The time the code was computed at, after clamping the request to
+        /// now plus or minus one period.
+        time_unix: u64,
     },
 }
 
@@ -160,6 +223,7 @@ impl AuditEvent {
             AuditEvent::VaultUnlocked { .. } => "vault_unlocked",
             AuditEvent::VaultLocked { .. } => "vault_locked",
             AuditEvent::AuthFailed { .. } => "auth_failed",
+            AuditEvent::UnlockFailed { .. } => "unlock_failed",
             AuditEvent::WriteStaged { .. } => "write_staged",
             AuditEvent::StageDiscarded { .. } => "stage_discarded",
             AuditEvent::SaveCommitted { .. } => "save_committed",
@@ -169,6 +233,7 @@ impl AuditEvent {
             AuditEvent::RevealProtected { .. } => "reveal_protected",
             AuditEvent::DownloadAttachment { .. } => "download_attachment",
             AuditEvent::GetOtp { .. } => "get_otp",
+            AuditEvent::WriterLockUnavailable { .. } => "writer_lock_unavailable",
         }
     }
 
@@ -180,6 +245,7 @@ impl AuditEvent {
             AuditEvent::VaultUnlocked { .. } => Level::Info,
             AuditEvent::VaultLocked { .. } => Level::Info,
             AuditEvent::AuthFailed { .. } => Level::Error,
+            AuditEvent::UnlockFailed { .. } => Level::Warn,
             AuditEvent::WriteStaged { .. } => Level::Info,
             AuditEvent::StageDiscarded { .. } => Level::Info,
             AuditEvent::SaveCommitted { .. } => Level::Info,
@@ -189,6 +255,7 @@ impl AuditEvent {
             AuditEvent::RevealProtected { .. } => Level::Info,
             AuditEvent::DownloadAttachment { .. } => Level::Info,
             AuditEvent::GetOtp { .. } => Level::Info,
+            AuditEvent::WriterLockUnavailable { .. } => Level::Warn,
         }
     }
 
@@ -294,21 +361,35 @@ impl AuditEvent {
             }),
             AuditEvent::DownloadAttachment {
                 target_path,
+                target_uuid,
                 attachment_name,
                 size_bytes,
                 sha256,
             } => json!({
                 "target_path": target_path,
+                "target_uuid": target_uuid,
                 "attachment_name": attachment_name,
                 "size_bytes": size_bytes,
                 "sha256": sha256,
             }),
+            AuditEvent::WriterLockUnavailable { reason } => json!({ "reason": reason }),
+            AuditEvent::UnlockFailed {
+                unlock_source,
+                reason,
+            } => json!({
+                "unlock_source": unlock_source,
+                "reason": reason,
+            }),
             AuditEvent::GetOtp {
                 target_path,
                 target_uuid,
+                requested_time_unix,
+                time_unix,
             } => json!({
                 "target_path": target_path,
                 "target_uuid": target_uuid,
+                "requested_time_unix": requested_time_unix,
+                "time_unix": time_unix,
             }),
         }
     }
@@ -319,7 +400,7 @@ impl AuditEvent {
     pub fn envelope(&self, timestamp: &str, pid: u32) -> Value {
         json!({
             "timestamp": timestamp,
-            "level": self.level().as_str(),
+            "level": self.level(),
             "event": self.event(),
             "pid": pid,
             "details": self.details_json(),
@@ -392,10 +473,10 @@ impl AuditLog {
         // stderr first so the record is visible even if the file write fails.
         let mut stderr = std::io::stderr();
         let _ = writeln!(stderr, "{line}");
-        if let Some(file) = &self.file {
-            if let Ok(mut handle) = file.lock() {
-                let _ = writeln!(handle, "{line}");
-            }
+        if let Some(file) = &self.file
+            && let Ok(mut handle) = file.lock()
+        {
+            let _ = writeln!(handle, "{line}");
         }
     }
 }
@@ -420,7 +501,7 @@ mod tests {
             ),
             (
                 AuditEvent::VaultUnlocked {
-                    unlock_source: "env".to_string(),
+                    unlock_source: UnlockSource::Env,
                     file_mtime: "2026-05-08T10:00:00Z".to_string(),
                 },
                 "vault_unlocked",
@@ -428,7 +509,7 @@ mod tests {
             ),
             (
                 AuditEvent::VaultLocked {
-                    reason: "idle".to_string(),
+                    reason: LockReason::IdleTimeout,
                     pending_discarded_count: 0,
                 },
                 "vault_locked",
@@ -436,16 +517,16 @@ mod tests {
             ),
             (
                 AuditEvent::AuthFailed {
-                    source: "cmd".to_string(),
-                    error_code: "AUTH_FAILED".to_string(),
+                    source: UnlockSource::Cmd,
+                    error_code: ErrorCode::AuthFailed,
                 },
                 "auth_failed",
                 Level::Error,
             ),
             (
                 AuditEvent::WriteStaged {
-                    tool: "kdbx_update_field".to_string(),
-                    target_path: "/Web/GitHub".to_string(),
+                    tool: WriteTool::KdbxUpdateField,
+                    target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                     field_name: Some("Password".to_string()),
                 },
@@ -454,7 +535,7 @@ mod tests {
             ),
             (
                 AuditEvent::StageDiscarded {
-                    reason: "idle_lock".to_string(),
+                    reason: StageDiscardReason::Manual,
                     num_dropped: 2,
                     summary: vec!["/Web/GitHub".to_string(), "/Web/GitLab".to_string()],
                 },
@@ -481,7 +562,7 @@ mod tests {
             ),
             (
                 AuditEvent::SaveFailed {
-                    failure_step: "rename".to_string(),
+                    failure_step: Some(SaveStep::Rename),
                     error_message: "disk full".to_string(),
                     pending_changes: 1,
                 },
@@ -490,7 +571,7 @@ mod tests {
             ),
             (
                 AuditEvent::RevealPassword {
-                    target_path: "/Web/GitHub".to_string(),
+                    target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                     sha256: "deadbeef".to_string(),
                 },
@@ -499,7 +580,7 @@ mod tests {
             ),
             (
                 AuditEvent::RevealProtected {
-                    target_path: "/Web/GitHub".to_string(),
+                    target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                     field_name: "RecoveryKey".to_string(),
                     sha256: "deadbeef".to_string(),
@@ -509,7 +590,8 @@ mod tests {
             ),
             (
                 AuditEvent::DownloadAttachment {
-                    target_path: "/Web/GitHub".to_string(),
+                    target_path: Some("/Web/GitHub".to_string()),
+                    target_uuid: "abcd".to_string(),
                     attachment_name: "key.pem".to_string(),
                     size_bytes: 2048,
                     sha256: "deadbeef".to_string(),
@@ -519,22 +601,86 @@ mod tests {
             ),
             (
                 AuditEvent::GetOtp {
-                    target_path: "/Web/GitHub".to_string(),
+                    target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
+                    requested_time_unix: None,
+                    time_unix: 1_700_000_000,
                 },
                 "get_otp",
                 Level::Info,
             ),
+            (
+                AuditEvent::UnlockFailed {
+                    unlock_source: UnlockSource::Input,
+                    reason: Some(UnreadableReason::NotKdbx),
+                },
+                "unlock_failed",
+                Level::Warn,
+            ),
+            (
+                AuditEvent::WriterLockUnavailable {
+                    reason: LockUnavailable::NoLocks,
+                },
+                "writer_lock_unavailable",
+                Level::Warn,
+            ),
         ]
     }
 
+    /// The exact JSONL line each event renders to, pinned. The audit log is a
+    /// durable on-disk format that operators grep and parse; any change to a
+    /// key, a value spelling, or a type here is a format break and must be
+    /// deliberate.
+    const PINNED_ENVELOPES: &[&str] = &[
+        r#"{"details":{"idle_timeout_seconds":900,"server_version":"0.1.0","vault_path":"/vault.kdbx","writes_allowed":false},"event":"server_started","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"file_mtime":"2026-05-08T10:00:00Z","unlock_source":"env"},"event":"vault_unlocked","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"pending_discarded_count":0,"reason":"idle_timeout"},"event":"vault_locked","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"error_code":"AUTH_FAILED","source":"cmd"},"event":"auth_failed","level":"error","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"field_name":"Password","target_path":"/Web/GitHub","target_uuid":"abcd","tool":"kdbx_update_field"},"event":"write_staged","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"num_dropped":2,"reason":"manual","summary":["/Web/GitHub","/Web/GitLab"]},"event":"stage_discarded","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"after_mtime":"2026-05-08T10:01:00Z","before_mtime":"2026-05-08T10:00:00Z","num_changes":1},"event":"save_committed","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"before_mtime":"2026-05-08T10:00:00Z","conflict_mtime":"2026-05-08T10:00:30Z","pending_changes":1},"event":"save_refused","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"error_message":"disk full","failure_step":"rename","pending_changes":1},"event":"save_failed","level":"error","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_password","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"field_name":"RecoveryKey","sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_protected","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"attachment_name":"key.pem","sha256":"deadbeef","size_bytes":2048,"target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"download_attachment","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"requested_time_unix":null,"target_path":"/Web/GitHub","target_uuid":"abcd","time_unix":1700000000},"event":"get_otp","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"reason":"not_kdbx","unlock_source":"input"},"event":"unlock_failed","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"reason":"no_locks"},"event":"writer_lock_unavailable","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+    ];
+
     #[test]
-    fn level_wire_strings() {
-        assert_eq!(Level::Error.as_str(), "error");
-        assert_eq!(Level::Warn.as_str(), "warn");
-        assert_eq!(Level::Info.as_str(), "info");
-        assert_eq!(Level::Debug.as_str(), "debug");
-        assert_eq!(Level::Trace.as_str(), "trace");
+    fn envelopes_render_to_the_pinned_jsonl() {
+        let events = all_events();
+        assert_eq!(events.len(), PINNED_ENVELOPES.len());
+        for ((event, name, _), pinned) in events.iter().zip(PINNED_ENVELOPES) {
+            assert_eq!(
+                event.envelope("2026-01-01T00:00:00Z", 42).to_string(),
+                *pinned,
+                "{name} drifted from the pinned audit format"
+            );
+        }
+    }
+
+    #[test]
+    fn level_wire_strings_parse_and_order() {
+        let all = [
+            (Level::Error, "error"),
+            (Level::Warn, "warn"),
+            (Level::Info, "info"),
+            (Level::Debug, "debug"),
+            (Level::Trace, "trace"),
+        ];
+        for (level, name) in all {
+            assert_eq!(serde_json::to_value(level).unwrap(), json!(name));
+            assert_eq!(name.parse::<Level>().unwrap(), level);
+        }
+        assert!("INFO".parse::<Level>().is_err());
+        assert!("verbose".parse::<Level>().is_err());
+        // Declaration order is verbosity order.
+        assert!(Level::Error < Level::Warn && Level::Warn < Level::Info);
+        assert!(Level::Info < Level::Debug && Level::Debug < Level::Trace);
+        assert_eq!(Level::default(), Level::Info);
     }
 
     #[test]
@@ -553,7 +699,7 @@ mod tests {
         // Exactly the five envelope fields from spec section 6, no more.
         assert_eq!(obj.len(), 5);
         assert_eq!(obj["timestamp"], json!("2026-05-08T10:00:00Z"));
-        assert_eq!(obj["level"], json!(level.as_str()));
+        assert_eq!(obj["level"], json!(level));
         assert_eq!(obj["event"], json!(name));
         assert_eq!(obj["pid"], json!(12345));
         assert!(obj["details"].is_object());
@@ -564,7 +710,7 @@ mod tests {
         for (event, name, level) in all_events() {
             let env = event.envelope("2026-05-08T10:00:00Z", 999);
             assert_eq!(env["timestamp"], json!("2026-05-08T10:00:00Z"));
-            assert_eq!(env["level"], json!(level.as_str()));
+            assert_eq!(env["level"], json!(level));
             assert_eq!(env["event"], json!(name));
             assert_eq!(env["pid"], json!(999));
             assert!(
@@ -578,8 +724,8 @@ mod tests {
     fn details_carry_the_spec_fields() {
         // Spot-check a few variants against the spec's details column.
         let staged = AuditEvent::WriteStaged {
-            tool: "kdbx_add_entry".to_string(),
-            target_path: "/Web/New".to_string(),
+            tool: WriteTool::KdbxAddEntry,
+            target_path: Some("/Web/New".to_string()),
             target_uuid: "uuid-1".to_string(),
             field_name: None,
         };
@@ -590,7 +736,7 @@ mod tests {
         assert_eq!(d["field_name"], Value::Null);
 
         let reveal = AuditEvent::RevealProtected {
-            target_path: "/Web/X".to_string(),
+            target_path: Some("/Web/X".to_string()),
             target_uuid: "uuid-2".to_string(),
             field_name: "Secret".to_string(),
             sha256: "abc123".to_string(),
@@ -600,13 +746,18 @@ mod tests {
         assert_eq!(d["sha256"], json!("abc123"));
 
         let otp = AuditEvent::GetOtp {
-            target_path: "/Web/X".to_string(),
+            target_path: Some("/Web/X".to_string()),
             target_uuid: "uuid-3".to_string(),
+            requested_time_unix: Some(0),
+            time_unix: 1_699_999_970,
         };
         let d = otp.details_json();
-        // No code field: the OTP value is never logged.
+        // No code field: the OTP value is never logged. The requested and the
+        // effective (clamped) evaluation times are.
         assert!(d.get("code").is_none());
-        assert_eq!(d.as_object().unwrap().len(), 2);
+        assert_eq!(d["requested_time_unix"], json!(0));
+        assert_eq!(d["time_unix"], json!(1_699_999_970));
+        assert_eq!(d.as_object().unwrap().len(), 4);
     }
 
     #[test]

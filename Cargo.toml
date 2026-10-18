@@ -3,7 +3,9 @@ name = "mcp-kdbx"
 description = "Model Context Protocol server exposing KeePass KDBX vaults to AI agents (bridge member of the *-kdbx ecosystem)"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.89: std::fs::File::try_lock, the advisory writer lock the save path holds
+# across its conflict check and rename (no extra dependency needed).
+rust-version = "1.89"
 authors = ["Alexander Towell <lex@metafunctor.com>"]
 license = "MIT"
 repository = "https://github.com/queelius/mcp-kdbx"
@@ -29,6 +31,11 @@ serde_json = "1"
 # Unicode NFC normalization for case-sensitive, normalization-aware path name
 # comparison. Small, single-purpose crate.
 unicode-normalization = "0.1"
+# Unicode General_Category lookup (same unicode-rs family as
+# unicode-normalization). Titles and field names refuse control (Cc) and
+# format (Cf) characters, minus an explicit allow-list (ZWNJ, ZWJ); std only
+# exposes Cc (char::is_control), and an allow-list over Cf needs the category.
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
@@ -44,6 +51,16 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io"] }
+# JSON Schema derive for core input enums (search::Field), so a tool schema can
+# enumerate allowed values. The same major version rmcp uses, so it unifies with
+# rmcp's copy; it is a JSON Schema crate, not an MCP type, so kdbx_core may use
+# it without breaking the core/adapter split.
+schemars = "1"
+
+# O_NOFOLLOW / O_NONBLOCK / ELOOP for opening the sidecar writer-lock file
+# safely (kdbx_core::vault_file). Already in the tree through tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 # Gates the gen-fixtures helper binary (added in Phase 4). Matches the

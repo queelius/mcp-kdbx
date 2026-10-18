@@ -32,53 +32,13 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::kdbx_core::audit::Level;
+use crate::kdbx_core::secret::Secret;
+
 /// Upper bound for the two integer settings, in seconds. 86400 is one day,
 /// which is far beyond any sane idle window or secret-manager round trip while
 /// still rejecting obvious overflow or garbage values.
 const MAX_SECONDS: u64 = 86_400;
-
-/// The verbosity levels accepted by `KDBX_LOG_LEVEL`, ordered least to most
-/// verbose. The wire/config names are the lowercase variant names; parsing is
-/// case-sensitive to keep the contract unambiguous.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LogLevel {
-    Error,
-    Warn,
-    /// The default level. Captures lifecycle and reveal events (spec section 5
-    /// defaults rationale).
-    #[default]
-    Info,
-    Debug,
-    Trace,
-}
-
-impl LogLevel {
-    /// The stable config string for this level.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            LogLevel::Error => "error",
-            LogLevel::Warn => "warn",
-            LogLevel::Info => "info",
-            LogLevel::Debug => "debug",
-            LogLevel::Trace => "trace",
-        }
-    }
-
-    /// Parse one of the five accepted level names. Anything else is rejected so
-    /// a misspelled level does not silently fall back to a default.
-    fn parse(raw: &str) -> Result<Self, ConfigError> {
-        match raw {
-            "error" => Ok(LogLevel::Error),
-            "warn" => Ok(LogLevel::Warn),
-            "info" => Ok(LogLevel::Info),
-            "debug" => Ok(LogLevel::Debug),
-            "trace" => Ok(LogLevel::Trace),
-            other => Err(ConfigError::InvalidLogLevel {
-                value: other.to_string(),
-            }),
-        }
-    }
-}
 
 /// A fatal startup-configuration error.
 ///
@@ -129,10 +89,10 @@ pub enum ConfigError {
 /// startup. Every field corresponds to one row of the spec section 2
 /// configuration surface.
 ///
-/// `Debug` is implemented by hand (see below) so that the two secret fields,
-/// `password` and `unlock_cmd`, never render their values. Deriving `Debug`
-/// would let a stray `tracing::debug!(?config)` leak the master password.
-#[derive(Clone, PartialEq, Eq)]
+/// The two secret fields, `password` and `unlock_cmd`, are [`Secret`]s, so the
+/// derived `Debug` shows only whether each is set, never its value: a stray
+/// `tracing::debug!(?config)` cannot leak the master password.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Absolute path to the .kdbx vault. Required, and validated to exist and
     /// be a readable regular file.
@@ -144,11 +104,11 @@ pub struct Config {
 
     /// Master password from `KDBX_PASSWORD`, if injected directly. This is a
     /// secret: it is never logged and never echoed by `kdbx_status`.
-    pub password: Option<String>,
+    pub password: Option<Secret<String>>,
 
     /// Shell command whose stdout is the master password (`KDBX_UNLOCK_CMD`).
     /// Also a secret source: not logged, not echoed.
-    pub unlock_cmd: Option<String>,
+    pub unlock_cmd: Option<Secret<String>>,
 
     /// Timeout for the unlock command, in seconds
     /// (`KDBX_UNLOCK_CMD_TIMEOUT_SECONDS`). Default 30.
@@ -167,41 +127,11 @@ pub struct Config {
     pub auto_clean_orphans: bool,
 
     /// Log verbosity (`KDBX_LOG_LEVEL`). Default info.
-    pub log_level: LogLevel,
+    pub log_level: Level,
 
     /// Append-only audit log path (`KDBX_LOG_FILE`). When unset, logs go to
     /// stderr only.
     pub log_file: Option<PathBuf>,
-}
-
-/// Hand-written `Debug` that redacts the two secret fields. `password` and
-/// `unlock_cmd` render as `Some("<redacted>")` when set and `None` when unset,
-/// so debug output reveals whether a secret source is configured without ever
-/// printing the secret itself. Every other field, including the path fields
-/// `keyfile_path` and `log_file` (paths, not secrets), prints normally. This is
-/// defense in depth: it makes `tracing::debug!(?config)` safe by construction.
-impl std::fmt::Debug for Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Map each secret to a redaction marker that preserves only its
-        // set/unset shape, then format with the standard derived layout.
-        let password = self.password.as_ref().map(|_| "<redacted>");
-        let unlock_cmd = self.unlock_cmd.as_ref().map(|_| "<redacted>");
-        f.debug_struct("Config")
-            .field("vault_path", &self.vault_path)
-            .field("keyfile_path", &self.keyfile_path)
-            .field("password", &password)
-            .field("unlock_cmd", &unlock_cmd)
-            .field(
-                "unlock_cmd_timeout_seconds",
-                &self.unlock_cmd_timeout_seconds,
-            )
-            .field("allow_writes", &self.allow_writes)
-            .field("idle_timeout_seconds", &self.idle_timeout_seconds)
-            .field("auto_clean_orphans", &self.auto_clean_orphans)
-            .field("log_level", &self.log_level)
-            .field("log_file", &self.log_file)
-            .finish()
-    }
 }
 
 impl Config {
@@ -222,8 +152,8 @@ impl Config {
         let vault_path = resolve_vault_path(vault_path_raw)?;
 
         let keyfile_path = optional_path(vars, "KDBX_KEYFILE_PATH");
-        let password = optional_string(vars, "KDBX_PASSWORD");
-        let unlock_cmd = optional_string(vars, "KDBX_UNLOCK_CMD");
+        let password = optional_string(vars, "KDBX_PASSWORD").map(Secret::new);
+        let unlock_cmd = optional_string(vars, "KDBX_UNLOCK_CMD").map(Secret::new);
 
         let unlock_cmd_timeout_seconds =
             parse_seconds(vars, "KDBX_UNLOCK_CMD_TIMEOUT_SECONDS", 30, 1, MAX_SECONDS)?;
@@ -237,8 +167,10 @@ impl Config {
         let auto_clean_orphans = parse_strict_bool(vars, "KDBX_AUTO_CLEAN_ORPHANS")?;
 
         let log_level = match vars.get("KDBX_LOG_LEVEL").filter(|v| !v.is_empty()) {
-            Some(raw) => LogLevel::parse(raw)?,
-            None => LogLevel::default(),
+            Some(raw) => raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidLogLevel { value: raw.clone() })?,
+            None => Level::default(),
         };
 
         let log_file = optional_path(vars, "KDBX_LOG_FILE");
@@ -282,7 +214,7 @@ impl Default for Config {
             allow_writes: false,
             idle_timeout_seconds: 900,
             auto_clean_orphans: false,
-            log_level: LogLevel::Info,
+            log_level: Level::Info,
             log_file: None,
         }
     }
@@ -423,13 +355,19 @@ mod tests {
 
         assert_eq!(cfg.vault_path, file.path());
         assert_eq!(cfg.keyfile_path, Some(PathBuf::from("/keys/vault.key")));
-        assert_eq!(cfg.password.as_deref(), Some("hunter2"));
-        assert_eq!(cfg.unlock_cmd.as_deref(), Some("pass show vault"));
+        assert_eq!(
+            cfg.password.as_ref().map(|p| p.expose().as_str()),
+            Some("hunter2")
+        );
+        assert_eq!(
+            cfg.unlock_cmd.as_ref().map(|c| c.expose().as_str()),
+            Some("pass show vault")
+        );
         assert_eq!(cfg.unlock_cmd_timeout_seconds, 45);
         assert!(cfg.allow_writes);
         assert_eq!(cfg.idle_timeout_seconds, 300);
         assert!(cfg.auto_clean_orphans);
-        assert_eq!(cfg.log_level, LogLevel::Debug);
+        assert_eq!(cfg.log_level, Level::Debug);
         assert_eq!(cfg.log_file, Some(PathBuf::from("/var/log/mcp-kdbx.jsonl")));
     }
 
@@ -445,7 +383,7 @@ mod tests {
         assert!(!cfg.allow_writes);
         assert_eq!(cfg.idle_timeout_seconds, 900);
         assert!(!cfg.auto_clean_orphans);
-        assert_eq!(cfg.log_level, LogLevel::Info);
+        assert_eq!(cfg.log_level, Level::Info);
         assert_eq!(cfg.log_file, None);
     }
 
@@ -594,18 +532,18 @@ mod tests {
     #[test]
     fn every_log_level_name_parses() {
         let cases = [
-            ("error", LogLevel::Error),
-            ("warn", LogLevel::Warn),
-            ("info", LogLevel::Info),
-            ("debug", LogLevel::Debug),
-            ("trace", LogLevel::Trace),
+            ("error", Level::Error),
+            ("warn", Level::Warn),
+            ("info", Level::Info),
+            ("debug", Level::Debug),
+            ("trace", Level::Trace),
         ];
         for (name, expected) in cases {
             let (_file, mut vars) = vault_fixture();
             set(&mut vars, "KDBX_LOG_LEVEL", name);
             let cfg = Config::from_map(&vars).expect("valid config");
             assert_eq!(cfg.log_level, expected);
-            assert_eq!(cfg.log_level.as_str(), name);
+            assert_eq!(serde_json::to_value(cfg.log_level).unwrap(), name);
         }
     }
 
@@ -676,8 +614,8 @@ mod tests {
     #[test]
     fn debug_redacts_password_and_unlock_cmd_when_set() {
         let cfg = Config {
-            password: Some("hunter2".to_string()),
-            unlock_cmd: Some("pass show vault".to_string()),
+            password: Some("hunter2".to_string().into()),
+            unlock_cmd: Some("pass show vault".to_string().into()),
             ..Config::default()
         };
         let rendered = format!("{cfg:?}");
@@ -685,8 +623,8 @@ mod tests {
         assert!(!rendered.contains("hunter2"));
         assert!(!rendered.contains("pass show vault"));
         // Both secrets render as a set marker, showing presence without value.
-        assert!(rendered.contains("password: Some(\"<redacted>\")"));
-        assert!(rendered.contains("unlock_cmd: Some(\"<redacted>\")"));
+        assert!(rendered.contains("password: Some(<redacted>)"));
+        assert!(rendered.contains("unlock_cmd: Some(<redacted>)"));
     }
 
     #[test]
@@ -714,7 +652,7 @@ mod tests {
         assert_eq!(cfg.idle_timeout_seconds, 900);
         assert!(!cfg.allow_writes);
         assert!(!cfg.auto_clean_orphans);
-        assert_eq!(cfg.log_level, LogLevel::Info);
+        assert_eq!(cfg.log_level, Level::Info);
         assert_eq!(cfg.password, None);
         assert_eq!(cfg.log_file, None);
     }

@@ -1,8 +1,9 @@
 //! Startup cleanup of leftover `*.tmp.*` save files.
 //!
 //! The save flow (see `stage`) writes the new vault bytes to a temp file in the
-//! vault's own directory, named `<vault_file>.tmp.<pid>.<rand>`, then fsyncs and
-//! atomically renames it over the vault. If the process is killed between the
+//! vault's own directory, named `<vault_file>.tmp.<pid>.<nonce>` (decimal; see
+//! `vault_file::TempName`), then fsyncs and atomically renames it over the
+//! vault. If the process is killed between the
 //! temp write and the rename, that temp file is orphaned: it never became the
 //! vault and nothing will ever rename it away.
 //!
@@ -17,15 +18,13 @@
 //! scan when asked and returns a [`CleanReport`] for the caller to log. It does not
 //! touch the audit log itself.
 
+use crate::kdbx_core::vault_file::TempName;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// One hour, in seconds. A temp file must be older than this to be removed.
 const ORPHAN_MIN_AGE: Duration = Duration::from_secs(3600);
-
-/// The infix that marks a save temp file: `<vault_file>.tmp.<pid>.<rand>`.
-const TMP_INFIX: &str = ".tmp.";
 
 /// Summary of one cleanup pass.
 ///
@@ -44,9 +43,10 @@ pub struct CleanReport {
 /// hour. `now` is injected (rather than read from `SystemTime::now()` inside) so
 /// callers and tests control the clock and the result is deterministic.
 ///
-/// Conservative by design: it only considers files whose name structurally
-/// matches `<vault_file>.tmp.<pid>.<rand>` for this exact vault, so the vault
-/// file itself and unrelated files in the directory are never candidates. When a
+/// Conservative by design: it only considers files whose name parses as a
+/// `vault_file::TempName` for this exact vault (`<vault_file>.tmp.<pid>.<nonce>`,
+/// both decimal), so the vault file itself and unrelated files in the directory
+/// are never candidates. When a
 /// file cannot be stat'd or its age cannot be computed, it is skipped and the
 /// reason recorded, not removed.
 ///
@@ -54,6 +54,10 @@ pub struct CleanReport {
 /// responsibility (spec section 2, startup step 8).
 pub fn clean_orphans(vault_path: &Path, now: SystemTime) -> CleanReport {
     let mut report = CleanReport::default();
+    // Saves resolve symlinks and write their temp files next to the real vault
+    // file, so scan there. A path that cannot be resolved is scanned as given.
+    let resolved = std::fs::canonicalize(vault_path).ok();
+    let vault_path = resolved.as_deref().unwrap_or(vault_path);
 
     let parent = match vault_path.parent() {
         // An empty parent ("") means the current directory; normalize to ".".
@@ -152,39 +156,13 @@ pub fn clean_orphans(vault_path: &Path, now: SystemTime) -> CleanReport {
     report
 }
 
-/// True when `name` is a save temp file for the vault file `vault_file`.
-///
-/// The structural rule, matched with plain string operations (no regex):
-///
-/// 1. `name` starts with `<vault_file>.tmp.` (so the file belongs to this vault
-///    and is not the vault itself, which has no `.tmp.` suffix).
-/// 2. After that infix there is a trailing `<pid>.<rand>` portion: it contains at
-///    least one more `.` separating a non-empty pid-like component from a
-///    non-empty rand-like component. This rejects a bare `<vault_file>.tmp.` with
-///    nothing after, and `<vault_file>.tmp.12345` with no rand part.
-///
-/// When the structure is not exactly this shape, return false. Skipping a real
-/// orphan is cheap (it gets cleaned next time, or by hand); removing the wrong
-/// file is not, so the bias is toward leaving files alone.
+/// True when `name` is a save temp file for the vault file `vault_file`: it
+/// parses as a [`TempName`] for that vault, the same type the writer formats
+/// the name with. Anything the writer could not have produced is left alone.
+/// Skipping a real orphan is cheap (it gets cleaned next time, or by hand);
+/// removing the wrong file is not.
 fn is_orphan_temp_name(name: &str, vault_file: &str) -> bool {
-    // Build the required prefix: "<vault_file>.tmp.".
-    let mut prefix = String::with_capacity(vault_file.len() + TMP_INFIX.len());
-    prefix.push_str(vault_file);
-    prefix.push_str(TMP_INFIX);
-
-    let trailing = match name.strip_prefix(&prefix) {
-        Some(trailing) => trailing,
-        None => return false,
-    };
-
-    // `trailing` must be `<pid>.<rand>`: split on the first '.' and require both
-    // sides to be non-empty.
-    let (pid, rand) = match trailing.split_once('.') {
-        Some(parts) => parts,
-        None => return false,
-    };
-
-    !pid.is_empty() && !rand.is_empty()
+    TempName::parse(name, vault_file).is_some()
 }
 
 #[cfg(test)]
@@ -211,7 +189,7 @@ mod tests {
     fn removes_orphan_temp_older_than_one_hour() {
         let dir = tempdir().unwrap();
         let vault = touch(dir.path(), "vault.kdbx");
-        let orphan = touch(dir.path(), "vault.kdbx.tmp.12345.abcdef");
+        let orphan = touch(dir.path(), "vault.kdbx.tmp.12345.67890");
 
         let report = clean_orphans(&vault, two_hours_ahead());
 
@@ -241,7 +219,7 @@ mod tests {
         let other = touch(dir.path(), "other.txt");
         let backup = touch(dir.path(), "vault.kdbx.bak");
         // A temp file for a DIFFERENT vault must also be left alone.
-        let other_vault_tmp = touch(dir.path(), "elsewhere.kdbx.tmp.999.zzz");
+        let other_vault_tmp = touch(dir.path(), "elsewhere.kdbx.tmp.999.111");
 
         let report = clean_orphans(&vault, two_hours_ahead());
 
@@ -255,7 +233,7 @@ mod tests {
     fn skips_recent_temp() {
         let dir = tempdir().unwrap();
         let vault = touch(dir.path(), "vault.kdbx");
-        let recent = touch(dir.path(), "vault.kdbx.tmp.777.fresh");
+        let recent = touch(dir.path(), "vault.kdbx.tmp.777.888");
 
         // `now` is the real present, so a just-created file has age ~0.
         let report = clean_orphans(&vault, SystemTime::now());
@@ -283,6 +261,27 @@ mod tests {
     }
 
     #[test]
+    fn non_numeric_temp_lookalikes_are_left_alone() {
+        // The writer only ever produces "<vault>.tmp.<digits>.<digits>", so a
+        // user's backup that merely starts with ".tmp." is not ours to delete.
+        let dir = tempdir().unwrap();
+        let vault = touch(dir.path(), "vault.kdbx");
+        let keep = [
+            touch(dir.path(), "vault.kdbx.tmp.old.bak"),
+            touch(dir.path(), "vault.kdbx.tmp.123.abc"),
+            touch(dir.path(), "vault.kdbx.tmp.1.2.3"),
+            touch(dir.path(), "vault.kdbx.tmp.-1.2"),
+        ];
+
+        let report = clean_orphans(&vault, two_hours_ahead());
+
+        for f in &keep {
+            assert!(f.exists(), "{} must survive", f.display());
+        }
+        assert!(report.removed.is_empty(), "removed: {:?}", report.removed);
+    }
+
+    #[test]
     fn unreadable_directory_yields_empty_report_without_panic() {
         // Point at a vault inside a directory that does not exist.
         let missing = Path::new("/no/such/dir/vault.kdbx");
@@ -298,8 +297,8 @@ mod tests {
     fn multiple_orphans_all_removed() {
         let dir = tempdir().unwrap();
         let vault = touch(dir.path(), "vault.kdbx");
-        let a = touch(dir.path(), "vault.kdbx.tmp.1.aaa");
-        let b = touch(dir.path(), "vault.kdbx.tmp.2.bbb");
+        let a = touch(dir.path(), "vault.kdbx.tmp.1.111");
+        let b = touch(dir.path(), "vault.kdbx.tmp.2.222");
 
         let report = clean_orphans(&vault, two_hours_ahead());
 
@@ -317,7 +316,7 @@ mod tests {
         // the reason it survives; only the is_file check can be.
         let dir = tempdir().unwrap();
         let vault = touch(dir.path(), "vault.kdbx");
-        let dir_named_like_temp = dir.path().join("vault.kdbx.tmp.1.dir");
+        let dir_named_like_temp = dir.path().join("vault.kdbx.tmp.1.333");
         std::fs::create_dir(&dir_named_like_temp).expect("create dir named like a temp file");
 
         let report = clean_orphans(&vault, two_hours_ahead());
@@ -335,10 +334,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn cleans_next_to_the_symlink_target() {
+        // Saves write their temp files next to the resolved vault file, so the
+        // cleanup must look there too when the configured path is a link.
+        let real_dir = tempdir().unwrap();
+        let link_dir = tempdir().unwrap();
+        let vault = touch(real_dir.path(), "vault.kdbx");
+        let orphan = touch(real_dir.path(), "vault.kdbx.tmp.12345.67890");
+        let link = link_dir.path().join("link.kdbx");
+        std::os::unix::fs::symlink(&vault, &link).unwrap();
+
+        let report = clean_orphans(&link, two_hours_ahead());
+
+        assert!(!orphan.exists(), "orphan next to the target is removed");
+        assert!(vault.exists());
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    }
+
+    #[test]
     fn name_matcher_is_structural() {
-        assert!(is_orphan_temp_name("vault.kdbx.tmp.123.abc", "vault.kdbx"));
+        assert!(is_orphan_temp_name("vault.kdbx.tmp.123.456", "vault.kdbx"));
         // Wrong vault.
-        assert!(!is_orphan_temp_name("other.kdbx.tmp.123.abc", "vault.kdbx"));
+        assert!(!is_orphan_temp_name("other.kdbx.tmp.123.456", "vault.kdbx"));
         // The vault itself.
         assert!(!is_orphan_temp_name("vault.kdbx", "vault.kdbx"));
         // Missing rand component.
@@ -346,6 +364,6 @@ mod tests {
         // Nothing after the infix.
         assert!(!is_orphan_temp_name("vault.kdbx.tmp.", "vault.kdbx"));
         // Empty pid component.
-        assert!(!is_orphan_temp_name("vault.kdbx.tmp..abc", "vault.kdbx"));
+        assert!(!is_orphan_temp_name("vault.kdbx.tmp..456", "vault.kdbx"));
     }
 }

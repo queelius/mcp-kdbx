@@ -199,6 +199,12 @@ impl McpServer {
         self.request("tools/list", json!({}))["result"].clone()
     }
 
+    /// Call a tool and return the raw JSON-RPC response (`result` or `error`),
+    /// for asserting protocol-level rejections such as invalid params.
+    pub fn call_raw(&mut self, tool: &str, args: Value) -> Value {
+        self.request("tools/call", json!({ "name": tool, "arguments": args }))
+    }
+
     /// Call a tool and return the parsed envelope (`{ ok, data } | { ok, error
     /// }`). The tool's `String` return is carried as the first text content
     /// block; this extracts and parses it.

@@ -10,38 +10,28 @@ use crate::adapter::views::format_system_time;
 use crate::adapter::{KEEPASS_RS_VERSION, KdbxServer, responses};
 use crate::kdbx_core::audit::AuditEvent;
 use crate::kdbx_core::error::{CoreError, ErrorCode};
+use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::unlock::resolve_unlock_source;
-use crate::kdbx_core::vault::LockReason;
+use crate::kdbx_core::vault::{LockReason, UnreadableReason};
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
+use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 /// Input for `kdbx_unlock`: an optional password and an optional base64 keyfile.
-#[derive(serde::Deserialize, schemars::JsonSchema)]
+/// Both are [`Secret`]s, so the derived `Debug` shows only whether each was
+/// supplied, never the value.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UnlockParams {
-    /// The master password. When omitted, the server resolves it from
-    /// `KDBX_PASSWORD` or `KDBX_UNLOCK_CMD`.
+    /// The master password, for scripted use only. Omit it: the server
+    /// resolves the password from `KDBX_PASSWORD` or `KDBX_UNLOCK_CMD`. Never
+    /// ask a user to paste the master password into a conversation.
     #[serde(default)]
-    pub password: Option<String>,
+    pub password: Option<Secret<String>>,
     /// An optional keyfile for two-factor unlock, base64-encoded.
     #[serde(default)]
-    pub keyfile_bytes: Option<String>,
-}
-
-/// Hand-written `Debug` that never prints the secrets. Both fields render as
-/// `Some("<redacted>")`/`None`, so a stray `tracing::debug!(?params)` reveals
-/// only whether a password or keyfile was supplied, never the value.
-impl std::fmt::Debug for UnlockParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnlockParams")
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
-            .field(
-                "keyfile_bytes",
-                &self.keyfile_bytes.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
+    pub keyfile_bytes: Option<Secret<String>>,
 }
 
 #[tool_router(router = lifecycle_router, vis = "pub(crate)")]
@@ -49,7 +39,7 @@ impl KdbxServer {
     /// Lifecycle: report vault and server status. Available locked or not, and
     /// it counts as activity, so it doubles as an idle-timer keep-alive.
     #[tool(
-        description = "Report vault and server status: locked state, vault name and path, idle-timeout remaining, pending changes, whether writes are allowed, and version info."
+        description = "Report vault and server status: locked state, vault name and path, idle-timeout remaining, pending changes, whether writes are allowed, last_lock (what the most recent lock discarded, until reported), and version info."
     )]
     async fn kdbx_status(&self) -> String {
         let vault = self.vault().await;
@@ -84,6 +74,9 @@ impl KdbxServer {
             "idle_timeout_remaining_seconds": idle_remaining,
             "has_pending_changes": has_pending,
             "writes_allowed": self.config.allow_writes,
+            // What the most recent lock discarded, until an unlock or a
+            // VAULT_LOCKED error reports it. Peeked, not consumed.
+            "last_lock": vault.last_lock(),
             "server_version": env!("CARGO_PKG_VERSION"),
             "keepass_rs_version": KEEPASS_RS_VERSION,
         }))
@@ -92,7 +85,7 @@ impl KdbxServer {
     /// Lifecycle: unlock the vault. Resolves the password from the tool input,
     /// `KDBX_PASSWORD`, or `KDBX_UNLOCK_CMD`, in that order.
     #[tool(
-        description = "Unlock the vault so its contents can be read. Provide the master password, or rely on the server's configured password source. An optional base64 keyfile is accepted for two-factor unlock."
+        description = "Unlock the vault so its contents can be read. Call it with no arguments: the server reads the master password from its configured source (KDBX_PASSWORD or KDBX_UNLOCK_CMD, for example a password manager command). Do not ask the user to type the master password into the chat; if no source is configured the call returns UNLOCK_SOURCE_MISSING, and the user should configure one. The password and keyfile_bytes arguments exist for scripted use. If a previous lock discarded staged changes, previous_lock reports them."
     )]
     async fn kdbx_unlock(&self, Parameters(params): Parameters<UnlockParams>) -> String {
         let mut vault = self.vault().await;
@@ -104,23 +97,26 @@ impl KdbxServer {
         // result is zeroized on drop and never logged. resolve_unlock_source
         // returns the source it actually used, so the audit label cannot drift
         // from the resolution order.
-        let (password, source) =
-            match resolve_unlock_source(params.password.as_deref(), &self.config).await {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    if e.code_enum() == ErrorCode::AuthFailed {
-                        // The source the command path tried; resolution failed
-                        // before returning one, so label it "cmd" (the only
-                        // source that can fail with AUTH_FAILED here).
-                        self.emit(AuditEvent::AuthFailed {
-                            source: "cmd".to_string(),
-                            error_code: e.code().to_string(),
-                        });
-                    }
-                    return responses::err(&e);
+        let (password, source) = match resolve_unlock_source(
+            params.password.as_ref().map(|p| p.expose().as_str()),
+            &self.config,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                if e.code_enum() == ErrorCode::AuthFailed {
+                    // The source the command path tried; resolution failed
+                    // before returning one, so label it "cmd" (the only
+                    // source that can fail with AUTH_FAILED here).
+                    self.emit(AuditEvent::AuthFailed {
+                        source: crate::kdbx_core::unlock::UnlockSource::Cmd,
+                        error_code: e.code_enum(),
+                    });
                 }
-            };
-        let source_label = source.as_str().to_string();
+                return responses::err(&e);
+            }
+        };
 
         // Resolve the keyfile: the per-call keyfile_bytes wins; otherwise fall
         // back to the configured KDBX_KEYFILE_PATH (mirrors the password source
@@ -131,41 +127,61 @@ impl KdbxServer {
             Err(e) => {
                 if e.code_enum() == ErrorCode::AuthFailed {
                     self.emit(AuditEvent::AuthFailed {
-                        source: source_label.clone(),
-                        error_code: e.code().to_string(),
+                        source,
+                        error_code: e.code_enum(),
                     });
                 }
                 return responses::err(&e);
             }
         };
 
-        match vault.unlock(&password, keyfile.as_deref()) {
-            Ok(()) => {
+        // The KDF in Database::open is deliberately slow; run it off the async
+        // worker (see kdbx_save_pending for the same pattern).
+        let unlocked = tokio::task::block_in_place(|| vault.unlock(&password, keyfile.as_deref()));
+        match unlocked {
+            Ok(previous_lock) => {
                 let file_mtime = vault
                     .mtime_at_unlock()
                     .ok()
                     .map(format_system_time)
                     .unwrap_or_default();
                 self.emit(AuditEvent::VaultUnlocked {
-                    unlock_source: source_label.clone(),
+                    unlock_source: source,
                     file_mtime,
                 });
                 let vault_name = vault
                     .working_db()
                     .ok()
                     .and_then(|db| db.meta.database_name.clone());
+                // previous_lock: what the lock before this unlock discarded,
+                // when no earlier call reported it (null otherwise).
                 responses::ok(serde_json::json!({
                     "vault_name": vault_name,
                     "locked": false,
                     "has_pending_changes": false,
+                    "previous_lock": previous_lock,
                 }))
             }
             Err(e) => {
-                if e.code_enum() == ErrorCode::AuthFailed {
-                    self.emit(AuditEvent::AuthFailed {
-                        source: source_label.clone(),
-                        error_code: e.code().to_string(),
-                    });
+                match e.code_enum() {
+                    ErrorCode::AuthFailed => self.emit(AuditEvent::AuthFailed {
+                        source,
+                        error_code: e.code_enum(),
+                    }),
+                    // Not an authentication failure (no key was checked), but
+                    // still a failed unlock worth a record. The reason is the
+                    // typed UnreadableReason the vault put in the details.
+                    ErrorCode::VaultUnreadable => {
+                        let reason = e
+                            .details()
+                            .and_then(|d| d.get("reason"))
+                            .and_then(|r| UnreadableReason::deserialize(r).ok());
+                        self.emit(AuditEvent::UnlockFailed {
+                            unlock_source: source,
+                            reason,
+                        });
+                    }
+                    _ => {}
                 }
                 responses::err(&e)
             }
@@ -181,7 +197,7 @@ impl KdbxServer {
         let mut vault = self.vault().await;
         let pending_discarded = vault.lock(LockReason::Manual);
         self.emit(AuditEvent::VaultLocked {
-            reason: "manual".to_string(),
+            reason: LockReason::Manual,
             pending_discarded_count: pending_discarded as u64,
         });
         responses::ok(serde_json::json!({
@@ -203,7 +219,7 @@ fn resolve_keyfile_bytes(
     params: &UnlockParams,
     config: &crate::kdbx_core::config::Config,
 ) -> Result<Option<Vec<u8>>, CoreError> {
-    if let Some(encoded) = params.keyfile_bytes.as_deref() {
+    if let Some(encoded) = params.keyfile_bytes.as_ref().map(|k| k.expose()) {
         return base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map(Some)

@@ -31,36 +31,36 @@ use serde_json::{Value, json};
 const EXPECTED_TOOLS: &[(&str, &[&str], &[&str])] = &[
     (
         "kdbx_add_entry",
-        &["attachments", "fields", "group_path", "title"],
-        &["group_path", "title"],
+        &["attachments", "fields", "group_path", "group_uuid", "title"],
+        &["title"],
     ),
     ("kdbx_diff_pending", &[], &[]),
     ("kdbx_discard_pending", &[], &[]),
     (
         "kdbx_download_attachment",
-        &["entry_path", "name"],
-        &["entry_path", "name"],
+        &["entry_path", "name", "uuid"],
+        &["name"],
     ),
     ("kdbx_find_entry", &["fields", "query"], &["query"]),
-    ("kdbx_get_entry", &["path"], &["path"]),
-    ("kdbx_get_otp", &["path", "time_unix"], &["path"]),
-    ("kdbx_list_attachments", &["entry_path"], &["entry_path"]),
-    ("kdbx_list_entries", &["group_path"], &["group_path"]),
-    ("kdbx_list_groups", &["parent_path"], &[]),
+    ("kdbx_get_entry", &["path", "uuid"], &[]),
+    ("kdbx_get_otp", &["path", "time_unix", "uuid"], &[]),
+    ("kdbx_list_attachments", &["entry_path", "uuid"], &[]),
+    ("kdbx_list_entries", &["group_path", "uuid"], &[]),
+    ("kdbx_list_groups", &["parent_path", "uuid"], &[]),
     ("kdbx_lock", &[], &[]),
-    ("kdbx_reveal_password", &["path"], &["path"]),
+    ("kdbx_reveal_password", &["path", "uuid"], &[]),
     (
         "kdbx_reveal_protected",
-        &["field_name", "path"],
-        &["field_name", "path"],
+        &["field_name", "path", "uuid"],
+        &["field_name"],
     ),
     ("kdbx_save_pending", &[], &[]),
     ("kdbx_status", &[], &[]),
     ("kdbx_unlock", &["keyfile_bytes", "password"], &[]),
     (
         "kdbx_update_field",
-        &["field_name", "path", "protected", "value"],
-        &["field_name", "path", "value"],
+        &["field_name", "path", "protected", "uuid", "value"],
+        &["field_name", "value"],
     ),
 ];
 
@@ -162,6 +162,15 @@ fn tools_list_matches_the_spec_surface() {
             *required,
             "required fields for {name} drifted from the spec"
         );
+        // Secret-wrapped inputs keep a plain string schema on the wire.
+        for secret_prop in ["value", "password", "keyfile_bytes"] {
+            if let Some(prop) = schema["properties"].get(secret_prop) {
+                assert!(
+                    prop.to_string().contains("\"string\""),
+                    "{name}.{secret_prop} schema is not a string: {prop}"
+                );
+            }
+        }
         // Every tool must carry a non-empty description (agents rely on it).
         assert!(
             tool["description"]
@@ -198,6 +207,35 @@ fn server_identifies_as_mcp_kdbx() {
             .map(|s| s.contains("kdbx"))
             .unwrap_or(false),
         "instructions should mention the kdbx tools"
+    );
+}
+
+#[test]
+fn instructions_teach_the_path_grammar_and_unlock_avoids_chat_passwords() {
+    let path = fixture_path("empty.kdbx");
+    let result = McpServer::initialize_result(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    let instructions = result["instructions"].as_str().unwrap();
+    for needle in ["leading '/'", "\\/", ":N", "uuid"] {
+        assert!(
+            instructions.contains(needle),
+            "instructions should explain {needle}: {instructions}"
+        );
+    }
+
+    let mut server = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    let tools = server.list_tools();
+    let unlock = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == json!("kdbx_unlock"))
+        .unwrap()
+        .clone();
+    let description = unlock["description"].as_str().unwrap();
+    assert!(description.contains("KDBX_PASSWORD") && description.contains("KDBX_UNLOCK_CMD"));
+    assert!(
+        description.contains("Do not ask the user"),
+        "kdbx_unlock must steer agents away from asking for the password in chat: {description}"
     );
 }
 
@@ -440,6 +478,64 @@ fn error_auth_failed() {
 }
 
 #[test]
+fn find_entry_rejects_unknown_field_names_and_lists_the_allowed_ones() {
+    let mut server = unlocked("flat.kdbx");
+    // An unknown field name is rejected as invalid params instead of being
+    // silently dropped.
+    let resp = server.call_raw(
+        "kdbx_find_entry",
+        json!({ "query": "x", "fields": ["password"] }),
+    );
+    let rejected = resp.get("error").is_some() || resp["result"]["isError"] == json!(true);
+    assert!(rejected, "unknown field name must be rejected: {resp}");
+
+    // The schema enumerates the allowed values.
+    let tools = server.list_tools();
+    let find = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == json!("kdbx_find_entry"))
+        .unwrap()
+        .clone();
+    let schema = find["inputSchema"].to_string();
+    for name in ["title", "username", "url", "notes"] {
+        assert!(
+            schema.contains(&format!("\"{name}\"")),
+            "{name} missing: {schema}"
+        );
+    }
+}
+
+#[test]
+fn error_vault_unreadable() {
+    // A file that is not a KDBX database fails before any key is checked:
+    // VAULT_UNREADABLE with a reason, not AUTH_FAILED.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("not-a-vault.kdbx");
+    std::fs::write(&path, b"plain text, not a keepass database").unwrap();
+    let mut server = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    let err = server.call_error("kdbx_unlock", json!({ "password": FIXTURE_PASSWORD }));
+    assert_eq!(err["code"], json!("VAULT_UNREADABLE"));
+    assert_eq!(err["details"]["reason"], json!("not_kdbx"));
+}
+
+#[test]
+fn error_path_invalid() {
+    let mut server = unlocked("flat.kdbx");
+    // A missing leading slash is a malformed path, from entry and group tools
+    // alike, not a not-found.
+    assert_eq!(
+        server.call_error_code("kdbx_get_entry", json!({ "path": "Bank" })),
+        "PATH_INVALID"
+    );
+    assert_eq!(
+        server.call_error_code("kdbx_list_entries", json!({ "group_path": "Web//x" })),
+        "PATH_INVALID"
+    );
+}
+
+#[test]
 fn error_unlock_source_missing() {
     let path = fixture_path("flat.kdbx");
     // No password argument and no KDBX_PASSWORD configured.
@@ -545,6 +641,39 @@ fn error_entry_title_invalid() {
 }
 
 #[test]
+fn error_entry_title_invalid_on_every_title_write() {
+    let (_dir, mut server) = unlocked_writable("flat.kdbx");
+    // A right-to-left override in a title, via add_entry.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_add_entry",
+            json!({ "group_path": "/", "title": "\u{202e}buHtiG" })
+        ),
+        "ENTRY_TITLE_INVALID"
+    );
+    // update_field on Title is validated as a title, not just as a field name.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_update_field",
+            json!({ "path": "/GitHub", "field_name": "Title", "value": "" })
+        ),
+        "ENTRY_TITLE_INVALID"
+    );
+    // The fields map cannot carry a second, unvalidated Title.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_add_entry",
+            json!({
+                "group_path": "/",
+                "title": "Valid",
+                "fields": { "Title": { "value": "", "protected": false } },
+            })
+        ),
+        "FIELD_NAME_INVALID"
+    );
+}
+
+#[test]
 fn error_field_name_invalid() {
     let (_dir, mut server) = unlocked_writable("flat.kdbx");
     // A field name with leading whitespace fails validation.
@@ -575,6 +704,128 @@ fn error_invalid_input_bad_attachment_base64() {
             })
         ),
         "INVALID_INPUT"
+    );
+}
+
+#[test]
+fn error_invalid_input_entry_address_needs_exactly_one_of_path_or_uuid() {
+    let mut server = unlocked("flat.kdbx");
+    let uuid = server.call_ok("kdbx_get_entry", json!({ "path": "/Bank" }))["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Both: refused rather than silently preferring one.
+    let both = server.call_error(
+        "kdbx_reveal_password",
+        json!({ "path": "/Bank", "uuid": uuid }),
+    );
+    assert_eq!(both["code"], json!("INVALID_INPUT"));
+    // Neither.
+    assert_eq!(
+        server.call_error_code("kdbx_get_entry", json!({})),
+        "INVALID_INPUT"
+    );
+    // A malformed uuid.
+    assert_eq!(
+        server.call_error_code("kdbx_get_entry", json!({ "uuid": "not-a-uuid" })),
+        "INVALID_INPUT"
+    );
+    // A well-formed uuid that names no entry.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_get_entry",
+            json!({ "uuid": "6f9619ff-8b86-d011-b42d-00c04fc964ff" })
+        ),
+        "ENTRY_NOT_FOUND"
+    );
+}
+
+#[test]
+fn entry_tools_accept_uuid_addressing() {
+    let (_dir, mut server) = unlocked_writable("with_attachments.kdbx");
+    let uuid = server.call_ok("kdbx_get_entry", json!({ "path": "/Document A" }))["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let detail = server.call_ok("kdbx_get_entry", json!({ "uuid": uuid }));
+    assert_eq!(detail["path"], json!("/Document A"));
+    let listed = server.call_ok("kdbx_list_attachments", json!({ "uuid": uuid }));
+    assert_eq!(listed["attachments"][0]["name"], json!("notes.txt"));
+    let downloaded = server.call_ok(
+        "kdbx_download_attachment",
+        json!({ "uuid": uuid, "name": "notes.txt" }),
+    );
+    assert_eq!(downloaded["size_bytes"], json!("meeting notes\n".len()));
+    let updated = server.call_ok(
+        "kdbx_update_field",
+        json!({ "uuid": uuid, "field_name": "Secret", "value": "s", "protected": true }),
+    );
+    assert_eq!(updated["path"], json!("/Document A"));
+    assert_eq!(updated["uuid"], json!(uuid));
+    let revealed = server.call_ok(
+        "kdbx_reveal_protected",
+        json!({ "uuid": uuid, "field_name": "Secret" }),
+    );
+    assert_eq!(revealed["value"], json!("s"));
+}
+
+#[test]
+fn group_tools_accept_uuid_addressing() {
+    let (_dir, mut server) = unlocked_writable("nested.kdbx");
+    let personal = server.call_ok("kdbx_list_groups", json!({}))["groups"][0].clone();
+    assert_eq!(personal["name"], json!("Personal"));
+    let finance = server.call_ok("kdbx_list_groups", json!({ "uuid": personal["uuid"] }))["groups"]
+        [0]
+    .clone();
+    assert_eq!(finance["path"], json!("/Personal/Finance"));
+    let banking = server.call_ok(
+        "kdbx_list_groups",
+        json!({ "parent_path": "/Personal/Finance" }),
+    )["groups"][0]
+        .clone();
+
+    let entries = server.call_ok("kdbx_list_entries", json!({ "uuid": banking["uuid"] }));
+    assert_eq!(entries["entries"][0]["title"], json!("Checking Account"));
+
+    let added = server.call_ok(
+        "kdbx_add_entry",
+        json!({ "group_uuid": banking["uuid"], "title": "Savings" }),
+    );
+    assert_eq!(added["path"], json!("/Personal/Finance/Banking/Savings"));
+
+    // Exactly one of path or uuid, as for entry tools.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_list_entries",
+            json!({ "group_path": "/Personal", "uuid": personal["uuid"] })
+        ),
+        "INVALID_INPUT"
+    );
+    assert_eq!(
+        server.call_error_code("kdbx_list_entries", json!({})),
+        "INVALID_INPUT"
+    );
+    assert_eq!(
+        server.call_error_code("kdbx_add_entry", json!({ "title": "Nowhere" })),
+        "INVALID_INPUT"
+    );
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_list_groups",
+            json!({ "uuid": "6f9619ff-8b86-d011-b42d-00c04fc964ff" })
+        ),
+        "GROUP_NOT_FOUND"
+    );
+}
+
+#[test]
+fn entry_tools_refuse_a_group_shaped_path() {
+    let mut server = unlocked("flat.kdbx");
+    // "/Bank/" addresses a group (trailing slash); it never names the entry.
+    assert_eq!(
+        server.call_error_code("kdbx_reveal_password", json!({ "path": "/Bank/" })),
+        "ENTRY_NOT_FOUND"
     );
 }
 
@@ -617,10 +868,16 @@ fn roundtrip_binary_attachment_base64() {
 }
 
 #[test]
-fn roundtrip_integer_range_edges_for_otp_time() {
+fn roundtrip_integer_range_edges_for_otp_time_are_clamped() {
     let mut server = unlocked("with_otp.kdbx");
-    // time_unix at the low edge (0) and a far-future value both compute a code.
-    for t in [0u64, 2_000_000_000, 4_000_000_000] {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // time_unix at the low edge (0) and far-future values are accepted but
+    // clamped to now plus or minus one 30-second period: no far-past or
+    // far-future code can be harvested.
+    for t in [0u64, 2_000_000_000, 4_000_000_000, u64::MAX] {
         let otp = server.call_ok(
             "kdbx_get_otp",
             json!({ "path": "/TOTP Account", "time_unix": t }),
@@ -628,5 +885,10 @@ fn roundtrip_integer_range_edges_for_otp_time() {
         let code = otp["code"].as_str().unwrap();
         assert_eq!(code.len(), 6, "code at time {t}");
         assert!(code.chars().all(|c| c.is_ascii_digit()));
+        let used = otp["time_unix"].as_u64().unwrap();
+        assert!(
+            used + 31 >= now && used <= now + 31,
+            "time {t} was evaluated at {used}, outside now +/- one period"
+        );
     }
 }

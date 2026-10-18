@@ -10,11 +10,12 @@
 //! - a manual lock discards the stage and the first locked call reports what was
 //!   dropped,
 //! - the idle timer locks an untouched vault (short TTL),
-//! - an external write to the vault file refuses the save with VAULT_FILE_MODIFIED.
+//! - an external write to the vault file refuses the save with VAULT_FILE_MODIFIED,
+//! - an untitled entry never aliases another entry through its path.
 
 mod common;
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use common::*;
 use mcp_kdbx::kdbx_core::audit::hash_revealed;
@@ -209,6 +210,8 @@ fn protected_standard_fields_are_hidden_from_reads_and_search_but_revealable() {
 #[test]
 fn stage_save_reopen_persists_changes() {
     let (_dir, path, mut server) = writable("flat.kdbx", &[]);
+    let modified_before =
+        server.call_ok("kdbx_get_entry", json!({ "path": "/GitHub" }))["modified_at"].clone();
 
     // Stage a field change and a brand-new entry, then commit.
     server.call_ok(
@@ -230,6 +233,8 @@ fn stage_save_reopen_persists_changes() {
 
     let github = reopened.call_ok("kdbx_get_entry", json!({ "path": "/GitHub" }));
     assert_eq!(github["url"], json!("https://changed.example"));
+    // The edit bumped the entry's modification time (tracked edit).
+    assert_ne!(github["modified_at"], modified_before);
 
     let persisted = reopened.call_ok("kdbx_get_entry", json!({ "path": "/Persisted" }));
     assert_eq!(persisted["title"], json!("Persisted"));
@@ -270,6 +275,38 @@ fn manual_lock_discards_stage_and_first_locked_call_reports_it() {
 }
 
 #[test]
+fn unlock_and_status_report_what_the_last_lock_discarded() {
+    let (_dir, _path, mut server) = writable("flat.kdbx", &[]);
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/GitHub", "field_name": "URL", "value": "https://dropped.example" }),
+    );
+    server.call_ok("kdbx_lock", json!({}));
+
+    // Status reports the discard and does not consume it.
+    for _ in 0..2 {
+        let status = server.call_ok("kdbx_status", json!({}));
+        assert_eq!(status["last_lock"]["lock_reason"], json!("manual"));
+        assert_eq!(status["last_lock"]["pending_discarded_count"], json!(1));
+        assert_eq!(
+            status["last_lock"]["pending_discarded_summary"],
+            json!(["/GitHub"])
+        );
+    }
+
+    // An agent whose first real call is the unlock still learns of it.
+    let unlocked = server.call_ok("kdbx_unlock", json!({ "password": FIXTURE_PASSWORD }));
+    assert_eq!(
+        unlocked["previous_lock"]["pending_discarded_count"],
+        json!(1)
+    );
+
+    // Reported once: afterwards it is gone.
+    let status = server.call_ok("kdbx_status", json!({}));
+    assert_eq!(status["last_lock"], Value::Null);
+}
+
+#[test]
 fn external_modification_refuses_save_with_conflict() {
     let (_dir, path, mut server) = writable("flat.kdbx", &[]);
 
@@ -278,26 +315,95 @@ fn external_modification_refuses_save_with_conflict() {
         json!({ "path": "/GitHub", "field_name": "URL", "value": "https://mine.example" }),
     );
 
-    // Simulate another writer (KeePassXC, a second mcp-kdbx) touching the file:
-    // push its mtime well past the mtime captured at unlock. The save must refuse
-    // rather than clobber the external change.
+    // Simulate another writer replacing the file, the way a restore or sync
+    // tool does: new content, but an mtime older than the one seen at unlock.
+    // The old mtime heuristic let this through; the content check must not.
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::copy(fixture_path("nested.kdbx"), &path).expect("external write");
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
-        .expect("open vault file to bump mtime");
-    file.set_modified(SystemTime::now() + Duration::from_secs(30))
-        .expect("set a future mtime on the vault file");
+        .expect("open vault file to backdate mtime");
+    file.set_modified(before - Duration::from_secs(60))
+        .expect("backdate the vault file mtime");
     drop(file);
 
     let err = server.call_error("kdbx_save_pending", json!({}));
     assert_eq!(err["code"], json!("VAULT_FILE_MODIFIED"));
     assert!(err["details"]["file_mtime_now"].is_string());
     assert!(err["details"]["file_mtime_at_unlock"].is_string());
+    assert_eq!(err["details"]["pending_changes"], json!(1));
 
     // The stage is preserved (the save was refused, not discarded): a diff still
     // shows the pending change.
     let diff = server.call_ok("kdbx_diff_pending", json!({}));
     assert_eq!(diff["summary"]["num_modified"], json!(1));
+}
+
+#[test]
+fn concurrent_instances_first_save_wins_second_is_refused() {
+    // Two mcp-kdbx processes on one vault, both staging a change. The first
+    // save wins; the second is refused even though it lands within the same
+    // second (the old one-second mtime slack let it clobber the first).
+    let (_dir, path) = temp_copy_of("flat.kdbx");
+    let envs = [
+        ("KDBX_VAULT_PATH", path.to_str().unwrap()),
+        ("KDBX_ALLOW_WRITES", "true"),
+    ];
+    let mut a = McpServer::spawn(&envs);
+    let mut b = McpServer::spawn(&envs);
+    a.unlock_with_fixture_password();
+    b.unlock_with_fixture_password();
+
+    a.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/GitHub", "field_name": "URL", "value": "https://from-a.example" }),
+    );
+    b.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/Bank", "field_name": "URL", "value": "https://from-b.example" }),
+    );
+
+    a.call_ok("kdbx_save_pending", json!({}));
+    let err = b.call_error("kdbx_save_pending", json!({}));
+    assert_eq!(err["code"], json!("VAULT_FILE_MODIFIED"));
+
+    // A's change is on disk; B did not clobber it.
+    drop(a);
+    drop(b);
+    let mut reader = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    reader.unlock_with_fixture_password();
+    let github = reader.call_ok("kdbx_get_entry", json!({ "path": "/GitHub" }));
+    assert_eq!(github["url"], json!("https://from-a.example"));
+}
+
+#[test]
+fn save_committed_audit_records_the_new_file_mtime() {
+    let (dir, path) = temp_copy_of("flat.kdbx");
+    let log = dir.path().join("audit.jsonl");
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", path.to_str().unwrap()),
+        ("KDBX_ALLOW_WRITES", "true"),
+        ("KDBX_LOG_FILE", log.to_str().unwrap()),
+    ]);
+    server.unlock_with_fixture_password();
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/GitHub", "field_name": "URL", "value": "https://x.example" }),
+    );
+    server.call_ok("kdbx_save_pending", json!({}));
+
+    let mtime: chrono::DateTime<chrono::Utc> =
+        std::fs::metadata(&path).unwrap().modified().unwrap().into();
+    let lines = read_audit_lines(&log);
+    let committed = lines
+        .iter()
+        .find(|l| l["event"] == json!("save_committed"))
+        .expect("save_committed event");
+    assert_eq!(
+        committed["details"]["after_mtime"],
+        json!(mtime.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    );
 }
 
 /// Idle-timeout test. The idle timer ticks on an interval clamped to a 5-second
@@ -323,4 +429,134 @@ fn idle_timeout_locks_untouched_vault_and_discards_stage() {
     assert_eq!(err["code"], json!("VAULT_LOCKED"));
     assert_eq!(err["details"]["lock_reason"], json!("idle_timeout"));
     assert_eq!(err["details"]["pending_discarded_count"], json!(1));
+}
+
+/// Build a vault on disk holding a root entry titled "Email" and a group
+/// "Email" that holds an entry with no Title. Returns the tempdir guard, the
+/// vault path, and the untitled entry's uuid.
+fn vault_with_untitled_entry_in_same_named_group() -> (tempfile::TempDir, std::path::PathBuf, String)
+{
+    use keepass::db::fields;
+    let mut db = keepass::Database::new();
+    db.root_mut().add_entry().edit(|e| {
+        e.set_unprotected(fields::TITLE, "Email");
+        e.set_protected(fields::PASSWORD, "root-email-secret");
+    });
+    let gid = db
+        .root_mut()
+        .add_group()
+        .edit(|g| g.name = "Email".to_string())
+        .id();
+    let untitled = db
+        .group_mut(gid)
+        .unwrap()
+        .add_entry()
+        .edit(|e| e.set_protected(fields::PASSWORD, "untitled-secret"))
+        .id();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("aliasing.kdbx");
+    let mut file = std::fs::File::create(&path).expect("create vault");
+    db.save(
+        &mut file,
+        keepass::DatabaseKey::new().with_password(FIXTURE_PASSWORD),
+    )
+    .expect("save vault");
+    (dir, path, untitled.uuid().to_string())
+}
+
+#[test]
+fn untitled_entry_never_aliases_a_same_named_entry() {
+    let (_dir, path, untitled_uuid) = vault_with_untitled_entry_in_same_named_group();
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", path.to_str().unwrap()),
+        ("KDBX_ALLOW_WRITES", "true"),
+    ]);
+    server.unlock_with_fixture_password();
+
+    // The untitled entry is listed with a null path (it has no addressable
+    // path), never with "/Email/", which names the group.
+    let entries = server.call_ok("kdbx_list_entries", json!({ "group_path": "/Email" }))["entries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], Value::Null);
+    assert_eq!(entries[0]["uuid"], json!(untitled_uuid));
+
+    // The path the old formatter produced must not reach the root entry.
+    assert_eq!(
+        server.call_error_code("kdbx_reveal_password", json!({ "path": "/Email/" })),
+        "ENTRY_NOT_FOUND"
+    );
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_update_field",
+            json!({ "path": "/Email/", "field_name": "URL", "value": "x" })
+        ),
+        "ENTRY_NOT_FOUND"
+    );
+
+    // The uuid reaches the right entry.
+    let pw = server.call_ok("kdbx_reveal_password", json!({ "uuid": untitled_uuid }));
+    assert_eq!(pw["password"], json!("untitled-secret"));
+    let root_pw = server.call_ok("kdbx_reveal_password", json!({ "path": "/Email" }));
+    assert_eq!(root_pw["password"], json!("root-email-secret"));
+}
+
+/// Every reveal-class audit event identifies its entry by UUID, because the
+/// path can be null (an untitled entry has no non-aliasing path). An
+/// attachment download that recorded only the path would be unattributable.
+#[test]
+fn download_attachment_audit_records_the_entry_uuid() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let vault = fixture_path("with_attachments.kdbx");
+
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", vault.to_str().unwrap()),
+        ("KDBX_LOG_FILE", log_path.to_str().unwrap()),
+    ]);
+    server.unlock_with_fixture_password();
+    let entry = server.call_ok("kdbx_get_entry", json!({ "path": "/Document A" }));
+    let uuid = entry["uuid"]
+        .as_str()
+        .expect("entry view has a uuid")
+        .to_owned();
+    server.call_ok(
+        "kdbx_download_attachment",
+        json!({ "entry_path": "/Document A", "name": "notes.txt" }),
+    );
+
+    let events = read_audit_lines(&log_path);
+    let download = events
+        .iter()
+        .find(|e| e["event"] == json!("download_attachment"))
+        .expect("download_attachment event present");
+    assert_eq!(download["details"]["target_uuid"], json!(uuid));
+    assert_eq!(download["details"]["target_path"], json!("/Document A"));
+}
+
+#[test]
+fn unreadable_vault_unlock_is_audited_with_its_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("not-a-vault.kdbx");
+    std::fs::write(&vault, b"plain text, not a keepass database").unwrap();
+    let log = dir.path().join("audit.jsonl");
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", vault.to_str().unwrap()),
+        ("KDBX_LOG_FILE", log.to_str().unwrap()),
+    ]);
+    let err = server.call_error("kdbx_unlock", json!({ "password": FIXTURE_PASSWORD }));
+    assert_eq!(err["code"], json!("VAULT_UNREADABLE"));
+
+    let lines = read_audit_lines(&log);
+    let failed = lines
+        .iter()
+        .find(|l| l["event"] == json!("unlock_failed"))
+        .expect("unlock_failed event");
+    assert_eq!(failed["level"], json!("warn"));
+    assert_eq!(failed["details"]["reason"], json!("not_kdbx"));
+    assert_eq!(failed["details"]["unlock_source"], json!("input"));
+    // It is not an authentication failure, so no auth_failed event.
+    assert!(!lines.iter().any(|l| l["event"] == json!("auth_failed")));
 }

@@ -20,8 +20,11 @@ pub mod reveals;
 pub mod views;
 pub mod writes;
 
+use crate::kdbx_core::address::EntryAddress;
 use crate::kdbx_core::audit::{AuditEvent, AuditLog};
 use crate::kdbx_core::config::Config;
+use crate::kdbx_core::error::{CoreError, ErrorCode};
+use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::vault::Vault;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -96,7 +99,8 @@ impl KdbxServer {
     /// by setting KDBX_LOG_LEVEL=warn"). Reveal and write events are info level,
     /// so they appear by default and can be silenced only deliberately.
     pub(crate) fn emit(&self, event: AuditEvent) {
-        if verbosity(event.level().as_str()) <= verbosity(self.config.log_level.as_str()) {
+        // Level's derived order is verbosity order (least verbose first).
+        if event.level() <= self.config.log_level {
             self.audit.write(&event);
         }
     }
@@ -138,12 +142,13 @@ impl KdbxServer {
             tokio::time::sleep(interval).await;
             let mut vault = self.state.lock().await;
             if vault.should_lock(Instant::now(), timeout) {
-                let dropped = vault.lock(crate::kdbx_core::vault::LockReason::IdleTimeout);
+                let reason = crate::kdbx_core::vault::LockReason::IdleTimeout;
+                let dropped = vault.lock(reason);
                 // Drop the guard before emitting so the audit write is off the
                 // lock.
                 drop(vault);
                 self.emit(AuditEvent::VaultLocked {
-                    reason: "idle_timeout".to_string(),
+                    reason,
                     pending_discarded_count: dropped as u64,
                 });
             }
@@ -151,18 +156,74 @@ impl KdbxServer {
     }
 }
 
-/// Map a level name (`error`/`warn`/`info`/`debug`/`trace`) to a verbosity rank,
-/// least verbose first. An event emits when its rank is at most the configured
-/// level's rank. Both `audit::Level` and `config::LogLevel` render to these
-/// names, so this one ranking covers the comparison without a second table.
-fn verbosity(level: &str) -> u8 {
-    match level {
-        "error" => 0,
-        "warn" => 1,
-        "info" => 2,
-        "debug" => 3,
-        "trace" => 4,
-        _ => 2,
+/// The server instructions sent at initialize: what the server is, the path
+/// grammar every path parameter uses, and how to unlock without putting the
+/// master password in the conversation. The grammar lives here once rather than
+/// in every tool description.
+const SERVER_INSTRUCTIONS: &str = "mcp-kdbx exposes a single KeePass KDBX vault. \
+Read groups and entries and find by title, username, or url with the list and find tools; \
+protected fields and attachments require a separate consent-gated reveal. Writes (when \
+enabled) are staged in memory and committed atomically with kdbx_save_pending.\n\n\
+Paths: every path has a leading '/' (the root group is '/'), and '/' separates group names \
+from the entry title, as in /Web/Banking/MyBank. Inside a name, write a literal '/' as \\/, \
+a literal backslash as \\\\, and a literal ':' before digits as \\:. When siblings share a \
+name, ':N' picks the Nth (1-based), as in /Web/MyBank:2. A trailing '/' names a group, never \
+an entry. Copy paths verbatim from tool output; ordinals can shift between sessions, so \
+for a stable reference pass the entry's or group's uuid (every read returns it) instead of \
+its path. A record whose path is null has no addressable path: use its uuid.\n\n\
+Unlocking: call kdbx_unlock with no arguments; the server reads the master password from \
+its configured KDBX_PASSWORD or KDBX_UNLOCK_CMD. Do not ask the user to type the master \
+password into the chat.";
+
+/// Locate the entry an entry-targeting tool names, by vault path or by UUID
+/// (exactly one; see [`EntryAddress::from_parts`]). `path_param` is the tool's
+/// path parameter name (`path` or `entry_path`), echoed in the error message.
+///
+/// Every entry tool resolves its target through here, so path and UUID
+/// addressing behave identically across reads, reveals, and writes.
+pub(crate) fn locate_entry<'a>(
+    db: &'a keepass::Database,
+    path: Option<&str>,
+    uuid: Option<&str>,
+    path_param: &str,
+) -> Result<keepass::db::EntryRef<'a>, CoreError> {
+    let id = EntryAddress::from_parts(path, uuid, path_param)?.resolve(db)?;
+    db.entry(id)
+        .ok_or_else(|| CoreError::new(ErrorCode::EntryNotFound))
+}
+
+/// The canonical vault path of `entry`, or `None` when it has no addressable
+/// path. Audit events and responses report this rather than echoing the
+/// caller's input, so they name the record actually touched.
+pub(crate) fn canonical_entry_path(
+    db: &keepass::Database,
+    entry: &keepass::db::EntryRef<'_>,
+) -> Option<String> {
+    crate::kdbx_core::path::vault_path_to_entry(db, entry.id()).map(|p| p.format())
+}
+
+/// Tool inputs wrap secret values in [`Secret`]; their JSON Schema is the inner
+/// type's, unchanged, so the wire contract an MCP host sees does not move.
+/// (Implemented here, not in `kdbx_core`, which stays free of the rmcp/schemars
+/// dependency.)
+impl<T> rmcp::schemars::JsonSchema for Secret<T>
+where
+    T: zeroize::Zeroize + rmcp::schemars::JsonSchema,
+{
+    fn inline_schema() -> bool {
+        T::inline_schema()
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        T::schema_name()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        T::schema_id()
+    }
+
+    fn json_schema(generator: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        T::json_schema(generator)
     }
 }
 
@@ -170,12 +231,7 @@ fn verbosity(level: &str) -> u8 {
 impl ServerHandler for KdbxServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "mcp-kdbx exposes a single KeePass KDBX vault. Read groups and entries and find \
-                 by title or url with the list and find tools; protected fields and attachments \
-                 require a separate consent-gated reveal. Writes (when enabled) are staged in \
-                 memory and committed atomically with kdbx_save_pending.",
-            );
+            .with_instructions(SERVER_INSTRUCTIONS);
         // Report mcp-kdbx as the server, not rmcp's default implementation name.
         // Implementation::from_build_env expands env!("CARGO_CRATE_NAME") inside
         // the rmcp crate, so it would report "rmcp" and rmcp's version, not ours.
@@ -183,5 +239,69 @@ impl ServerHandler for KdbxServer {
         // ServerInfo is non-exhaustive, so set the field after construction.
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::kdbx_core::{config::Config, stage, totp::TotpConfig};
+
+    /// A value that must never appear in any Debug rendering below.
+    const MARK: &str = "SECRET-MARK-7f3a";
+
+    fn assert_redacted(what: &str, rendered: String) {
+        assert!(
+            !rendered.contains(MARK),
+            "{what} Debug leaked the secret: {rendered}"
+        );
+    }
+
+    #[test]
+    fn every_secret_bearing_type_redacts_debug() {
+        // Tool inputs, built from the JSON an agent would send.
+        let add: super::writes::AddEntryParams = serde_json::from_value(serde_json::json!({
+            "group_path": "/",
+            "title": "T",
+            "fields": { "Password": { "value": MARK, "protected": true } },
+            "attachments": { "a.bin": { "base64": MARK } },
+        }))
+        .unwrap();
+        assert_redacted("AddEntryParams", format!("{add:?}"));
+        let update: super::writes::UpdateFieldParams = serde_json::from_value(serde_json::json!({
+            "path": "/T", "field_name": "Password", "value": MARK,
+        }))
+        .unwrap();
+        assert_redacted("UpdateFieldParams", format!("{update:?}"));
+        let unlock: super::lifecycle::UnlockParams = serde_json::from_value(serde_json::json!({
+            "password": MARK, "keyfile_bytes": MARK,
+        }))
+        .unwrap();
+        assert_redacted("UnlockParams", format!("{unlock:?}"));
+
+        // Core types that carry the same values onward.
+        let entry = stage::EntryInput {
+            title: "T".to_string(),
+            fields: vec![stage::FieldInput {
+                name: "Password".to_string(),
+                value: MARK.to_string().into(),
+                protected: true,
+            }],
+            attachments: vec![stage::AttachmentInput {
+                name: "a.bin".to_string(),
+                bytes: MARK.as_bytes().to_vec().into(),
+            }],
+        };
+        assert_redacted("EntryInput", format!("{entry:?}"));
+        let totp = TotpConfig::parse("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP").unwrap();
+        let rendered = format!("{totp:?}");
+        assert!(rendered.contains("<redacted>"), "TotpConfig: {rendered}");
+        let code = totp.compute_at(59);
+        assert!(!format!("{code:?}").contains(code.code.expose().as_str()));
+        let config = Config {
+            password: Some(MARK.to_string().into()),
+            unlock_cmd: Some(MARK.to_string().into()),
+            ..Config::default()
+        };
+        assert_redacted("Config", format!("{config:?}"));
     }
 }

@@ -39,7 +39,10 @@ use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 /// adapter records whatever [`resolve_unlock_source`] returns rather than
 /// re-deriving the label from the config, so the audit cannot drift from the
 /// priority order applied here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes as its lowercase name: `"input"`, `"env"`, or `"cmd"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UnlockSource {
     /// The `password` argument passed to the tool call.
     Input,
@@ -49,15 +52,18 @@ pub enum UnlockSource {
     Cmd,
 }
 
-impl UnlockSource {
-    /// The stable audit label for this source: "input", "env", or "cmd".
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            UnlockSource::Input => "input",
-            UnlockSource::Env => "env",
-            UnlockSource::Cmd => "cmd",
-        }
-    }
+/// Why the unlock command produced no password (the `reason` in an
+/// `AUTH_FAILED` error's details). A non-zero exit carries `exit_code`
+/// instead. Serialized snake_case, for example `"unlock_cmd_timeout"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlockCmdFailure {
+    /// `/bin/sh` could not be spawned or waited on.
+    UnlockCmdSpawnFailed,
+    /// The command outlived `KDBX_UNLOCK_CMD_TIMEOUT_SECONDS`.
+    UnlockCmdTimeout,
+    /// The command's stdout is not valid UTF-8.
+    UnlockCmdOutputNotUtf8,
 }
 
 /// Resolve the master password from the first available source, in priority
@@ -85,12 +91,12 @@ pub async fn resolve_unlock_source(
     }
 
     // (b) KDBX_PASSWORD, injected directly into the environment.
-    if let Some(pw) = config.password.as_deref() {
+    if let Some(pw) = config.password.as_ref().map(|p| p.expose().as_str()) {
         return Ok((Zeroizing::new(pw.to_string()), UnlockSource::Env));
     }
 
     // (c) KDBX_UNLOCK_CMD: shell out to a secret manager and read its stdout.
-    if let Some(cmd) = config.unlock_cmd.as_deref() {
+    if let Some(cmd) = config.unlock_cmd.as_ref().map(|c| c.expose().as_str()) {
         let pw = run_unlock_cmd(cmd, config.unlock_cmd_timeout_seconds).await?;
         return Ok((pw, UnlockSource::Cmd));
     }
@@ -132,8 +138,8 @@ async fn run_unlock_cmd(cmd: &str, timeout_seconds: u64) -> CoreResult<Zeroizing
             return Err(CoreError::new(ErrorCode::AuthFailed)
                 .with_message("Unlock command failed to run.")
                 .with_details(json!({
-                    "source": "cmd",
-                    "reason": "unlock_cmd_spawn_failed",
+                    "source": UnlockSource::Cmd,
+                    "reason": UnlockCmdFailure::UnlockCmdSpawnFailed,
                     "io_error": e.kind().to_string(),
                 })));
         }
@@ -142,29 +148,47 @@ async fn run_unlock_cmd(cmd: &str, timeout_seconds: u64) -> CoreResult<Zeroizing
             return Err(CoreError::new(ErrorCode::AuthFailed)
                 .with_message("Unlock command timed out.")
                 .with_details(json!({
-                    "source": "cmd",
-                    "reason": "unlock_cmd_timeout",
+                    "source": UnlockSource::Cmd,
+                    "reason": UnlockCmdFailure::UnlockCmdTimeout,
                     "timeout_seconds": timeout_seconds,
                 })));
         }
     };
 
+    // Both captured buffers are zeroized when they drop, on every path below
+    // (including the non-zero exit): stdout is the master password, and
+    // stderr may echo it (or other secret-manager output).
+    let stdout = Zeroizing::new(output.stdout);
+    let _stderr = Zeroizing::new(output.stderr);
+
     if !output.status.success() {
         return Err(CoreError::new(ErrorCode::AuthFailed)
             .with_message("Unlock command exited non-zero.")
             .with_details(json!({
-                "source": "cmd",
+                "source": UnlockSource::Cmd,
                 // None when killed by a signal: serializes to JSON null.
                 "exit_code": output.status.code(),
             })));
     }
 
+    // Strict UTF-8. A lossy decode would replace invalid bytes with U+FFFD and
+    // unlock with a password that is not the one the command printed, which
+    // fails as a confusing AUTH_FAILED (or, worse, matches nothing the user
+    // ever set). The master password is a string to keepass, so non-UTF-8
+    // output is an error stated plainly. The error never includes the bytes.
+    let raw = std::str::from_utf8(&stdout).map_err(|_| {
+        CoreError::new(ErrorCode::AuthFailed)
+            .with_message("Unlock command output is not valid UTF-8.")
+            .with_details(json!({
+                "source": UnlockSource::Cmd,
+                "reason": UnlockCmdFailure::UnlockCmdOutputNotUtf8,
+            }))
+    })?;
+
     // Trim trailing whitespace and newline. A secret manager that prints the
     // password followed by a newline is the common case; trimming the end keeps
     // any internal characters intact while dropping the line terminator.
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let trimmed = raw.trim_end();
-    Ok(Zeroizing::new(trimmed.to_string()))
+    Ok(Zeroizing::new(raw.trim_end().to_string()))
 }
 
 #[cfg(test)]
@@ -187,8 +211,8 @@ mod tests {
     async fn input_password_wins_over_env_and_cmd() {
         let mut cfg = base_config();
         // Both lower-priority sources are present, but the input must win.
-        cfg.password = Some("from-env".to_string());
-        cfg.unlock_cmd = Some("printf should-not-run".to_string());
+        cfg.password = Some("from-env".to_string().into());
+        cfg.unlock_cmd = Some("printf should-not-run".to_string().into());
 
         let (pw, source) = resolve_unlock_source(Some("from-input"), &cfg)
             .await
@@ -200,9 +224,9 @@ mod tests {
     #[tokio::test]
     async fn env_password_used_when_no_input() {
         let mut cfg = base_config();
-        cfg.password = Some("env-secret".to_string());
+        cfg.password = Some("env-secret".to_string().into());
         // A command is also configured, but the env password outranks it.
-        cfg.unlock_cmd = Some("printf should-not-run".to_string());
+        cfg.unlock_cmd = Some("printf should-not-run".to_string().into());
 
         let (pw, source) = resolve_unlock_source(None, &cfg)
             .await
@@ -216,7 +240,7 @@ mod tests {
         let mut cfg = base_config();
         // printf emits no trailing newline, but the resolver trims either way.
         // Use echo to confirm the trailing newline is stripped.
-        cfg.unlock_cmd = Some("echo secretpw".to_string());
+        cfg.unlock_cmd = Some("echo secretpw".to_string().into());
 
         let (pw, source) = resolve_unlock_source(None, &cfg)
             .await
@@ -228,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn unlock_cmd_printf_has_no_newline_to_trim() {
         let mut cfg = base_config();
-        cfg.unlock_cmd = Some("printf secretpw".to_string());
+        cfg.unlock_cmd = Some("printf secretpw".to_string().into());
 
         let (pw, source) = resolve_unlock_source(None, &cfg)
             .await
@@ -238,9 +262,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_utf8_output_is_auth_failed_not_silently_mangled() {
+        // from_utf8_lossy would turn 0xFF into U+FFFD and unlock with a wrong
+        // password; a clear error is the only correct outcome.
+        let mut cfg = base_config();
+        cfg.unlock_cmd = Some("printf '\\377pw'".to_string().into());
+        let err = resolve_unlock_source(None, &cfg)
+            .await
+            .expect_err("non-UTF-8 output must fail");
+        assert_eq!(err.code_enum(), ErrorCode::AuthFailed);
+        assert_eq!(
+            err.details().unwrap()["reason"],
+            json!("unlock_cmd_output_not_utf8")
+        );
+    }
+
+    #[tokio::test]
     async fn nonzero_exit_is_auth_failed_with_exit_code() {
         let mut cfg = base_config();
-        cfg.unlock_cmd = Some("exit 3".to_string());
+        cfg.unlock_cmd = Some("exit 3".to_string().into());
 
         let err = resolve_unlock_source(None, &cfg)
             .await
@@ -256,7 +296,7 @@ mod tests {
     async fn timeout_is_auth_failed_with_reason() {
         let mut cfg = base_config();
         // The command sleeps well past the 1-second timeout from base_config.
-        cfg.unlock_cmd = Some("sleep 5".to_string());
+        cfg.unlock_cmd = Some("sleep 5".to_string().into());
         cfg.unlock_cmd_timeout_seconds = 1;
 
         let err = resolve_unlock_source(None, &cfg)
@@ -281,9 +321,18 @@ mod tests {
     fn unlock_source_labels_are_stable() {
         // These strings are the audit unlock_source label; pin them so a rename
         // of an enum variant cannot silently change the audit contract.
-        assert_eq!(UnlockSource::Input.as_str(), "input");
-        assert_eq!(UnlockSource::Env.as_str(), "env");
-        assert_eq!(UnlockSource::Cmd.as_str(), "cmd");
+        assert_eq!(
+            serde_json::to_value(UnlockSource::Input).unwrap(),
+            json!("input")
+        );
+        assert_eq!(
+            serde_json::to_value(UnlockSource::Env).unwrap(),
+            json!("env")
+        );
+        assert_eq!(
+            serde_json::to_value(UnlockSource::Cmd).unwrap(),
+            json!("cmd")
+        );
     }
 
     #[tokio::test]
@@ -292,7 +341,7 @@ mod tests {
         // before the env and command paths. Whether it decrypts is the unlock
         // step's concern, not this resolver's.
         let mut cfg = base_config();
-        cfg.password = Some("env-secret".to_string());
+        cfg.password = Some("env-secret".to_string().into());
 
         let (pw, source) = resolve_unlock_source(Some(""), &cfg)
             .await

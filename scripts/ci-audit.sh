@@ -69,20 +69,37 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# D. The secret-bearing types must keep their hand-written redacting Debug. A
-#    derived Debug would let a stray tracing::debug!(?x) leak the master
-#    password. A manual impl alongside a derive does not compile, so the
-#    presence of the manual impl guarantees no derive.
+# D. Secret-bearing fields must not render in Debug. Structurally: in any
+#    struct that derives Debug, a field whose name marks it as secret material
+#    (password, unlock_cmd, keyfile_bytes, secret, value, base64, bytes, code)
+#    must not hold a raw String or Vec<u8> (optionally in an Option). It must
+#    be wrapped in kdbx_core::secret::Secret, whose Debug prints <redacted>.
+#    A struct with a hand-written Debug is not matched (it has no derive).
+#    This covers every current and future struct, not a list of named types.
 # ---------------------------------------------------------------------------
-if grep -q 'impl std::fmt::Debug for Config' src/kdbx_core/config.rs; then
-    pass "Config has a hand-written redacting Debug"
+hits=$(find src -name '*.rs' -print0 | xargs -0 awk '
+FNR == 1 { derive_debug = 0; in_struct = 0 }
+/^[[:space:]]*#\[derive\(/ { if ($0 ~ /Debug/) derive_debug = 1 }
+/^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?struct[[:space:]]+[A-Za-z0-9_]+.*\{[[:space:]]*$/ {
+    if (derive_debug) { in_struct = 1; name = $0; sub(/.*struct[[:space:]]+/, "", name); sub(/[^A-Za-z0-9_].*/, "", name) }
+    derive_debug = 0
+    next
+}
+/^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?(enum|fn|impl|mod|trait|type|const|static)[[:space:]]/ { derive_debug = 0 }
+in_struct && /^[[:space:]]*\}/ { in_struct = 0; next }
+in_struct {
+    line = $0
+    if (match(line, /^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?(password|unlock_cmd|keyfile_bytes|secret|value|base64|bytes|code):[[:space:]]*/)) {
+        field = line; sub(/^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?/, "", field); sub(/:.*/, "", field)
+        type = substr(line, RSTART + RLENGTH); sub(/,[[:space:]]*$/, "", type)
+        if (type ~ /^(Option<)?(String|Vec<u8>)>?$/) printf "%s:%d: %s.%s: %s\n", FILENAME, FNR, name, field, type
+    }
+}
+' || true)
+if [ -n "$hits" ]; then
+    problem "secret-named field with a raw String/Vec<u8> in a struct deriving Debug (wrap it in Secret<..>)" "$hits"
 else
-    problem "Config is missing its hand-written redacting Debug (src/kdbx_core/config.rs)"
-fi
-if grep -q 'impl std::fmt::Debug for UnlockParams' src/adapter/lifecycle.rs; then
-    pass "UnlockParams has a hand-written redacting Debug"
-else
-    problem "UnlockParams is missing its hand-written redacting Debug (src/adapter/lifecycle.rs)"
+    pass "secret-named fields in Debug-deriving structs are all Secret<..>"
 fi
 
 # ---------------------------------------------------------------------------

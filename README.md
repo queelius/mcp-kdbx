@@ -44,7 +44,7 @@ for host setup and the per-release smoke checklist, see
 
 ## Quick start
 
-Build from source (Rust 1.85+, edition 2024). `diff-kdbx` is currently a
+Build from source (Rust 1.89+, edition 2024). `diff-kdbx` is currently a
 path dependency, so check out the sibling repo at `../diff-kdbx` first:
 
 ```sh

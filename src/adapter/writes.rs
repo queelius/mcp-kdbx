@@ -18,21 +18,26 @@
 
 use crate::adapter::views::format_system_time;
 use crate::adapter::{KdbxServer, responses};
-use crate::kdbx_core::audit::AuditEvent;
+use crate::kdbx_core::address::{EntryAddress, GroupAddress};
+use crate::kdbx_core::audit::{AuditEvent, StageDiscardReason, WriteTool};
 use crate::kdbx_core::error::{CoreError, ErrorCode};
-use crate::kdbx_core::path::{VaultPath, vault_path_to_entry};
+use crate::kdbx_core::path::vault_path_to_entry;
+use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::stage;
+use crate::kdbx_core::vault_file::SaveStep;
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
+use serde::Deserialize;
 use std::collections::HashMap;
 
 /// One field on a new entry in the `kdbx_add_entry` input map: a value and its
-/// protection flag. Keyed by field name in the surrounding map.
+/// protection flag. Keyed by field name in the surrounding map. The value is a
+/// [`Secret`] (redacted in `Debug`).
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct FieldSpec {
     /// The field value. Stored protected or not per `protected`.
-    pub value: String,
+    pub value: Secret<String>,
     /// Whether to store the field as a protected (encrypted-at-rest) value.
     pub protected: bool,
 }
@@ -42,7 +47,7 @@ pub struct FieldSpec {
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct AttachmentSpec {
     /// The attachment bytes, base64-encoded (standard alphabet).
-    pub base64: String,
+    pub base64: Secret<String>,
 }
 
 /// Input for `kdbx_add_entry`: a destination group, a title, and optional
@@ -50,7 +55,13 @@ pub struct AttachmentSpec {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AddEntryParams {
     /// The group path to add the entry under, for example `/Web/` or `/`.
-    pub group_path: String,
+    /// Give exactly one of `group_path` or `group_uuid`.
+    #[serde(default)]
+    pub group_path: Option<String>,
+    /// The uuid of the group to add the entry under (as returned by
+    /// kdbx_list_groups). Give exactly one of `group_path` or `group_uuid`.
+    #[serde(default)]
+    pub group_uuid: Option<String>,
     /// The entry title (the Title field).
     pub title: String,
     /// Custom and standard fields, keyed by name. Each carries a value and a
@@ -63,15 +74,21 @@ pub struct AddEntryParams {
     pub attachments: HashMap<String, AttachmentSpec>,
 }
 
-/// Input for `kdbx_update_field`: which entry, which field, and the new value.
+/// Input for `kdbx_update_field`: which entry (by path or uuid), which field,
+/// and the new value.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UpdateFieldParams {
-    /// The entry path, for example `/Web/GitHub`.
-    pub path: String,
+    /// The entry path, for example `/Web/GitHub`. Give exactly one of `path`
+    /// or `uuid`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The entry's uuid. Give exactly one of `path` or `uuid`.
+    #[serde(default)]
+    pub uuid: Option<String>,
     /// The field name to set or change.
     pub field_name: String,
     /// The new value. An empty value clears the field.
-    pub value: String,
+    pub value: Secret<String>,
     /// Force the field's protection state. When omitted, an existing field keeps
     /// its current protection and a new field defaults to unprotected.
     #[serde(default)]
@@ -84,7 +101,7 @@ impl KdbxServer {
     /// and an unlocked vault. The entry is added to the working db only; it
     /// reaches disk on `kdbx_save_pending`.
     #[tool(
-        description = "Stage a new entry under a group. Requires writes to be enabled and the vault unlocked. The entry is staged in memory, not written to disk: commit it with kdbx_save_pending. Fields and attachments are optional maps keyed by name."
+        description = "Stage a new entry under a group, named by group_path or group_uuid. Requires writes to be enabled and the vault unlocked. The entry is staged in memory, not written to disk: commit it with kdbx_save_pending. Fields and attachments are optional maps keyed by name."
     )]
     async fn kdbx_add_entry(&self, Parameters(params): Parameters<AddEntryParams>) -> String {
         if !self.writes_allowed() {
@@ -96,8 +113,13 @@ impl KdbxServer {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
-        let group_path = match VaultPath::parse(&params.group_path) {
-            Ok(p) => p,
+        let group = match GroupAddress::from_parts(
+            params.group_path.as_deref(),
+            params.group_uuid.as_deref(),
+            "group_path",
+            "group_uuid",
+        ) {
+            Ok(g) => g,
             Err(e) => return responses::err(&e),
         };
 
@@ -124,8 +146,9 @@ impl KdbxServer {
             params.attachments.into_iter().collect();
         attachment_names.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, spec) in attachment_names {
-            let bytes = match base64::engine::general_purpose::STANDARD.decode(&spec.base64) {
-                Ok(bytes) => bytes,
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(spec.base64.expose())
+            {
+                Ok(bytes) => Secret::new(bytes),
                 Err(_) => {
                     return responses::err(
                         &CoreError::new(ErrorCode::InvalidInput)
@@ -148,20 +171,19 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let entry_id = match stage::add_entry(working, &group_path, &input) {
+        let entry_id = match stage::add_entry(working, &group, &input) {
             Ok(id) => id,
             Err(e) => return responses::err(&e),
         };
 
         // Capture the audit data into owned values before returning. The new
-        // entry's path is built from the working db; the uuid comes off the id.
-        let path = vault_path_to_entry(working, entry_id)
-            .map(|p| p.format())
-            .unwrap_or_else(|| group_path.format());
+        // entry's path is built from the working db (None only when its group
+        // has no addressable path); the uuid comes off the id.
+        let path = vault_path_to_entry(working, entry_id).map(|p| p.format());
         let uuid = entry_id.uuid().to_string();
 
         self.emit(AuditEvent::WriteStaged {
-            tool: "kdbx_add_entry".to_string(),
+            tool: WriteTool::KdbxAddEntry,
             target_path: path.clone(),
             target_uuid: uuid.clone(),
             field_name: None,
@@ -189,8 +211,12 @@ impl KdbxServer {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
-        let path = match VaultPath::parse(&params.path) {
-            Ok(p) => p,
+        let target = match EntryAddress::from_parts(
+            params.path.as_deref(),
+            params.uuid.as_deref(),
+            "path",
+        ) {
+            Ok(t) => t,
             Err(e) => return responses::err(&e),
         };
 
@@ -199,35 +225,32 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        if let Err(e) = stage::update_field(
+        let entry_id = match stage::update_field(
             working,
-            &path,
+            &target,
             &params.field_name,
-            &params.value,
+            params.value.expose(),
             params.protected,
         ) {
-            return responses::err(&e);
-        }
+            Ok(id) => id,
+            Err(e) => return responses::err(&e),
+        };
 
-        // Resolve the entry's uuid for the audit event. The write just succeeded,
-        // so the path resolves; fall back to an empty uuid defensively.
-        let uuid = path
-            .resolve_entry(working)
-            .ok()
-            .and_then(|id| working.entry(id).map(|e| e.id().uuid().to_string()))
-            .unwrap_or_default();
-
-        let path_str = path.format();
+        // Report the canonical path of the entry actually written (re-derived
+        // after the write, since a Title change moves it) and its uuid.
+        let path = vault_path_to_entry(working, entry_id).map(|p| p.format());
+        let uuid = entry_id.uuid().to_string();
         self.emit(AuditEvent::WriteStaged {
-            tool: "kdbx_update_field".to_string(),
-            target_path: path_str.clone(),
-            target_uuid: uuid,
+            tool: WriteTool::KdbxUpdateField,
+            target_path: path.clone(),
+            target_uuid: uuid.clone(),
             field_name: Some(params.field_name.clone()),
         });
 
         responses::ok(serde_json::json!({
             "staged": true,
-            "path": path_str,
+            "path": path,
+            "uuid": uuid,
             "field_name": params.field_name,
         }))
     }
@@ -263,7 +286,7 @@ impl KdbxServer {
     /// staged (`NO_PENDING_CHANGES`) or when the file changed on disk since
     /// unlock (`VAULT_FILE_MODIFIED`).
     #[tool(
-        description = "Commit the staged changes to the vault file atomically. Requires writes to be enabled and the vault unlocked. Refuses when nothing is staged, or when the file changed on disk since it was unlocked. On success the stage settles and the working copy becomes the new baseline."
+        description = "Commit the staged changes to the vault file atomically. Requires writes to be enabled and the vault unlocked. Refuses when nothing is staged, or when the file content changed on disk since it was unlocked (VAULT_FILE_MODIFIED: discard and re-unlock to pick up the other change). On success the stage settles and the working copy becomes the new baseline."
     )]
     async fn kdbx_save_pending(&self) -> String {
         if !self.writes_allowed() {
@@ -285,12 +308,27 @@ impl KdbxServer {
             .unwrap_or_default();
         let pending_before = vault.pending_count() as u64;
 
-        match stage::save_pending(&mut vault) {
+        // The save runs the KDF and blocking file I/O (including a bounded wait
+        // for the writer lock). block_in_place moves that off the async worker
+        // so other tasks (the idle timer) keep running; the server runs on the
+        // multi-threaded runtime (#[tokio::main]).
+        let result = tokio::task::block_in_place(|| stage::save_pending(&mut vault));
+        match result {
             Ok(outcome) => {
+                if let Some(reason) = outcome.writer_lock_unavailable {
+                    self.emit(AuditEvent::WriterLockUnavailable { reason });
+                }
+                // The baseline now describes the file just written, so its mtime
+                // is the real new file mtime.
+                let after_mtime = vault
+                    .mtime_at_unlock()
+                    .ok()
+                    .map(format_system_time)
+                    .unwrap_or_default();
                 self.emit(AuditEvent::SaveCommitted {
                     num_changes: outcome.num_changes as u64,
                     before_mtime,
-                    after_mtime: outcome.written_at.clone(),
+                    after_mtime,
                 });
                 responses::ok(outcome)
             }
@@ -315,8 +353,14 @@ impl KdbxServer {
                     ErrorCode::NoPendingChanges => {}
                     // Any other failure is a write failure.
                     _ => {
+                        // The save path tags every WRITE_FAILED with the step
+                        // that failed (details.step, a SaveStep).
+                        let failure_step = e
+                            .details()
+                            .and_then(|d| d.get("step"))
+                            .and_then(|step| SaveStep::deserialize(step).ok());
                         self.emit(AuditEvent::SaveFailed {
-                            failure_step: "write".to_string(),
+                            failure_step,
                             error_message: e.message().to_string(),
                             pending_changes: pending_before,
                         });
@@ -343,18 +387,12 @@ impl KdbxServer {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
 
-        // Capture the discarded changes' paths before the working copy is reset.
-        // The immutable diff borrow ends once the owned paths are collected, so
-        // the mutable discard borrow that follows does not conflict.
+        // Capture the discarded changes' labels before the working copy is
+        // reset. The immutable diff borrow ends once the owned labels are
+        // collected, so the mutable discard borrow that follows does not
+        // conflict.
         let summary: Vec<String> = match vault.canonical_and_working() {
-            Ok((canonical, working)) => {
-                let diff = stage::diff_pending(canonical, working);
-                diff.added
-                    .iter()
-                    .map(|a| a.path.clone())
-                    .chain(diff.modified.iter().map(|m| m.path.clone()))
-                    .collect()
-            }
+            Ok((canonical, working)) => stage::diff_pending(canonical, working).entry_labels(),
             Err(_) => Vec::new(),
         };
 
@@ -364,7 +402,7 @@ impl KdbxServer {
         };
 
         self.emit(AuditEvent::StageDiscarded {
-            reason: "manual".to_string(),
+            reason: StageDiscardReason::Manual,
             num_dropped: num_dropped as u64,
             summary,
         });

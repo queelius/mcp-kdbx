@@ -39,6 +39,15 @@ pub enum ErrorCode {
     /// name (for example, an attachment whose base64 fails to decode). Distinct
     /// from `FIELD_NAME_INVALID`, which is specifically about a bad field name.
     InvalidInput,
+    /// A vault path is not well-formed (no leading `/`, an empty `//` segment,
+    /// a dangling `\` escape, a `:0` ordinal). Distinct from `GROUP_NOT_FOUND`
+    /// and `ENTRY_NOT_FOUND`, which mean a well-formed path matched nothing.
+    PathInvalid,
+    /// The vault file could not be opened for a reason found before any key
+    /// is checked (not a KDBX file, an unsupported version, truncated, or a
+    /// corrupt header), so reporting it reveals nothing about the password.
+    /// `details.reason` names which. A wrong key stays `AUTH_FAILED`.
+    VaultUnreadable,
 }
 
 impl ErrorCode {
@@ -63,6 +72,8 @@ impl ErrorCode {
             ErrorCode::EntryTitleInvalid => "ENTRY_TITLE_INVALID",
             ErrorCode::FieldNameInvalid => "FIELD_NAME_INVALID",
             ErrorCode::InvalidInput => "INVALID_INPUT",
+            ErrorCode::PathInvalid => "PATH_INVALID",
+            ErrorCode::VaultUnreadable => "VAULT_UNREADABLE",
         }
     }
 
@@ -94,7 +105,20 @@ impl ErrorCode {
             ErrorCode::EntryTitleInvalid => "The entry title is invalid.",
             ErrorCode::FieldNameInvalid => "The field name is invalid.",
             ErrorCode::InvalidInput => "A supplied value is invalid.",
+            ErrorCode::PathInvalid => {
+                "The path is malformed. Paths start with '/', separate groups with '/', escape a literal '/' as '\\/' and '\\' as '\\\\', and may end a segment with ':N' to pick the Nth same-named sibling."
+            }
+            ErrorCode::VaultUnreadable => {
+                "The vault file is not a readable KDBX database (see details.reason)."
+            }
         }
+    }
+}
+
+/// Serializes as the stable wire string (the audit `auth_failed.error_code`).
+impl serde::Serialize for ErrorCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -204,6 +228,8 @@ mod tests {
         (ErrorCode::EntryTitleInvalid, "ENTRY_TITLE_INVALID"),
         (ErrorCode::FieldNameInvalid, "FIELD_NAME_INVALID"),
         (ErrorCode::InvalidInput, "INVALID_INPUT"),
+        (ErrorCode::PathInvalid, "PATH_INVALID"),
+        (ErrorCode::VaultUnreadable, "VAULT_UNREADABLE"),
     ];
 
     #[test]

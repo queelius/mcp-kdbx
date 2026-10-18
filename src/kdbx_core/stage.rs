@@ -25,9 +25,15 @@
 //! non-protected one. That is how we decide whether to redact a field change
 //! without ever holding a protected plaintext.
 
+use crate::kdbx_core::address::{EntryAddress, GroupAddress};
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
-use crate::kdbx_core::path::{VaultPath, vault_path_to_entry};
+use crate::kdbx_core::path::{vault_path_to_entry, vault_path_to_group};
+use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::vault::Vault;
+use crate::kdbx_core::vault_file::{
+    LockUnavailable, SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint,
+    resolve_write_target, write_atomically,
+};
 use diff_kdbx::change_set::{Change, EntryChangeKind, FieldChange, ValueChange, ValueDisplay};
 use diff_kdbx::options::DiffOptions;
 use keepass::Database;
@@ -40,10 +46,11 @@ use std::time::SystemTime;
 // ---------------------------------------------------------------------------
 
 /// One field on a staged entry: a name, a value, and whether it is protected.
+/// The value is a [`Secret`] (any field may hold one), so `Debug` redacts it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FieldInput {
     pub name: String,
-    pub value: String,
+    pub value: Secret<String>,
     pub protected: bool,
 }
 
@@ -57,7 +64,7 @@ pub struct FieldInput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttachmentInput {
     pub name: String,
-    pub bytes: Vec<u8>,
+    pub bytes: Secret<Vec<u8>>,
 }
 
 /// A staged new entry: a title plus zero or more fields and attachments.
@@ -86,21 +93,26 @@ pub struct DiffPending {
 }
 
 /// An entry that exists in the working db but not the canonical baseline.
+///
+/// `path` and `group_path` are `None` (JSON `null`) when the record has no
+/// addressable path (an empty title or group name, see
+/// [`vault_path_to_entry`]); `uuid` always identifies it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AddedEntry {
-    pub path: String,
+    pub path: Option<String>,
     pub uuid: String,
     pub title: String,
-    pub group_path: String,
+    pub group_path: Option<String>,
     pub field_count: usize,
     pub has_attachments: bool,
     pub has_otp: bool,
 }
 
-/// An entry present in both dbs whose fields or attachments changed.
+/// An entry present in both dbs whose fields or attachments changed. `path` is
+/// `None` when the record has no addressable path, as for [`AddedEntry`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModifiedEntry {
-    pub path: String,
+    pub path: Option<String>,
     pub uuid: String,
     pub title: String,
     pub field_changes: Vec<FieldChangeOut>,
@@ -143,6 +155,25 @@ pub struct AttachmentChangeOut {
     pub change: String,
 }
 
+impl DiffPending {
+    /// One human-readable label per staged entry (added, then modified): its
+    /// vault path, or its UUID when it has no addressable path. The lock
+    /// discard summary and the `stage_discarded` audit event both use this, so
+    /// they cannot disagree. A path always starts with `/` and a UUID never
+    /// does, so the two forms stay distinguishable.
+    pub fn entry_labels(&self) -> Vec<String> {
+        let added = self
+            .added
+            .iter()
+            .map(|a| a.path.clone().unwrap_or_else(|| a.uuid.clone()));
+        let modified = self
+            .modified
+            .iter()
+            .map(|m| m.path.clone().unwrap_or_else(|| m.uuid.clone()));
+        added.chain(modified).collect()
+    }
+}
+
 /// The counts shown at the top of the diff.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiffSummary {
@@ -154,6 +185,11 @@ pub struct DiffSummary {
 /// The result of a successful save.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SaveOutcome {
+    /// Set when the filesystem could not take the writer lock and the save
+    /// went ahead without it. Not part of the tool response; the adapter
+    /// reports it as the warn-level `writer_lock_unavailable` audit event.
+    #[serde(skip)]
+    pub writer_lock_unavailable: Option<LockUnavailable>,
     pub saved: bool,
     pub num_changes: usize,
     pub vault_path: String,
@@ -164,7 +200,39 @@ pub struct SaveOutcome {
 // Validation (spec section 3).
 // ---------------------------------------------------------------------------
 
-/// Validate an entry title: length 1..=4096, no ASCII control characters.
+/// The format characters (General_Category Cf) a title or field name may
+/// contain: the zero-width non-joiner U+200C and joiner U+200D. Persian,
+/// Hindi, Malayalam, and other scripts need them for correct spelling, and
+/// emoji sequences need the joiner. Every other format character is refused
+/// (bidi controls that reorder text, zero-width spaces and the word joiner
+/// that hide a difference, tag characters, the soft hyphen, and any Cf a
+/// future Unicode version adds), so this is an allow-list, not a list of
+/// known-bad ranges.
+const ALLOWED_FORMAT_CHARS: [char; 2] = ['\u{200C}', '\u{200D}'];
+
+/// True when `c` may not appear in a title or field name: a control character
+/// (General_Category Cc: ASCII controls, DEL, the C1 range), or a format
+/// character (Cf) other than the [`ALLOWED_FORMAT_CHARS`].
+fn is_disallowed_name_char(c: char) -> bool {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    match c.general_category() {
+        GeneralCategory::Control => true,
+        GeneralCategory::Format => !ALLOWED_FORMAT_CHARS.contains(&c),
+        _ => false,
+    }
+}
+
+/// The first disallowed character of `s` (see [`is_disallowed_name_char`]), as
+/// its code point label (`U+202E`) for the error details.
+fn first_invisible_char(s: &str) -> Option<String> {
+    s.chars()
+        .find(|c| is_disallowed_name_char(*c))
+        .map(|c| format!("U+{:04X}", c as u32))
+}
+
+/// Validate an entry title: length 1..=4096, no control characters and no
+/// format characters outside the allow-list (see [`is_disallowed_name_char`]). Every write to the Title field goes through here: the `title`
+/// of `add_entry`, and `update_field` on `Title`.
 fn validate_title(title: &str) -> CoreResult<()> {
     let len = title.chars().count();
     if !(1..=4096).contains(&len) {
@@ -172,15 +240,16 @@ fn validate_title(title: &str) -> CoreResult<()> {
             .with_message("title length must be between 1 and 4096 characters")
             .with_details(serde_json::json!({ "length": len })));
     }
-    if title.chars().any(|c| (c as u32) < 0x20) {
+    if let Some(code_point) = first_invisible_char(title) {
         return Err(CoreError::new(ErrorCode::EntryTitleInvalid)
-            .with_message("title must not contain ASCII control characters"));
+            .with_message("title must not contain control or format characters")
+            .with_details(serde_json::json!({ "code_point": code_point })));
     }
     Ok(())
 }
 
-/// Validate a field name: length 1..=256, no ASCII control characters, no
-/// leading or trailing whitespace.
+/// Validate a field name: length 1..=256, no control characters and no format
+/// characters outside the allow-list, no leading or trailing whitespace.
 fn validate_field_name(name: &str) -> CoreResult<()> {
     let len = name.chars().count();
     if !(1..=256).contains(&len) {
@@ -188,15 +257,26 @@ fn validate_field_name(name: &str) -> CoreResult<()> {
             .with_message("field name length must be between 1 and 256 characters")
             .with_details(serde_json::json!({ "name": name, "length": len })));
     }
-    if name.chars().any(|c| (c as u32) < 0x20) {
+    if let Some(code_point) = first_invisible_char(name) {
         return Err(CoreError::new(ErrorCode::FieldNameInvalid)
-            .with_message("field name must not contain ASCII control characters")
-            .with_details(serde_json::json!({ "name": name })));
+            .with_message("field name must not contain control or format characters")
+            .with_details(serde_json::json!({ "code_point": code_point })));
     }
     if name != name.trim() {
         return Err(CoreError::new(ErrorCode::FieldNameInvalid)
             .with_message("field name must not have leading or trailing whitespace")
             .with_details(serde_json::json!({ "name": name })));
+    }
+    Ok(())
+}
+
+/// Validate a write of `value` to field `name`: the name itself, and, when the
+/// field is the Title, the value as a title. This is the one gate every field
+/// write passes, so no path can store a title that `validate_title` refuses.
+fn validate_field_write(name: &str, value: &str) -> CoreResult<()> {
+    validate_field_name(name)?;
+    if name == fields::TITLE {
+        validate_title(value)?;
     }
     Ok(())
 }
@@ -211,17 +291,29 @@ fn validate_field_name(name: &str) -> CoreResult<()> {
 /// the title and every field name, then creates the entry: sets Title, then
 /// each field (protected or not), then links each attachment under its name.
 /// Returns the new entry's id.
+///
+/// keepass stamps a new entry's creation, modification, and access times with
+/// the current time. The entry is built with a plain `edit`, not
+/// `edit_tracking`: a history snapshot of the blank, just-created entry would
+/// be noise.
 pub fn add_entry(
     working: &mut Database,
-    group_path: &VaultPath,
+    group: &GroupAddress,
     input: &EntryInput,
 ) -> CoreResult<EntryId> {
     validate_title(&input.title)?;
     for f in &input.fields {
-        validate_field_name(&f.name)?;
+        // The title parameter is the one way to set Title on a new entry; a
+        // Title key in the fields map would silently override it.
+        if f.name == fields::TITLE {
+            return Err(CoreError::new(ErrorCode::FieldNameInvalid)
+                .with_message("set the title with the title parameter, not in fields")
+                .with_details(serde_json::json!({ "name": f.name })));
+        }
+        validate_field_write(&f.name, f.value.expose())?;
     }
 
-    let group_id = group_path.resolve_group(working)?;
+    let group_id = group.resolve(working)?;
 
     // Clone the inputs the closure needs. The edit closure is FnOnce and the
     // keepass write API takes owned values, so we move owned copies in.
@@ -229,18 +321,18 @@ pub fn add_entry(
     let field_specs: Vec<(String, String, bool)> = input
         .fields
         .iter()
-        .map(|f| (f.name.clone(), f.value.clone(), f.protected))
+        .map(|f| (f.name.clone(), f.value.expose().clone(), f.protected))
         .collect();
     let attachment_specs: Vec<(String, Vec<u8>)> = input
         .attachments
         .iter()
-        .map(|a| (a.name.clone(), a.bytes.clone()))
+        .map(|a| (a.name.clone(), a.bytes.expose().clone()))
         .collect();
 
     let mut group_mut = working.group_mut(group_id).ok_or_else(|| {
         CoreError::new(ErrorCode::GroupNotFound)
             .with_message("group disappeared between resolve and write")
-            .with_details(serde_json::json!({ "path": group_path.format() }))
+            .with_details(serde_json::json!({ "uuid": group_id.uuid().to_string() }))
     })?;
 
     let new_id = group_mut
@@ -267,54 +359,167 @@ pub fn add_entry(
     Ok(new_id)
 }
 
-/// Update or set a single field on the entry named by `entry_path`.
+/// Update or set a single field on the entry named by `target` (a vault path or
+/// a record UUID). Returns the entry's id.
 ///
 /// `protected = None` preserves an existing field's protection state (and
 /// defaults to unprotected for a new field); `Some(b)` forces it. An empty
 /// value is allowed and clears the field (the Password-regenerate workflow).
-/// Propagates `ENTRY_NOT_FOUND` when the path does not resolve to an entry, and
-/// validates the field name.
+///
+/// A real change snapshots the previous entry state into the entry's history
+/// and updates its modification time (KeePass edit semantics). Setting a field
+/// to the value and protection it already has is a no-op.
+/// Propagates `ENTRY_NOT_FOUND` when the target does not resolve to an entry,
+/// and validates the field name.
 pub fn update_field(
     working: &mut Database,
-    entry_path: &VaultPath,
+    target: &EntryAddress,
     field_name: &str,
     value: &str,
     protected: Option<bool>,
-) -> CoreResult<()> {
-    validate_field_name(field_name)?;
+) -> CoreResult<EntryId> {
+    validate_field_write(field_name, value)?;
 
-    let entry_id = entry_path.resolve_entry(working)?;
+    let entry_id = target.resolve(working)?;
 
     // Decide the protection state before taking the mutable borrow: when the
     // caller did not force it, read the current field's state (false when the
     // field is new).
+    let current = working
+        .entry(entry_id)
+        .and_then(|er| er.fields.get(field_name).cloned());
     let resolved_protected = match protected {
         Some(b) => b,
-        None => working
-            .entry(entry_id)
-            .and_then(|er| er.fields.get(field_name).map(|v| v.is_protected()))
-            .unwrap_or(false),
+        None => current.as_ref().map(|v| v.is_protected()).unwrap_or(false),
+    };
+    let new_value = if resolved_protected {
+        Value::protected(value.to_string())
+    } else {
+        Value::unprotected(value.to_string())
     };
 
-    let name = field_name.to_string();
-    let value_owned = value.to_string();
+    // Setting a field to exactly what it already holds changes nothing: skip
+    // it, so it neither snapshots history nor makes the stage dirty.
+    if current.as_ref() == Some(&new_value) {
+        return Ok(entry_id);
+    }
 
+    let name = field_name.to_string();
     let mut entry_mut = working.entry_mut(entry_id).ok_or_else(|| {
         CoreError::new(ErrorCode::EntryNotFound)
             .with_message("entry disappeared between resolve and write")
-            .with_details(serde_json::json!({ "path": entry_path.format() }))
+            .with_details(serde_json::json!({ "uuid": entry_id.uuid().to_string() }))
     })?;
 
-    entry_mut.edit(|e| {
-        let v = if resolved_protected {
-            Value::protected(value_owned)
-        } else {
-            Value::unprotected(value_owned)
-        };
-        e.set(name, v);
-    });
+    // edit_tracking snapshots the pre-edit entry into its history when the
+    // tracker drops, and EntryTrack::set bumps LastModificationTime, matching
+    // what KeePass and KeePassXC do on an edit. (Plain `edit` did neither, so
+    // the old value was lost from history on save.)
+    entry_mut.edit_tracking(|e| e.set(name, new_value));
 
-    Ok(())
+    maintain_history(working, entry_id);
+
+    Ok(entry_id)
+}
+
+/// KeePass's default `HistoryMaxItems` when the vault does not set one.
+const DEFAULT_HISTORY_MAX_ITEMS: isize = 10;
+
+/// KeePass's default `HistoryMaxSize` (6 MiB) when the vault does not set one.
+const DEFAULT_HISTORY_MAX_SIZE: isize = 6 * 1024 * 1024;
+
+/// Restore KeePass history order and limits after a tracked edit.
+///
+/// Order: KeePass stores history oldest first (it appends each backup), and
+/// keepass 0.12 keeps the file order when it parses and writes. But its
+/// `History::add_entry`, which `edit_tracking` calls, inserts the new snapshot
+/// at index 0. Left alone, a loaded entry's history becomes newest, then
+/// oldest to second-newest, and the newest backup is written first. Since
+/// every tracked edit here goes through this function, the list is oldest
+/// first before the edit, so moving index 0 to the end restores the order.
+///
+/// Limits: keepass 0.12 never applies `Meta::history_max_items` or
+/// `history_max_size`, so history grew by a full snapshot per edit. This
+/// applies KeePass's `PwEntry.MaintainBackups`: while there are more than
+/// `max_items` backups, remove the oldest; then while their total size is over
+/// `max_size`, remove the oldest. A negative limit means unlimited; an unset
+/// one takes KeePass's default (10 items, 6 MiB). "Oldest" is the smallest
+/// LastModificationTime, the first such on a tie (KeePass's
+/// `RemoveOldestBackup`). The size of a backup is the bytes of its field names
+/// and values plus its attachments, an approximation of KeePass's
+/// `PwEntry.GetSize`.
+///
+/// keepass 0.12 exposes no way to edit a history list in place, so the kept
+/// snapshots are re-added newest-to-oldest through `add_entry` (each insert at
+/// index 0), which leaves them oldest first. Attachments that only a removed
+/// backup used stay in the database's binary pool, as with any keepass 0.12
+/// edit; KeePass drops unreferenced binaries when it next saves.
+fn maintain_history(working: &mut Database, entry_id: EntryId) {
+    let max_items = working
+        .meta
+        .history_max_items
+        .unwrap_or(DEFAULT_HISTORY_MAX_ITEMS);
+    let max_size = working
+        .meta
+        .history_max_size
+        .unwrap_or(DEFAULT_HISTORY_MAX_SIZE);
+
+    let Some(entry) = working.entry(entry_id) else {
+        return;
+    };
+    let Some(history) = entry.history.as_ref() else {
+        return;
+    };
+    // (snapshot, size), in stored order: newest first, then oldest first.
+    let mut backups: Vec<(keepass::db::Entry, usize)> = history
+        .get_entries()
+        .iter()
+        .enumerate()
+        .map(|(i, snapshot)| {
+            let attachment_bytes: usize = entry
+                .historical(i)
+                .map(|h| h.attachments_named().map(|(_, a)| a.get().len()).sum())
+                .unwrap_or(0);
+            let field_bytes: usize = snapshot
+                .fields
+                .iter()
+                .map(|(name, value)| name.len() + value.get().len())
+                .sum();
+            (snapshot.clone(), field_bytes + attachment_bytes)
+        })
+        .collect();
+    if !backups.is_empty() {
+        backups.rotate_left(1);
+    }
+
+    let remove_oldest = |backups: &mut Vec<(keepass::db::Entry, usize)>| {
+        let oldest = backups
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, (snapshot, _))| (snapshot.times.last_modification, *i))
+            .map(|(i, _)| i);
+        if let Some(i) = oldest {
+            backups.remove(i);
+        }
+    };
+    if let Ok(max) = usize::try_from(max_items) {
+        while backups.len() > max {
+            remove_oldest(&mut backups);
+        }
+    }
+    if let Ok(max) = usize::try_from(max_size) {
+        while backups.iter().map(|(_, size)| size).sum::<usize>() > max {
+            remove_oldest(&mut backups);
+        }
+    }
+
+    let mut rebuilt = keepass::db::History::default();
+    for (snapshot, _) in backups.into_iter().rev() {
+        rebuilt.add_entry(snapshot);
+    }
+    if let Some(mut entry) = working.entry_mut(entry_id) {
+        entry.history = Some(rebuilt);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,16 +565,18 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
         }
     }
 
-    // Stable order: sort each list by (group_path, title). For modified entries
-    // we have the full path but not a separate group_path field, so we derive
-    // the group path from the entry's path via VaultPath::parent.
+    // Stable order: sort each list by (group_path, title), with the uuid as a
+    // final tie-break so same-titled siblings order deterministically. Modified
+    // entries carry no group_path field, so derive it from the working db.
     added.sort_by(|a, b| {
-        (a.group_path.as_str(), a.title.as_str()).cmp(&(b.group_path.as_str(), b.title.as_str()))
+        (&a.group_path, &a.title, &a.uuid).cmp(&(&b.group_path, &b.title, &b.uuid))
     });
-    modified.sort_by(|a, b| {
-        let ga = group_path_of(&a.path);
-        let gb = group_path_of(&b.path);
-        (ga.as_str(), a.title.as_str()).cmp(&(gb.as_str(), b.title.as_str()))
+    modified.sort_by_cached_key(|m| {
+        (
+            group_path_of(working, &m.uuid),
+            m.title.clone(),
+            m.uuid.clone(),
+        )
     });
 
     let num_added = added.len();
@@ -386,14 +593,20 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
     }
 }
 
-/// The containing group path of a formatted entry path, used as a sort key.
-/// Falls back to the path itself when it does not parse (which should not
-/// happen for paths we built with `vault_path_to_entry`).
-fn group_path_of(entry_path: &str) -> String {
-    match VaultPath::parse(entry_path) {
-        Ok(p) => p.parent().format(),
-        Err(_) => entry_path.to_string(),
-    }
+/// The vault path of the group holding the entry whose hyphenated UUID is
+/// `uuid`, used as a sort key. `None` when the entry is gone or its group has
+/// no addressable path.
+fn group_path_of(working: &Database, uuid: &str) -> Option<String> {
+    let entry = working
+        .iter_all_entries()
+        .find(|e| e.id().uuid().hyphenated().to_string() == uuid)?;
+    containing_group_path(working, &entry)
+}
+
+/// The vault path of the group that holds `entry`, or `None` when that group
+/// has no addressable path.
+fn containing_group_path(working: &Database, entry: &keepass::db::EntryRef<'_>) -> Option<String> {
+    vault_path_to_group(working, entry.parent().id()).map(|p| p.format())
 }
 
 /// Build an [`AddedEntry`] by looking up `uuid` in the working db.
@@ -401,32 +614,19 @@ fn map_added_entry(working: &Database, uuid: uuid::Uuid) -> Option<AddedEntry> {
     let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
     let eid = entry_ref.id();
 
-    // Build the path once; derive the group path from its parent. The entry was
-    // just found in `working`, so this resolves; "/" is a defensive fallback.
-    let vpath = vault_path_to_entry(working, eid);
-    let path = vpath
-        .as_ref()
-        .map(|p| p.format())
-        .unwrap_or_else(|| "/".to_string());
-    let group_path = vpath
-        .as_ref()
-        .map(|p| p.parent().format())
-        .unwrap_or_else(|| "/".to_string());
+    // Both paths are None for a record with no addressable path. There is no
+    // fallback string: a placeholder like "/" would alias the root group.
+    let path = vault_path_to_entry(working, eid).map(|p| p.format());
+    let group_path = containing_group_path(working, &entry_ref);
 
     let title = entry_ref.get_title().unwrap_or("").to_string();
     let field_count = entry_ref.fields.len();
     let has_attachments = entry_ref.attachments_named().next().is_some();
     // Route has_otp through the same resolver the read views use
     // (src/adapter/views.rs), so kdbx_diff_pending and kdbx_list_entries agree on
-    // whether an entry has a usable TOTP source. This covers the modern `otp`
-    // field and the legacy "TOTP Seed" + "TOTP Settings" pair, not just a bare
-    // `otp` presence check.
-    let has_otp = crate::kdbx_core::totp::resolve_config(
-        entry_ref.get(fields::OTP),
-        entry_ref.get("TOTP Seed"),
-        entry_ref.get("TOTP Settings"),
-    )
-    .is_some();
+    // whether an entry has a usable TOTP source (every source the resolver
+    // knows, not just a bare `otp` presence check).
+    let has_otp = crate::kdbx_core::totp::resolve_for_entry(&entry_ref).is_some();
 
     Some(AddedEntry {
         path,
@@ -449,9 +649,7 @@ fn map_modified_entry(
     let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
     let eid = entry_ref.id();
 
-    let path = vault_path_to_entry(working, eid)
-        .map(|p| p.format())
-        .unwrap_or_else(|| "/".to_string());
+    let path = vault_path_to_entry(working, eid).map(|p| p.format());
     let title = entry_ref.get_title().unwrap_or("").to_string();
 
     let mut field_out: Vec<FieldChangeOut> = Vec::new();
@@ -578,51 +776,36 @@ fn plain_to_json(v: &ValueDisplay) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// Atomically save the working db to the vault file (spec section 3, "Save
-/// atomicity").
+/// atomicity", as amended by the 2026-10-18 implementation notes).
 ///
-/// Steps: refuse when nothing is pending; refuse when the file changed on disk
-/// since unlock (mtime conflict, more than one second of slack); serialize the
-/// working db in memory; write to a temp file in the same directory and fsync
-/// it; rename it over the vault file; best-effort fsync the parent directory;
-/// re-stat for the new mtime; adopt the working db as the new canonical
-/// baseline. On a serialize or write failure the stage is preserved and no
-/// vault state changes.
+/// Steps:
+/// 1. Refuse when nothing is pending (`NO_PENDING_CHANGES`).
+/// 2. Serialize (and encrypt) the working db in memory. The KDF runs here,
+///    before the writer lock is taken, so the lock is held only for I/O.
+/// 3. Resolve symlinks (a linked vault stays linked; see
+///    [`resolve_write_target`]) and take the sidecar writer lock
+///    ([`WriterLock`]) next to the real file so another mcp-kdbx
+///    instance cannot interleave between the check and the rename.
+/// 4. Re-read the vault file and compare its content hash with the baseline
+///    recorded at unlock (or at the last save). Any difference, whatever the
+///    mtimes say, is `VAULT_FILE_MODIFIED` with the real pending-change count.
+///    A vault file that can no longer be read is `WRITE_FAILED`.
+/// 5. Write atomically (temp, fsync, rename, fsync dir) and adopt the working
+///    db as the new canonical baseline, with the fingerprint of the bytes just
+///    written.
+///
+/// On any failure the stage is preserved and no vault state changes.
 pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
     if !vault.has_pending_changes() {
         return Err(ErrorCode::NoPendingChanges.into());
     }
 
     let path = vault.path().to_path_buf();
-    let mtime_at_unlock = vault.mtime_at_unlock()?;
-
-    // mtime conflict check. A file modified more than one second after the
-    // mtime we captured at unlock means something else wrote it (KeePassXC,
-    // another mcp-kdbx). One second of slack absorbs filesystem timestamp
-    // coarseness.
-    let mtime_now = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .map_err(|e| {
-            CoreError::new(ErrorCode::WriteFailed)
-                .with_message(format!("could not stat vault file: {e}"))
-        })?;
-    if exceeds_slack(mtime_at_unlock, mtime_now) {
-        let pending = if vault.has_pending_changes() { 1 } else { 0 };
-        return Err(
-            CoreError::new(ErrorCode::VaultFileModified).with_details(serde_json::json!({
-                "file_mtime_at_unlock": to_rfc3339(mtime_at_unlock),
-                "file_mtime_now": to_rfc3339(mtime_now),
-                "pending_changes": pending,
-            })),
-        );
-    }
+    let baseline = vault.file_baseline()?;
 
     // Count the changes before we adopt working as canonical (after mark_saved
     // the two dbs are equal and the count would be zero).
-    let num_changes = {
-        let (canonical, working) = vault.canonical_and_working()?;
-        let d = diff_pending(canonical, working);
-        d.summary.num_added + d.summary.num_modified + d.summary.num_removed
-    };
+    let num_changes = vault.pending_count();
 
     // Serialize the working db to encrypted bytes in memory.
     let bytes = {
@@ -631,16 +814,37 @@ pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
         working.save(&mut buf, key.clone()).map_err(|e| {
             CoreError::new(ErrorCode::WriteFailed)
                 .with_message(format!("serializing the vault failed: {e}"))
+                .with_details(serde_json::json!({ "step": SaveStep::Serialize }))
         })?;
         buf
     };
 
-    // Write to a temp file in the same directory, fsync, rename, fsync dir.
-    let new_mtime = write_atomically(&path, &bytes)?;
+    // Resolve symlinks so the rename replaces the real file, not the link.
+    let target = resolve_write_target(&path)?;
 
-    vault.mark_saved(new_mtime)?;
+    let lock = WriterLock::acquire(&target, WRITER_LOCK_WAIT)?;
+
+    let (_, current) = read_with_fingerprint(&target).map_err(|e| {
+        CoreError::new(ErrorCode::WriteFailed)
+            .with_message(format!("could not re-read the vault file: {e}"))
+            .with_details(serde_json::json!({ "step": SaveStep::Reread }))
+    })?;
+    if !current.same_content(&baseline) {
+        return Err(
+            CoreError::new(ErrorCode::VaultFileModified).with_details(serde_json::json!({
+                "file_mtime_at_unlock": to_rfc3339(baseline.mtime()),
+                "file_mtime_now": to_rfc3339(current.mtime()),
+                "pending_changes": num_changes,
+            })),
+        );
+    }
+
+    let written = write_atomically(&target, &bytes)?;
+
+    vault.mark_saved(written)?;
 
     Ok(SaveOutcome {
+        writer_lock_unavailable: lock.unavailable(),
         saved: true,
         num_changes,
         vault_path: absolute_path_string(&path),
@@ -652,130 +856,6 @@ pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
 /// pending count.
 pub fn discard_pending(vault: &mut Vault) -> CoreResult<usize> {
     vault.discard_working()
-}
-
-/// True when `now` is more than one second later than `at_unlock`. A `now` at
-/// or before `at_unlock` (clock went backward, or no external write) is not a
-/// conflict.
-fn exceeds_slack(at_unlock: SystemTime, now: SystemTime) -> bool {
-    match now.duration_since(at_unlock) {
-        Ok(delta) => delta > std::time::Duration::from_secs(1),
-        Err(_) => false,
-    }
-}
-
-/// Write `bytes` to `path` atomically: a uniquely-named temp file in the same
-/// directory, `write_all`, fsync the file, rename it over `path`, then a
-/// best-effort fsync of the parent directory. Returns the freshly written
-/// file's mtime. On any pre-rename failure the temp file is unlinked and
-/// `WRITE_FAILED` is returned, so the vault is untouched.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> CoreResult<SystemTime> {
-    use std::io::Write;
-
-    let parent = path.parent().ok_or_else(|| {
-        CoreError::new(ErrorCode::WriteFailed).with_message("vault path has no parent directory")
-    })?;
-
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "vault.kdbx".to_string());
-
-    let temp_path = parent.join(format!(
-        "{}.tmp.{}.{}",
-        file_name,
-        std::process::id(),
-        temp_suffix()
-    ));
-
-    // Open and write the temp file. The open uses create_new (O_EXCL), so it
-    // refuses to clobber a pre-existing temp file: if the name already exists,
-    // another save raced us and we surface WRITE_FAILED rather than overwrite a
-    // file that may be in use. Any failure here unlinks the temp and surfaces
-    // WRITE_FAILED; the vault file is untouched. (On a create_new failure the
-    // name was not ours to begin with, so the remove below is a harmless no-op
-    // most of the time, and the surrounding error path is unchanged.)
-    let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::options()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(CoreError::new(ErrorCode::WriteFailed)
-            .with_message(format!("writing the temp file failed: {e}")));
-    }
-
-    // Preserve the user's file hardening across the rename. create_new opens the
-    // temp with the umask-default mode (typically 0644), which would silently
-    // downgrade a vault the user chmod'ed 0600. Copy the existing vault file's
-    // mode onto the temp before the rename when the vault file exists; for a
-    // brand-new vault (no existing file) fall back to 0600. A failure to read or
-    // set the mode is non-fatal: the save proceeds with the temp's default mode
-    // rather than refusing to write.
-    preserve_temp_permissions(path, &temp_path);
-
-    // Atomic rename over the vault file.
-    if let Err(e) = std::fs::rename(&temp_path, path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(CoreError::new(ErrorCode::WriteFailed)
-            .with_message(format!("renaming the temp file over the vault failed: {e}")));
-    }
-
-    // Best-effort parent-directory fsync for POSIX durability. The rename has
-    // already happened, so a failure here does not corrupt anything: log-and-
-    // ignore rather than fail the save and leave the caller thinking it did not
-    // write.
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
-
-    // Re-stat for the new mtime. If the metadata read fails (unlikely right
-    // after a successful write), fall back to now: the save did succeed.
-    let new_mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or_else(|_| SystemTime::now());
-
-    Ok(new_mtime)
-}
-
-/// Copy the existing vault file's permission bits onto the temp file so the
-/// atomic rename preserves the user's hardening. When the vault file does not
-/// yet exist (a first save), fall back to 0600 so a new vault is owner-only
-/// rather than world-readable. POSIX-only: it uses the Unix permission model
-/// directly. Any error reading or setting permissions is swallowed: the save is
-/// more important than the mode tweak, and the temp keeps its default mode.
-#[cfg(unix)]
-fn preserve_temp_permissions(vault_path: &std::path::Path, temp_path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let perms = match std::fs::metadata(vault_path) {
-        Ok(meta) => meta.permissions(),
-        // No existing vault file (first save): default to owner-only 0600.
-        Err(_) => std::fs::Permissions::from_mode(0o600),
-    };
-    let _ = std::fs::set_permissions(temp_path, perms);
-}
-
-/// Non-Unix fallback: there is no portable POSIX permission model to copy, so
-/// leave the temp file's default permissions in place.
-#[cfg(not(unix))]
-fn preserve_temp_permissions(_vault_path: &std::path::Path, _temp_path: &std::path::Path) {}
-
-/// A per-call suffix for the temp file name. There is no `rand` crate in the
-/// dependency set, so derive a value from the current time's nanos. Combined
-/// with the pid in the file name, this is unique enough to avoid collisions
-/// between concurrent saves; the temp file is short-lived and gets renamed away
-/// immediately.
-fn temp_suffix() -> u128 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
 }
 
 /// Format a `SystemTime` as an RFC3339 / ISO 8601 UTC string via chrono.
@@ -795,6 +875,7 @@ fn absolute_path_string(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kdbx_core::path::VaultPath;
     use crate::kdbx_core::vault::Vault;
     use keepass::{Database, DatabaseKey};
     use std::io::Write;
@@ -823,12 +904,20 @@ mod tests {
         VaultPath::parse(s).expect("parse path")
     }
 
+    fn addr(s: &str) -> EntryAddress {
+        EntryAddress::Path(path(s))
+    }
+
+    fn gaddr(s: &str) -> GroupAddress {
+        GroupAddress::Path(path(s))
+    }
+
     fn simple_input(title: &str) -> EntryInput {
         EntryInput {
             title: title.to_string(),
             fields: vec![FieldInput {
                 name: "UserName".to_string(),
-                value: "alice".to_string(),
+                value: "alice".to_string().into(),
                 protected: false,
             }],
             attachments: Vec::new(),
@@ -860,8 +949,8 @@ mod tests {
     #[test]
     fn add_entry_into_root_is_findable() {
         let mut db = build_db();
-        let id =
-            add_entry(&mut db, &path("/"), &simple_input("New Root Entry")).expect("add into root");
+        let id = add_entry(&mut db, &gaddr("/"), &simple_input("New Root Entry"))
+            .expect("add into root");
         let entry = db.entry(id).expect("entry exists");
         assert_eq!(entry.get_title(), Some("New Root Entry"));
         assert_eq!(entry.get("UserName"), Some("alice"));
@@ -874,7 +963,7 @@ mod tests {
     fn add_entry_into_nested_group() {
         let mut db = build_db();
         let id =
-            add_entry(&mut db, &path("/Web/"), &simple_input("Nested")).expect("add into /Web");
+            add_entry(&mut db, &gaddr("/Web/"), &simple_input("Nested")).expect("add into /Web");
         let resolved = path("/Web/Nested").resolve_entry(&db).expect("resolve");
         assert_eq!(resolved, id);
     }
@@ -886,12 +975,12 @@ mod tests {
             title: "Has Secret".to_string(),
             fields: vec![FieldInput {
                 name: "Password".to_string(),
-                value: "s3cret".to_string(),
+                value: "s3cret".to_string().into(),
                 protected: true,
             }],
             attachments: Vec::new(),
         };
-        let id = add_entry(&mut db, &path("/"), &input).expect("add");
+        let id = add_entry(&mut db, &gaddr("/"), &input).expect("add");
         let entry = db.entry(id).expect("entry");
         let pw = entry.fields.get("Password").expect("password field");
         assert!(pw.is_protected(), "Password should be protected");
@@ -906,10 +995,10 @@ mod tests {
             fields: Vec::new(),
             attachments: vec![AttachmentInput {
                 name: "note.txt".to_string(),
-                bytes: b"hello".to_vec(),
+                bytes: b"hello".to_vec().into(),
             }],
         };
-        let id = add_entry(&mut db, &path("/"), &input).expect("add with attachment");
+        let id = add_entry(&mut db, &gaddr("/"), &input).expect("add with attachment");
         let entry = db.entry(id).expect("entry");
         assert!(
             entry.attachments_named().any(|(n, _)| n == "note.txt"),
@@ -920,23 +1009,144 @@ mod tests {
     #[test]
     fn add_entry_bad_group_is_group_not_found() {
         let mut db = build_db();
-        let err = add_entry(&mut db, &path("/Nope/"), &simple_input("X")).expect_err("bad group");
+        let err = add_entry(&mut db, &gaddr("/Nope/"), &simple_input("X")).expect_err("bad group");
         assert_eq!(err.code_enum(), ErrorCode::GroupNotFound);
     }
 
     #[test]
     fn add_entry_empty_title_is_invalid() {
         let mut db = build_db();
-        let err = add_entry(&mut db, &path("/"), &simple_input("")).expect_err("empty title");
+        let err = add_entry(&mut db, &gaddr("/"), &simple_input("")).expect_err("empty title");
         assert_eq!(err.code_enum(), ErrorCode::EntryTitleInvalid);
     }
 
     #[test]
     fn add_entry_control_char_title_is_invalid() {
         let mut db = build_db();
-        let err = add_entry(&mut db, &path("/"), &simple_input("bad\u{0007}title"))
+        let err = add_entry(&mut db, &gaddr("/"), &simple_input("bad\u{0007}title"))
             .expect_err("control char title");
         assert_eq!(err.code_enum(), ErrorCode::EntryTitleInvalid);
+    }
+
+    #[test]
+    fn script_joiners_are_accepted() {
+        // ZWNJ and ZWJ are format characters (Cf) that real text needs:
+        // Persian, Hindi, and Malayalam spelling, and emoji sequences.
+        for good in [
+            "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}", // Persian, with ZWNJ
+            "\u{915}\u{94d}\u{200d}\u{937}",                             // Devanagari, with ZWJ
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} family",
+        ] {
+            validate_title(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            validate_field_name(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn every_other_format_character_is_rejected() {
+        // Everything in Cf outside the ZWNJ/ZWJ allow-list: tag characters, the
+        // word joiner and invisible operators, deprecated format controls, the
+        // Mongolian vowel separator, interlinear annotation, and the soft hyphen.
+        for c in [
+            '\u{E0041}',
+            '\u{E0001}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{180E}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{AD}',
+        ] {
+            let title = format!("Git{c}Hub");
+            assert_eq!(
+                validate_title(&title).map_err(|e| e.code_enum()),
+                Err(ErrorCode::EntryTitleInvalid),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn every_bidi_control_is_rejected() {
+        // Unicode's Bidi_Control set, each one individually.
+        let bidi = ['\u{61c}', '\u{200e}', '\u{200f}']
+            .into_iter()
+            .chain('\u{202a}'..='\u{202e}')
+            .chain('\u{2066}'..='\u{2069}');
+        for c in bidi {
+            let title = format!("Git{c}Hub");
+            let err = validate_title(&title).expect_err(&format!("U+{:04X}", c as u32));
+            assert_eq!(err.code_enum(), ErrorCode::EntryTitleInvalid);
+            assert_eq!(
+                err.details().unwrap()["code_point"],
+                serde_json::json!(format!("U+{:04X}", c as u32))
+            );
+        }
+    }
+
+    #[test]
+    fn titles_and_field_names_reject_unicode_control_and_format_chars() {
+        // Cc beyond ASCII (DEL, a C1 control) and spoofing format characters
+        // (a bidi override, an isolate, a zero-width space, a byte-order mark)
+        // are invisible or reorder text,
+        // so a title that looks like "GitHub" could name something else.
+        for bad in [
+            "Git\u{7f}Hub",
+            "Git\u{85}Hub",
+            "\u{202e}buHtiG",
+            "Git\u{200b}Hub",
+            "\u{feff}GitHub",
+            "\u{2067}x",
+        ] {
+            assert_eq!(
+                validate_title(bad).unwrap_err().code_enum(),
+                ErrorCode::EntryTitleInvalid,
+                "title {bad:?}"
+            );
+            assert_eq!(
+                validate_field_name(bad).unwrap_err().code_enum(),
+                ErrorCode::FieldNameInvalid,
+                "field name {bad:?}"
+            );
+        }
+        // Visible Unicode, including combining marks and spaces, stays valid.
+        for good in ["Caf\u{e9}", "Cafe\u{301}", "日本語 ☕", "a/b"] {
+            validate_title(good).expect(good);
+        }
+    }
+
+    #[test]
+    fn add_entry_refuses_a_title_in_the_fields_map() {
+        // The fields map must not be a second, unvalidated way to set Title.
+        let mut db = build_db();
+        let input = EntryInput {
+            title: "Valid".to_string(),
+            fields: vec![FieldInput {
+                name: fields::TITLE.to_string(),
+                value: String::new().into(),
+                protected: false,
+            }],
+            attachments: Vec::new(),
+        };
+        let err = add_entry(&mut db, &gaddr("/"), &input).expect_err("Title in fields");
+        assert_eq!(err.code_enum(), ErrorCode::FieldNameInvalid);
+        assert!(path("/Valid").resolve_entry(&db).is_err(), "nothing staged");
+    }
+
+    #[test]
+    fn update_field_on_title_is_validated_as_a_title() {
+        let mut db = build_db();
+        for bad in ["", "Git\u{7}Hub", "\u{202e}x"] {
+            let err = update_field(&mut db, &addr("/Existing"), fields::TITLE, bad, None)
+                .expect_err("invalid title via update_field");
+            assert_eq!(err.code_enum(), ErrorCode::EntryTitleInvalid, "{bad:?}");
+        }
+        // A valid rename works and the entry is reachable at its new path.
+        update_field(&mut db, &addr("/Existing"), fields::TITLE, "Renamed", None).unwrap();
+        assert!(path("/Renamed").resolve_entry(&db).is_ok());
     }
 
     #[test]
@@ -946,12 +1156,12 @@ mod tests {
             title: "T".to_string(),
             fields: vec![FieldInput {
                 name: "".to_string(),
-                value: "v".to_string(),
+                value: "v".to_string().into(),
                 protected: false,
             }],
             attachments: Vec::new(),
         };
-        let err = add_entry(&mut db, &path("/"), &input).expect_err("empty field name");
+        let err = add_entry(&mut db, &gaddr("/"), &input).expect_err("empty field name");
         assert_eq!(err.code_enum(), ErrorCode::FieldNameInvalid);
     }
 
@@ -962,12 +1172,12 @@ mod tests {
             title: "T".to_string(),
             fields: vec![FieldInput {
                 name: " Leading".to_string(),
-                value: "v".to_string(),
+                value: "v".to_string().into(),
                 protected: false,
             }],
             attachments: Vec::new(),
         };
-        let err = add_entry(&mut db, &path("/"), &input).expect_err("leading space");
+        let err = add_entry(&mut db, &gaddr("/"), &input).expect_err("leading space");
         assert_eq!(err.code_enum(), ErrorCode::FieldNameInvalid);
     }
 
@@ -978,7 +1188,7 @@ mod tests {
         let mut db = build_db();
         update_field(
             &mut db,
-            &path("/Existing"),
+            &addr("/Existing"),
             "URL",
             "https://new.example.com",
             None,
@@ -994,7 +1204,7 @@ mod tests {
         let mut db = build_db();
         // Password starts protected; update with protected: None must keep it
         // protected.
-        update_field(&mut db, &path("/Existing"), "Password", "new-secret", None)
+        update_field(&mut db, &addr("/Existing"), "Password", "new-secret", None)
             .expect("update password");
         let id = path("/Existing").resolve_entry(&db).expect("resolve");
         let entry = db.entry(id).expect("entry");
@@ -1005,7 +1215,7 @@ mod tests {
         // URL starts unprotected; None keeps it unprotected.
         update_field(
             &mut db,
-            &path("/Existing"),
+            &addr("/Existing"),
             "URL",
             "https://x.example.com",
             None,
@@ -1019,7 +1229,7 @@ mod tests {
     #[test]
     fn update_field_some_true_forces_protection() {
         let mut db = build_db();
-        update_field(&mut db, &path("/Existing"), "URL", "secret-url", Some(true))
+        update_field(&mut db, &addr("/Existing"), "URL", "secret-url", Some(true))
             .expect("force protect");
         let id = path("/Existing").resolve_entry(&db).expect("resolve");
         let url = db
@@ -1035,15 +1245,175 @@ mod tests {
     #[test]
     fn update_field_empty_value_clears() {
         let mut db = build_db();
-        update_field(&mut db, &path("/Existing"), "URL", "", None).expect("clear");
+        update_field(&mut db, &addr("/Existing"), "URL", "", None).expect("clear");
         let id = path("/Existing").resolve_entry(&db).expect("resolve");
         assert_eq!(db.entry(id).unwrap().get("URL"), Some(""));
+    }
+
+    /// Backdate every timestamp of the entry at `p` so a modification made
+    /// now is visible at KDBX's one-second precision.
+    fn backdate(db: &mut Database, p: &str) {
+        let id = path(p).resolve_entry(db).unwrap();
+        let old = chrono::DateTime::from_timestamp(1_600_000_000, 0)
+            .unwrap()
+            .naive_utc();
+        let mut e = db.entry_mut(id).unwrap();
+        e.times.creation = Some(old);
+        e.times.last_modification = Some(old);
+    }
+
+    #[test]
+    fn update_field_snapshots_history_and_bumps_modification_time() {
+        let mut db = build_db();
+        backdate(&mut db, "/Existing");
+        let id = path("/Existing").resolve_entry(&db).unwrap();
+        let (created, modified) = {
+            let e = db.entry(id).unwrap();
+            assert!(e.history.is_none() || e.history.as_ref().unwrap().get_entries().is_empty());
+            (e.times.creation, e.times.last_modification)
+        };
+
+        update_field(&mut db, &addr("/Existing"), "Password", "new-secret", None).unwrap();
+
+        let e = db.entry(id).unwrap();
+        let history = e.history.as_ref().expect("history recorded");
+        assert_eq!(history.get_entries().len(), 1, "one snapshot per edit");
+        // The snapshot holds the pre-edit value, as KeePass does.
+        assert_eq!(
+            history.get_entries()[0].get(fields::PASSWORD),
+            Some("old-secret")
+        );
+        assert!(
+            e.times.last_modification > modified,
+            "modification time bumped"
+        );
+        assert_eq!(e.times.creation, created, "creation time untouched");
+    }
+
+    /// The URL values held by the history snapshots of the entry at `p`, in
+    /// stored order.
+    fn history_urls(db: &Database, p: &str) -> Vec<String> {
+        let id = path(p).resolve_entry(db).unwrap();
+        db.entry(id)
+            .unwrap()
+            .history
+            .as_ref()
+            .map(|h| {
+                h.get_entries()
+                    .iter()
+                    .map(|e| e.get(fields::URL).unwrap_or("").to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Set URL to v1..=vN in turn. The snapshots then hold the pre-edit
+    /// values: the original URL, then v1..v(N-1).
+    fn edit_url_n_times(db: &mut Database, n: usize) {
+        for i in 1..=n {
+            update_field(db, &addr("/Existing"), fields::URL, &format!("v{i}"), None).unwrap();
+        }
+    }
+
+    #[test]
+    fn history_is_stored_oldest_first_and_trimmed_to_ten_by_default() {
+        // KeePass stores history oldest first and, by default, keeps 10
+        // items. keepass 0.12 inserts each new snapshot at index 0 and never
+        // trims, so the entry would grow without bound in mixed order.
+        let mut db = build_db();
+        edit_url_n_times(&mut db, 12);
+        let urls = history_urls(&db, "/Existing");
+        let expected: Vec<String> = (2..=11).map(|i| format!("v{i}")).collect();
+        assert_eq!(urls, expected, "the 10 newest snapshots, oldest first");
+    }
+
+    #[test]
+    fn history_order_survives_save_and_a_further_edit_after_reopen() {
+        // Saved oldest first, reopened in file order, and a further edit on the
+        // reopened entry appends its snapshot at the end.
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        edit_url_n_times(vault.working_db_mut().unwrap(), 3);
+        save_pending(&mut vault).unwrap();
+        let path_on_disk = vault.path().to_path_buf();
+        drop(vault);
+
+        let mut reopened = Vault::new(path_on_disk);
+        reopened.unlock(TEST_PASSWORD, None).unwrap();
+        let working = reopened.working_db_mut().unwrap();
+        assert_eq!(
+            history_urls(working, "/Existing"),
+            ["https://old.example.com", "v1", "v2"]
+        );
+        update_field(working, &addr("/Existing"), fields::URL, "v4", None).unwrap();
+        assert_eq!(
+            history_urls(working, "/Existing"),
+            ["https://old.example.com", "v1", "v2", "v3"]
+        );
+    }
+
+    #[test]
+    fn history_honors_the_vault_max_items_and_negative_means_unlimited() {
+        let mut db = build_db();
+        db.meta.history_max_items = Some(3);
+        edit_url_n_times(&mut db, 6);
+        assert_eq!(history_urls(&db, "/Existing"), ["v3", "v4", "v5"]);
+
+        let mut db = build_db();
+        db.meta.history_max_items = Some(-1);
+        edit_url_n_times(&mut db, 12);
+        assert_eq!(history_urls(&db, "/Existing").len(), 12);
+    }
+
+    #[test]
+    fn history_honors_the_vault_max_size_dropping_the_oldest() {
+        // Each snapshot carries a ~1000-byte URL, so a 2500-byte budget keeps
+        // the newest two.
+        let mut db = build_db();
+        db.meta.history_max_size = Some(2500);
+        let big = |c: char| c.to_string().repeat(1000);
+        for c in ['a', 'b', 'c', 'd'] {
+            update_field(&mut db, &addr("/Existing"), fields::URL, &big(c), None).unwrap();
+        }
+        assert_eq!(history_urls(&db, "/Existing"), [big('b'), big('c')]);
+    }
+
+    #[test]
+    fn update_field_with_identical_value_is_a_no_op() {
+        // Re-setting the same value and protection must not grow history or
+        // make the stage dirty.
+        let canonical = build_db();
+        let mut working = canonical.clone();
+        update_field(
+            &mut working,
+            &addr("/Existing"),
+            "URL",
+            "https://old.example.com",
+            None,
+        )
+        .unwrap();
+        assert_eq!(working, canonical);
+    }
+
+    #[test]
+    fn add_entry_sets_creation_and_modification_times_without_history() {
+        let mut db = build_db();
+        let id = add_entry(&mut db, &gaddr("/"), &simple_input("Timed")).unwrap();
+        let e = db.entry(id).unwrap();
+        assert!(e.times.creation.is_some());
+        assert!(e.times.last_modification.is_some());
+        assert!(
+            e.history
+                .as_ref()
+                .is_none_or(|h| h.get_entries().is_empty()),
+            "a brand-new entry has no history snapshot of its blank state"
+        );
     }
 
     #[test]
     fn update_field_bad_path_is_entry_not_found() {
         let mut db = build_db();
-        let err = update_field(&mut db, &path("/Ghost"), "URL", "x", None).expect_err("bad entry");
+        let err = update_field(&mut db, &addr("/Ghost"), "URL", "x", None).expect_err("bad entry");
         assert_eq!(err.code_enum(), ErrorCode::EntryNotFound);
     }
 
@@ -1071,26 +1441,26 @@ mod tests {
             fields: vec![
                 FieldInput {
                     name: "UserName".to_string(),
-                    value: "bob".to_string(),
+                    value: "bob".to_string().into(),
                     protected: false,
                 },
                 FieldInput {
                     name: "URL".to_string(),
-                    value: "https://b.example.com".to_string(),
+                    value: "https://b.example.com".to_string().into(),
                     protected: false,
                 },
             ],
             attachments: Vec::new(),
         };
-        add_entry(&mut working, &path("/Web/"), &input).expect("add");
+        add_entry(&mut working, &gaddr("/Web/"), &input).expect("add");
 
         let d = diff_pending(&canonical, &working);
         assert_eq!(d.summary.num_added, 1);
         assert_eq!(d.added.len(), 1);
         let a = &d.added[0];
         assert_eq!(a.title, "Brand New");
-        assert_eq!(a.path, "/Web/Brand New");
-        assert_eq!(a.group_path, "/Web");
+        assert_eq!(a.path.as_deref(), Some("/Web/Brand New"));
+        assert_eq!(a.group_path.as_deref(), Some("/Web"));
         // Title plus the two fields.
         assert_eq!(a.field_count, 3);
         assert!(!a.has_attachments);
@@ -1103,7 +1473,7 @@ mod tests {
         let mut working = canonical.clone();
         update_field(
             &mut working,
-            &path("/Existing"),
+            &addr("/Existing"),
             "URL",
             "https://new.example.com",
             None,
@@ -1114,7 +1484,7 @@ mod tests {
         assert_eq!(d.summary.num_modified, 1);
         let m = &d.modified[0];
         assert_eq!(m.title, "Existing");
-        assert_eq!(m.path, "/Existing");
+        assert_eq!(m.path.as_deref(), Some("/Existing"));
         // The URL field change must carry before/after, protected false.
         let fc = m
             .field_changes
@@ -1142,7 +1512,7 @@ mod tests {
         let mut working = canonical.clone();
         update_field(
             &mut working,
-            &path("/Existing"),
+            &addr("/Existing"),
             "Password",
             "new-secret",
             None,
@@ -1180,7 +1550,7 @@ mod tests {
         // A NEW protected field "ApiKey" on the existing entry. protected: true.
         update_field(
             &mut working,
-            &path("/Existing"),
+            &addr("/Existing"),
             "ApiKey",
             SECRET_PLAINTEXT,
             Some(true),
@@ -1282,12 +1652,14 @@ mod tests {
             title: "With OTP".to_string(),
             fields: vec![FieldInput {
                 name: fields::OTP.to_string(),
-                value: "otpauth://totp/Example?secret=JBSWY3DPEHPK3PXP".to_string(),
+                value: "otpauth://totp/Example?secret=JBSWY3DPEHPK3PXP"
+                    .to_string()
+                    .into(),
                 protected: true,
             }],
             attachments: Vec::new(),
         };
-        add_entry(&mut working, &path("/"), &input).expect("add otp entry");
+        add_entry(&mut working, &gaddr("/"), &input).expect("add otp entry");
         let d = diff_pending(&canonical, &working);
         let a = d
             .added
@@ -1307,7 +1679,7 @@ mod tests {
         // Stage an add on the working db.
         {
             let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Staged")).expect("stage add");
+            add_entry(working, &gaddr("/"), &simple_input("Staged")).expect("stage add");
         }
         assert!(vault.has_pending_changes());
 
@@ -1327,7 +1699,7 @@ mod tests {
         // Stage a new entry.
         {
             let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Saved Entry")).expect("stage add");
+            add_entry(working, &gaddr("/"), &simple_input("Saved Entry")).expect("stage add");
         }
         assert!(vault.has_pending_changes());
 
@@ -1353,46 +1725,203 @@ mod tests {
         );
     }
 
-    #[test]
-    fn save_pending_refuses_when_file_modified_since_unlock() {
-        use std::time::Duration;
+    /// Replace the vault file's bytes with a different valid vault (as another
+    /// writer would) and stamp it with `mtime`.
+    fn external_rewrite(vault_path: &std::path::Path, mtime: SystemTime) {
+        let mut other = build_db();
+        other
+            .root_mut()
+            .add_entry()
+            .edit(|e| e.set_unprotected(fields::TITLE, "Written Elsewhere"));
+        let mut buf = Vec::new();
+        other
+            .save(&mut buf, DatabaseKey::new().with_password(TEST_PASSWORD))
+            .expect("serialize external vault");
+        std::fs::write(vault_path, &buf).expect("external write");
+        std::fs::File::options()
+            .write(true)
+            .open(vault_path)
+            .expect("open for set_modified")
+            .set_modified(mtime)
+            .expect("set mtime");
+    }
 
+    #[test]
+    fn save_pending_refuses_a_backdated_external_write() {
+        // A restore or sync tool that preserves an older mtime defeated the old
+        // "mtime moved forward by more than 1s" heuristic. Content identity
+        // catches it.
         let db = build_db();
         let (_tmp, mut vault) = unlocked_vault(&db);
         let vault_path = vault.path().to_path_buf();
+        let at_unlock = vault.mtime_at_unlock().expect("unlocked");
+        update_field(
+            vault.working_db_mut().unwrap(),
+            &addr("/Existing"),
+            "URL",
+            "x",
+            None,
+        )
+        .unwrap();
 
-        // Stage a change so has_pending_changes is true.
-        {
-            let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Staged")).expect("stage add");
-        }
-        assert!(vault.has_pending_changes());
+        external_rewrite(&vault_path, at_unlock - std::time::Duration::from_secs(60));
 
-        // Bump the on-disk file's mtime well past the unlock mtime: more than the
-        // one-second slack. set_modified is stable since Rust 1.75 and needs no
-        // new dependency. Ten seconds ahead clears the slack with room to spare.
-        let bumped = SystemTime::now() + Duration::from_secs(10);
-        std::fs::File::open(&vault_path)
-            .expect("open vault file")
-            .set_modified(bumped)
-            .expect("set mtime forward");
-
-        let err = save_pending(&mut vault).expect_err("save must refuse a modified file");
+        let err = save_pending(&mut vault).expect_err("must refuse");
         assert_eq!(err.code_enum(), ErrorCode::VaultFileModified);
-
-        // When details are populated, pending_changes is reported present.
-        if let Some(details) = err.details() {
-            assert!(
-                details.get("pending_changes").is_some(),
-                "details should carry pending_changes: {details:?}"
-            );
-        }
-
-        // The refusal preserves the stage: nothing was committed or dropped.
+        assert!(vault.has_pending_changes(), "stage preserved on refusal");
+        // The external write survives untouched.
+        let on_disk = Database::open(
+            &mut std::fs::File::open(&vault_path).unwrap(),
+            DatabaseKey::new().with_password(TEST_PASSWORD),
+        )
+        .unwrap();
         assert!(
-            vault.has_pending_changes(),
-            "stage preserved after a VAULT_FILE_MODIFIED refusal"
+            on_disk
+                .iter_all_entries()
+                .any(|e| e.get_title() == Some("Written Elsewhere"))
         );
+    }
+
+    #[test]
+    fn save_pending_refuses_an_external_write_within_one_second() {
+        // The old one-second slack let a write landing within it be clobbered.
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        let vault_path = vault.path().to_path_buf();
+        let at_unlock = vault.mtime_at_unlock().expect("unlocked");
+        update_field(
+            vault.working_db_mut().unwrap(),
+            &addr("/Existing"),
+            "URL",
+            "x",
+            None,
+        )
+        .unwrap();
+
+        external_rewrite(
+            &vault_path,
+            at_unlock + std::time::Duration::from_millis(900),
+        );
+
+        let err = save_pending(&mut vault).expect_err("must refuse");
+        assert_eq!(err.code_enum(), ErrorCode::VaultFileModified);
+    }
+
+    #[test]
+    fn save_pending_ignores_an_mtime_only_touch() {
+        // Identity is the content, not the timestamp: a touch that leaves the
+        // bytes unchanged is not a conflict.
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        let vault_path = vault.path().to_path_buf();
+        add_entry(
+            vault.working_db_mut().unwrap(),
+            &gaddr("/"),
+            &simple_input("Staged"),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&vault_path)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(30))
+            .unwrap();
+        save_pending(&mut vault).expect("an mtime-only touch is not a conflict");
+    }
+
+    #[test]
+    fn vault_file_modified_reports_the_real_pending_count() {
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        let vault_path = vault.path().to_path_buf();
+        {
+            let working = vault.working_db_mut().unwrap();
+            add_entry(working, &gaddr("/"), &simple_input("One")).unwrap();
+            add_entry(working, &gaddr("/Web/"), &simple_input("Two")).unwrap();
+            update_field(working, &addr("/Existing"), "URL", "x", None).unwrap();
+        }
+        external_rewrite(&vault_path, SystemTime::now());
+
+        let err = save_pending(&mut vault).expect_err("must refuse");
+        assert_eq!(err.code_enum(), ErrorCode::VaultFileModified);
+        let details = err.details().expect("details");
+        assert_eq!(details["pending_changes"], serde_json::json!(3));
+        assert!(details["file_mtime_at_unlock"].is_string());
+        assert!(details["file_mtime_now"].is_string());
+    }
+
+    #[test]
+    fn save_pending_updates_the_baseline_to_the_written_file() {
+        // After a save the baseline is the file just written: a second save
+        // succeeds, and the recorded mtime is the new file's real mtime.
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        let vault_path = vault.path().to_path_buf();
+        add_entry(
+            vault.working_db_mut().unwrap(),
+            &gaddr("/"),
+            &simple_input("First"),
+        )
+        .unwrap();
+        save_pending(&mut vault).expect("first save");
+        let on_disk_mtime = std::fs::metadata(&vault_path).unwrap().modified().unwrap();
+        assert_eq!(vault.mtime_at_unlock().unwrap(), on_disk_mtime);
+
+        add_entry(
+            vault.working_db_mut().unwrap(),
+            &gaddr("/"),
+            &simple_input("Second"),
+        )
+        .unwrap();
+        save_pending(&mut vault).expect("second save against the new baseline");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_through_a_symlink_writes_the_target_and_keeps_the_link() {
+        // A vault reached through a symlink (dotfile managers, synced folders)
+        // must stay a symlink: the save writes next to the target and renames
+        // onto it, instead of replacing the link with a regular file.
+        let db = build_db();
+        let (tmp, target) = write_fixture(&db);
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link.kdbx");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut vault = Vault::new(link.clone());
+        vault.unlock(TEST_PASSWORD, None).unwrap();
+        add_entry(
+            vault.working_db_mut().unwrap(),
+            &gaddr("/"),
+            &simple_input("Via Link"),
+        )
+        .unwrap();
+        save_pending(&mut vault).expect("save through the link");
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link survives the save");
+        let reopened = Database::open(
+            &mut std::fs::File::open(&target).unwrap(),
+            DatabaseKey::new().with_password(TEST_PASSWORD),
+        )
+        .unwrap();
+        assert!(
+            reopened
+                .iter_all_entries()
+                .any(|e| e.get_title() == Some("Via Link")),
+            "the target file holds the saved change"
+        );
+        // Nothing (no temp, no lock file) was left next to the link.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "link.kdbx")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stray files next to the link: {leftovers:?}"
+        );
+        drop(tmp);
     }
 
     #[test]
@@ -1410,7 +1939,7 @@ mod tests {
         let (_tmp, mut vault) = unlocked_vault(&db);
         {
             let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Once")).expect("stage");
+            add_entry(working, &gaddr("/"), &simple_input("Once")).expect("stage");
         }
         save_pending(&mut vault).expect("first save");
         let err = save_pending(&mut vault).expect_err("second save, nothing pending");
@@ -1441,7 +1970,7 @@ mod tests {
         // mode back to the umask default (typically 0644).
         {
             let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Hardened")).expect("stage add");
+            add_entry(working, &gaddr("/"), &simple_input("Hardened")).expect("stage add");
         }
         save_pending(&mut vault).expect("save");
 
@@ -1460,7 +1989,7 @@ mod tests {
         // The modern-otp case is covered by diff_added_entry_with_otp_sets_has_otp.
         // This pins the legacy "TOTP Seed" + "TOTP Settings" pair so the diff's
         // has_otp agrees with the read views, which also route through
-        // totp::resolve_config.
+        // totp::resolve_for_entry.
         let canonical = build_db();
         let mut working = canonical.clone();
         let input = EntryInput {
@@ -1468,18 +1997,18 @@ mod tests {
             fields: vec![
                 FieldInput {
                     name: "TOTP Seed".to_string(),
-                    value: "JBSWY3DPEHPK3PXP".to_string(),
+                    value: "JBSWY3DPEHPK3PXP".to_string().into(),
                     protected: true,
                 },
                 FieldInput {
                     name: "TOTP Settings".to_string(),
-                    value: "30;6".to_string(),
+                    value: "30;6".to_string().into(),
                     protected: false,
                 },
             ],
             attachments: Vec::new(),
         };
-        add_entry(&mut working, &path("/"), &input).expect("add legacy otp entry");
+        add_entry(&mut working, &gaddr("/"), &input).expect("add legacy otp entry");
         let d = diff_pending(&canonical, &working);
         let a = d
             .added

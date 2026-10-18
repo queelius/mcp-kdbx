@@ -341,6 +341,9 @@ output: { ok: true, data: { discarded: true, num_dropped: number } }
 | `VAULT_FILE_MODIFIED` | mtime changed since unlock |
 | `ENTRY_TITLE_INVALID` | Title is empty or contains literal `/` |
 | `FIELD_NAME_INVALID` | Field name is empty or has reserved characters |
+| `INVALID_INPUT` | A supplied value is malformed in a way no other code names (see implementation notes) |
+| `PATH_INVALID` | A path is malformed: no leading `/`, an empty `//` segment, a dangling `\` escape, or a `:0` ordinal (implementation notes, 2026-10-18) |
+| `VAULT_UNREADABLE` | The vault file fails before any key check: `details.reason` is `not_kdbx`, `unsupported_version`, `truncated`, or `corrupt_header` (implementation notes, 2026-10-18) |
 
 ## Versioning
 
@@ -807,8 +810,10 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 | `save_failed` | error | failure_step, error_message, pending_changes |
 | `reveal_password` | info | target_path, target_uuid, sha256 |
 | `reveal_protected` | info | target_path, target_uuid, field_name, sha256 |
-| `download_attachment` | info | target_path, attachment_name, size_bytes, sha256 |
+| `download_attachment` | info | target_path, target_uuid, attachment_name, size_bytes, sha256 |
 | `get_otp` | info | target_path, target_uuid (no code logged) |
+| `unlock_failed` | warn | unlock_source, reason (added 2026-10-18: `VAULT_UNREADABLE`) |
+| `writer_lock_unavailable` | warn | reason (added 2026-10-18: save without the writer lock) |
 | `tool_call` | debug | tool, params (sensitive fields redacted), duration_ms, error_code |
 | `mcp_message` | trace | direction, full JSON-RPC payload |
 
@@ -1148,3 +1153,233 @@ against them.
     `protected` flag. Hiding it would require an addressing scheme that does
     not embed titles (UUID-only paths), which is out of scope for v0.1.
   - Password is still never emitted by any view, protected or not.
+
+# Implementation notes (review fix batch, 2026-10-18)
+
+Deviations and clarifications from the second review fix batch. Like the notes
+above, these are the authoritative wire contract; the conformance and
+integration tests assert them.
+
+- **Paths never alias another record.** An entry with an empty Title used to
+  format as `/Group/`, which parses as the group path `/Group`, and entry
+  resolution ignored the trailing slash, so `/Group/` resolved to a different
+  entry (a sibling of the group titled `Group`) and reveal or update acted on
+  the wrong record. Two rules close this:
+  - A record has a vault path only when every segment of that path has a
+    non-empty name. An entry with an empty (or missing) Title, and any record
+    under a group with an empty name, has no path: read views, the stage diff
+    (`path`, `group_path`), `kdbx_update_field`, and audit `target_path`
+    report `null` for it. The path grammar has no spelling for an empty name,
+    so the alternative (emitting a placeholder) would always alias something.
+    Every path the server emits parses and resolves back to the record it was
+    built from (a unit test asserts this over awkward titles).
+  - Entry tools refuse a group-shaped path. A path ending in `/` (including
+    the root `/`) always addresses a group, so entry resolution returns
+    `ENTRY_NOT_FOUND` for it instead of matching an entry. Group tools still
+    accept `/Web` and `/Web/` alike.
+- **UUID addressing for entry tools.** `kdbx_get_entry`,
+  `kdbx_list_attachments`, `kdbx_reveal_password`, `kdbx_reveal_protected`,
+  `kdbx_download_attachment`, `kdbx_get_otp`, and `kdbx_update_field` accept an
+  optional `uuid` (the record UUID every read view returns) alongside their
+  path parameter (`path`, or `entry_path` for the two attachment tools), which
+  is now optional too. Exactly one of the two must be given: both, or neither,
+  or a malformed uuid is `INVALID_INPUT`; a well-formed uuid that names no
+  entry is `ENTRY_NOT_FOUND`. This is how an agent reaches a record with no
+  path, and it is the cross-session-stable way to name any entry.
+  `kdbx_update_field` now also returns the entry's `uuid`, and its `path` is
+  the canonical path of the entry written (re-derived after the write).
+- **Discard summaries.** `pending_discarded_summary` (on `VAULT_LOCKED`) and the
+  `stage_discarded` audit `summary` list each staged entry's vault path, or its
+  UUID when it has no path. A path always starts with `/`; a UUID never does.
+- **Save conflict detection is by content, under a writer lock.** The mtime
+  heuristic in section 2 ("External-modification detection") and section 3
+  ("Save atomicity", step 1) is replaced. It missed an external write that
+  kept or backdated the mtime (restore and sync tools do this) and any write
+  landing within its one-second slack, including a second mcp-kdbx saving in
+  the same second; each was then silently clobbered. Now:
+  - At unlock the vault is read through one handle; the server records the
+    sha256 of exactly those bytes and the mtime from that handle's metadata.
+  - `kdbx_save_pending` serializes first (the KDF runs before any lock), then
+    takes an exclusive advisory lock on a sidecar `<vault>.lock` (flock via
+    `std::fs::File::try_lock`, waiting up to 5 seconds), re-reads the vault,
+    and refuses with `VAULT_FILE_MODIFIED` when the content hash differs from
+    the baseline, whatever the mtimes say. A touch that changes only the mtime
+    is not a conflict. The lock is held through the temp write and rename, so
+    two mcp-kdbx instances cannot interleave. The sidecar is never deleted.
+    A new sidecar takes the vault file's permission bits (filtered by the
+    umask), and a sidecar this user cannot write is opened read-only (flock
+    needs no write access), so a group-shared vault stays saveable by every
+    member. Both opens use `O_NOFOLLOW | O_NONBLOCK` and the descriptor must
+    be a regular file: a symlink or FIFO planted at the lock path (by anyone
+    able to write the vault directory) fails the save at once with
+    `WRITE_FAILED`, `details.step: "lock"`, instead of redirecting the lock
+    or blocking past the wait deadline. A
+    lock still held after the wait is `WRITE_FAILED` with `details.step:
+    "lock"`.
+  - After the rename the baseline becomes the sha256 of the bytes written and
+    the mtime of the written file, so a second save in the same session works.
+  - `VAULT_FILE_MODIFIED.details.pending_changes` is the real count of staged
+    entries (it was a 0/1 flag), and the `save_committed` audit event's
+    `after_mtime` is the new file's mtime (it was the wall-clock write time).
+  - `WRITE_FAILED` from a save carries `details.step`: `lock`, `reread`,
+    `serialize`, `write_temp`, or `rename`.
+  - Residual risk: the lock coordinates mcp-kdbx instances only. A program
+    that does not take it (KeePassXC) writing between the re-read and the
+    rename is not detected; that window is one temp write plus one rename.
+  - The unlock KDF and the save run under `tokio::task::block_in_place`, so
+    they no longer stall the async worker the idle timer shares.
+  - MSRV is now 1.89 (`File::try_lock`); no new dependency.
+- **`kdbx_update_field` keeps KeePass edit semantics.** A real change now
+  snapshots the pre-edit entry into the entry's history and updates its
+  `LastModificationTime` (keepass `edit_tracking`), as KeePass and KeePassXC
+  do; before, the old value vanished from history on save and `modified_at`
+  never moved. Setting a field to the value and protection it already holds is
+  a no-op (no history snapshot, no pending change). History is not surfaced by
+  any tool, and the stage diff ignores history growth. `kdbx_add_entry` keeps
+  a plain edit: keepass stamps the new entry's creation and modification
+  times, and a snapshot of the blank entry would be noise.
+- **Title and field-name validation has no bypass, and rejects invisible
+  characters.** Section 3's "No ASCII control characters" becomes: no Unicode
+  control characters (General_Category Cc: ASCII controls, DEL, the C1
+  range) and no format characters (Cf) except an explicit allow-list: the
+  zero-width non-joiner and joiner (U+200C, U+200D), which Persian, Hindi,
+  Malayalam, and emoji sequences need. Everything else in Cf is refused,
+  including the bidi controls, zero-width space, word joiner, byte-order
+  mark, tag characters, soft hyphen, and any format character a future
+  Unicode version adds (an allow-list, not a list of known-bad ranges). This
+  applies to titles and field names; the
+  error details carry the offending `code_point` (for example `"U+202E"`).
+  Every write to `Title` is validated as a title: `kdbx_update_field` with
+  `field_name: "Title"` (an empty or disallowed-character title is
+  `ENTRY_TITLE_INVALID`), and a `Title` key in `kdbx_add_entry`'s `fields`
+  map is refused with `FIELD_NAME_INVALID` (the `title` parameter is the one
+  way to set it).
+- **`kdbx_get_otp.time_unix` is clamped.** Section 1 let the caller pick any
+  evaluation time, which contradicts section 3's "only the current code is
+  exposed": an agent could harvest codes for any future step. The requested
+  time is now clamped to now plus or minus one TOTP period (so the previous,
+  current, or next code, for clock skew), the response gains `time_unix` (the
+  time actually used), and the `get_otp` audit event records
+  `requested_time_unix` (null when omitted) and the effective `time_unix`.
+- **A symlinked vault stays a symlink.** The save resolves the configured
+  `KDBX_VAULT_PATH` through any symlinks and writes the temp file, takes the
+  writer lock, re-reads, and renames next to the real file. Before, the rename
+  replaced the link itself with a regular file, detaching the vault from the
+  file the link pointed at. `KDBX_AUTO_CLEAN_ORPHANS` scans the resolved
+  file's directory for the same reason. `kdbx_status.vault_path` still reports
+  the configured path.
+- **Save temp files are owner-only from creation, and orphan cleanup is
+  strict.** The temp file (`<vault>.tmp.<pid>.<nonce>`, both decimal) is
+  created with mode 0600 (it was umask-default until a later chmod, briefly
+  world-readable). One `TempName` type formats the name for the writer and
+  parses it for `KDBX_AUTO_CLEAN_ORPHANS`, which now removes only names with
+  two decimal parts, so a user file like `vault.kdbx.tmp.old.bak` is never
+  deleted.
+- **Secret hygiene.** Every secret-bearing field is a `Secret<T>`
+  (`kdbx_core::secret`): `Debug` prints `<redacted>`, the value is zeroized on
+  drop, and reading it takes an explicit `expose()`. This covers `Config`'s
+  password and unlock command, `kdbx_unlock`'s inputs, `kdbx_add_entry` and
+  `kdbx_update_field` values and attachment content, the staged
+  `FieldInput`/`AttachmentInput`, and the TOTP secret and computed code. Tool
+  input schemas are unchanged (the wrapper's schema is the inner type's). The
+  CI audit's check D is structural: any struct deriving `Debug` with a
+  secret-named field (`password`, `unlock_cmd`, `keyfile_bytes`, `secret`,
+  `value`, `base64`, `bytes`, `code`) holding a raw `String` or `Vec<u8>`
+  fails. The `KDBX_UNLOCK_CMD` stdout and stderr buffers are zeroized, and the
+  output is decoded as strict UTF-8: non-UTF-8 output is `AUTH_FAILED` with
+  `details.reason: "unlock_cmd_output_not_utf8"` (a lossy decode used to
+  substitute U+FFFD and try a password the command never printed).
+- **A lock's discard summary is never lost.** Section 2 attaches the summary
+  to the first `VAULT_LOCKED` after a lock, but an agent's first call after an
+  idle lock is often `kdbx_unlock`, which used to clear it silently. Now
+  `kdbx_unlock`'s output gains `previous_lock` (the summary, consumed, or
+  `null`), and `kdbx_status` gains `last_lock` (the same object, peeked and
+  not consumed; `null` once reported). All three reports share one shape:
+  `{ lock_reason, pending_discarded_count, pending_discarded_summary }`. A
+  failed unlock leaves the summary in place.
+- **Error codes: `PATH_INVALID` and `VAULT_UNREADABLE`.** A malformed path
+  (no leading `/`, `//`, a dangling `\`, `:0`) returned `GROUP_NOT_FOUND`,
+  even from entry tools; it is now `PATH_INVALID`, and the not-found codes
+  mean a well-formed path matched nothing. Every `Database::open` failure was
+  `AUTH_FAILED`; failures found before any key is derived or checked are now
+  `VAULT_UNREADABLE` with `details.reason`: `not_kdbx` (no KeePass
+  signature), `unsupported_version` (KeePass 2 pre-release or an unknown KDBX
+  major version), `truncated` (shorter than the version header), or
+  `corrupt_header` (the outer header does not parse or fails its sha256
+  check). Naming these reveals nothing about the password. A wrong key, and
+  every failure that can only arise after decryption with some key (a block
+  HMAC or XML error), stays `AUTH_FAILED`. `VAULT_UNREADABLE` emits no
+  `auth_failed` event; it emits a warn-level `unlock_failed` event with
+  `unlock_source` and the `reason`.
+- **`kdbx_find_entry.fields` is a closed enum.** Unknown names (and wrong
+  case, such as `"Title"`) used to be dropped silently, so a typo quietly
+  reverted to the default field set. The input is now typed: the schema lists
+  `title`, `username`, `url`, `notes`, and any other value is refused at the
+  protocol level as invalid params (JSON-RPC error -32602, "unknown variant"),
+  before the tool runs. An omitted or empty list still means the default set.
+- **TOTP sources.** One resolver, `totp::resolve_for_entry`, decides an
+  entry's TOTP config for `kdbx_get_otp`, `has_otp` in the read views, and
+  `has_otp` in the stage diff (three hand-copied lookups before). It tries, in
+  order: the `otp` field (otpauth URI); KeePass 2's native `TimeOtp-*` fields
+  (KeePass 2.47+, documented under "Placeholders", `{TIMEOTP}`): exactly one
+  of `TimeOtp-Secret` (UTF-8), `-Hex`, `-Base32`, `-Base64`, plus optional
+  `TimeOtp-Length` (default 6, at most 8), `TimeOtp-Period` (default 30), and
+  `TimeOtp-Algorithm` (`HMAC-SHA-1` default, `HMAC-SHA-256`, `HMAC-SHA-512`);
+  then the legacy `TOTP Seed` + `TOTP Settings` pair. A malformed source falls
+  through to the next. Base32 secrets are normalized before decoding
+  (whitespace removed, uppercased, `=` padding dropped), so lowercase, grouped,
+  or padded secrets now work.
+- **Agent guidance.** The server instructions (sent at initialize) now state
+  the path grammar once: leading `/`, `\/` and `\\` escapes, `\:` before
+  digits, `:N` ordinals, a trailing `/` naming a group, and uuid addressing
+  for stable references or null paths. The `PATH_INVALID` message repeats the
+  grammar for hosts that do not surface instructions. `kdbx_unlock`'s
+  description no longer invites the agent to collect the master password: it
+  says to call the tool with no arguments (the server reads `KDBX_PASSWORD` or
+  `KDBX_UNLOCK_CMD`) and not to ask the user to type the password into the
+  chat; the `password` argument is documented as for scripted use.
+- **Typed audit fields (format unchanged).** One ordered `Level` enum serves
+  both the audit envelope and `KDBX_LOG_LEVEL` (the derived order is the
+  verbosity order, replacing a string-keyed rank with a silent `info`
+  fallback). `unlock_source` and `source` are an `UnlockSource`, `reason` on
+  `vault_locked` and in lock reports is a `LockReason`, `tool` a `WriteTool`,
+  `stage_discarded.reason` a `StageDiscardReason`, `error_code` an
+  `ErrorCode`, and `failure_step` a `SaveStep`, all serialized through serde
+  to the same strings as before; a unit test pins the exact JSONL line of
+  every event. The one value change: `save_failed.failure_step` now names the
+  real step (`lock`, `reread`, `serialize`, `write_temp`, `rename`) instead of
+  always `"write"`. Two value shapes widened earlier in this batch and are
+  pinned too: `target_path` (on `write_staged`, the reveal events,
+  `download_attachment`, and `get_otp`) is `null` for a record with no
+  addressable path, and `stage_discarded.summary` (like
+  `pending_discarded_summary`) lists a UUID instead of a path for such a
+  record. `download_attachment` also carries `target_uuid`, and `get_otp`
+  carries `requested_time_unix` and `time_unix`.
+- **History is kept in KeePass order and within the vault's limits.**
+  keepass 0.12's `History::add_entry` (used by `edit_tracking`) inserts each
+  new snapshot at index 0, while its XML parse and write keep file order and
+  KeePass writes history oldest first; it also never applies
+  `HistoryMaxItems` / `HistoryMaxSize`. After every tracked edit the server
+  moves the new snapshot to the end (oldest first) and applies KeePass's
+  `MaintainBackups`: remove the oldest backup (smallest LastModificationTime,
+  first on a tie) while there are more than `HistoryMaxItems`, then while
+  their total size exceeds `HistoryMaxSize`. Negative means unlimited; unset
+  means KeePass's defaults (10 items, 6 MiB). Size is field bytes plus
+  attachment bytes, an approximation of KeePass's `PwEntry.GetSize`.
+  Binaries used only by a removed backup stay in the binary pool until
+  KeePass next saves.
+- **A filesystem without locks degrades, audibly.** If the writer lock fails
+  because the filesystem cannot lock at all (`ENOLCK`, for example NFS
+  without a lock daemon, or an "unsupported" error from some FUSE and SMB
+  mounts), the save proceeds without the inter-instance lock (the content
+  check still runs) and a successful save emits a new warn-level audit event,
+  `writer_lock_unavailable`, with `reason`: `no_locks` or `unsupported`. Any
+  other lock error stays `WRITE_FAILED` (`details.step: "lock"`).
+- **UUID addressing for group tools.** `kdbx_list_entries` (`group_path` or
+  `uuid`), `kdbx_list_groups` (`parent_path` or `uuid`; with neither, the
+  root), and `kdbx_add_entry` (`group_path` or `group_uuid`, named so it
+  cannot be mistaken for the new entry's uuid) take a group by path or by
+  record UUID under the same exactly-one rule as entry tools: both, neither
+  (except `kdbx_list_groups`), or a malformed uuid is `INVALID_INPUT`; an
+  unknown uuid is `GROUP_NOT_FOUND`. A group under an unnamed group, whose
+  path is null, is reachable this way.
