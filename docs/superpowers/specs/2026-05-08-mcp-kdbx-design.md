@@ -1186,3 +1186,33 @@ integration tests assert them.
 - **Discard summaries.** `pending_discarded_summary` (on `VAULT_LOCKED`) and the
   `stage_discarded` audit `summary` list each staged entry's vault path, or its
   UUID when it has no path. A path always starts with `/`; a UUID never does.
+- **Save conflict detection is by content, under a writer lock.** The mtime
+  heuristic in section 2 ("External-modification detection") and section 3
+  ("Save atomicity", step 1) is replaced. It missed an external write that
+  kept or backdated the mtime (restore and sync tools do this) and any write
+  landing within its one-second slack, including a second mcp-kdbx saving in
+  the same second; each was then silently clobbered. Now:
+  - At unlock the vault is read through one handle; the server records the
+    sha256 of exactly those bytes and the mtime from that handle's metadata.
+  - `kdbx_save_pending` serializes first (the KDF runs before any lock), then
+    takes an exclusive advisory lock on a sidecar `<vault>.lock` (flock via
+    `std::fs::File::try_lock`, waiting up to 5 seconds), re-reads the vault,
+    and refuses with `VAULT_FILE_MODIFIED` when the content hash differs from
+    the baseline, whatever the mtimes say. A touch that changes only the mtime
+    is not a conflict. The lock is held through the temp write and rename, so
+    two mcp-kdbx instances cannot interleave. The sidecar is never deleted. A
+    lock still held after the wait is `WRITE_FAILED` with `details.step:
+    "lock"`.
+  - After the rename the baseline becomes the sha256 of the bytes written and
+    the mtime of the written file, so a second save in the same session works.
+  - `VAULT_FILE_MODIFIED.details.pending_changes` is the real count of staged
+    entries (it was a 0/1 flag), and the `save_committed` audit event's
+    `after_mtime` is the new file's mtime (it was the wall-clock write time).
+  - `WRITE_FAILED` from a save carries `details.step`: `lock`, `reread`,
+    `serialize`, `write_temp`, or `rename`.
+  - Residual risk: the lock coordinates mcp-kdbx instances only. A program
+    that does not take it (KeePassXC) writing between the re-read and the
+    rename is not detected; that window is one temp write plus one rename.
+  - The unlock KDF and the save run under `tokio::task::block_in_place`, so
+    they no longer stall the async worker the idle timer shares.
+  - MSRV is now 1.89 (`File::try_lock`); no new dependency.

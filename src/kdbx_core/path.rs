@@ -631,16 +631,16 @@ fn collect_entry_segments(
     };
 
     let entry_ids: Vec<EntryId> = group.entry_ids().collect();
-    if entry_ids.contains(&target) {
-        if let Some(entry) = db.entry(target) {
-            let title = entry.get_title().unwrap_or("").to_string();
-            let ordinal = entry_ordinal(db, &group, target, &title);
-            segments.push(Segment {
-                name: title,
-                ordinal,
-            });
-            return true;
-        }
+    if entry_ids.contains(&target)
+        && let Some(entry) = db.entry(target)
+    {
+        let title = entry.get_title().unwrap_or("").to_string();
+        let ordinal = entry_ordinal(db, &group, target, &title);
+        segments.push(Segment {
+            name: title,
+            ordinal,
+        });
+        return true;
     }
 
     let child_ids: Vec<GroupId> = group.group_ids().collect();

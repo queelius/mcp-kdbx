@@ -3,7 +3,9 @@ name = "mcp-kdbx"
 description = "Model Context Protocol server exposing KeePass KDBX vaults to AI agents (bridge member of the *-kdbx ecosystem)"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.89: std::fs::File::try_lock, the advisory writer lock the save path holds
+# across its conflict check and rename (no extra dependency needed).
+rust-version = "1.89"
 authors = ["Alexander Towell <lex@metafunctor.com>"]
 license = "MIT"
 repository = "https://github.com/queelius/mcp-kdbx"

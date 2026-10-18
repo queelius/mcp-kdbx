@@ -29,6 +29,9 @@ use crate::kdbx_core::address::EntryAddress;
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 use crate::kdbx_core::path::{VaultPath, vault_path_to_entry, vault_path_to_group};
 use crate::kdbx_core::vault::Vault;
+use crate::kdbx_core::vault_file::{
+    SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint, write_atomically,
+};
 use diff_kdbx::change_set::{Change, EntryChangeKind, FieldChange, ValueChange, ValueDisplay};
 use diff_kdbx::options::DiffOptions;
 use keepass::Database;
@@ -603,51 +606,34 @@ fn plain_to_json(v: &ValueDisplay) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// Atomically save the working db to the vault file (spec section 3, "Save
-/// atomicity").
+/// atomicity", as amended by the 2026-10-18 implementation notes).
 ///
-/// Steps: refuse when nothing is pending; refuse when the file changed on disk
-/// since unlock (mtime conflict, more than one second of slack); serialize the
-/// working db in memory; write to a temp file in the same directory and fsync
-/// it; rename it over the vault file; best-effort fsync the parent directory;
-/// re-stat for the new mtime; adopt the working db as the new canonical
-/// baseline. On a serialize or write failure the stage is preserved and no
-/// vault state changes.
+/// Steps:
+/// 1. Refuse when nothing is pending (`NO_PENDING_CHANGES`).
+/// 2. Serialize (and encrypt) the working db in memory. The KDF runs here,
+///    before the writer lock is taken, so the lock is held only for I/O.
+/// 3. Take the sidecar writer lock ([`WriterLock`]) so another mcp-kdbx
+///    instance cannot interleave between the check and the rename.
+/// 4. Re-read the vault file and compare its content hash with the baseline
+///    recorded at unlock (or at the last save). Any difference, whatever the
+///    mtimes say, is `VAULT_FILE_MODIFIED` with the real pending-change count.
+///    A vault file that can no longer be read is `WRITE_FAILED`.
+/// 5. Write atomically (temp, fsync, rename, fsync dir) and adopt the working
+///    db as the new canonical baseline, with the fingerprint of the bytes just
+///    written.
+///
+/// On any failure the stage is preserved and no vault state changes.
 pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
     if !vault.has_pending_changes() {
         return Err(ErrorCode::NoPendingChanges.into());
     }
 
     let path = vault.path().to_path_buf();
-    let mtime_at_unlock = vault.mtime_at_unlock()?;
-
-    // mtime conflict check. A file modified more than one second after the
-    // mtime we captured at unlock means something else wrote it (KeePassXC,
-    // another mcp-kdbx). One second of slack absorbs filesystem timestamp
-    // coarseness.
-    let mtime_now = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .map_err(|e| {
-            CoreError::new(ErrorCode::WriteFailed)
-                .with_message(format!("could not stat vault file: {e}"))
-        })?;
-    if exceeds_slack(mtime_at_unlock, mtime_now) {
-        let pending = if vault.has_pending_changes() { 1 } else { 0 };
-        return Err(
-            CoreError::new(ErrorCode::VaultFileModified).with_details(serde_json::json!({
-                "file_mtime_at_unlock": to_rfc3339(mtime_at_unlock),
-                "file_mtime_now": to_rfc3339(mtime_now),
-                "pending_changes": pending,
-            })),
-        );
-    }
+    let baseline = vault.file_baseline()?;
 
     // Count the changes before we adopt working as canonical (after mark_saved
     // the two dbs are equal and the count would be zero).
-    let num_changes = {
-        let (canonical, working) = vault.canonical_and_working()?;
-        let d = diff_pending(canonical, working);
-        d.summary.num_added + d.summary.num_modified + d.summary.num_removed
-    };
+    let num_changes = vault.pending_count();
 
     // Serialize the working db to encrypted bytes in memory.
     let bytes = {
@@ -656,14 +642,31 @@ pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
         working.save(&mut buf, key.clone()).map_err(|e| {
             CoreError::new(ErrorCode::WriteFailed)
                 .with_message(format!("serializing the vault failed: {e}"))
+                .with_details(serde_json::json!({ "step": SaveStep::Serialize }))
         })?;
         buf
     };
 
-    // Write to a temp file in the same directory, fsync, rename, fsync dir.
-    let new_mtime = write_atomically(&path, &bytes)?;
+    let _lock = WriterLock::acquire(&path, WRITER_LOCK_WAIT)?;
 
-    vault.mark_saved(new_mtime)?;
+    let (_, current) = read_with_fingerprint(&path).map_err(|e| {
+        CoreError::new(ErrorCode::WriteFailed)
+            .with_message(format!("could not re-read the vault file: {e}"))
+            .with_details(serde_json::json!({ "step": SaveStep::Reread }))
+    })?;
+    if !current.same_content(&baseline) {
+        return Err(
+            CoreError::new(ErrorCode::VaultFileModified).with_details(serde_json::json!({
+                "file_mtime_at_unlock": to_rfc3339(baseline.mtime()),
+                "file_mtime_now": to_rfc3339(current.mtime()),
+                "pending_changes": num_changes,
+            })),
+        );
+    }
+
+    let written = write_atomically(&path, &bytes)?;
+
+    vault.mark_saved(written)?;
 
     Ok(SaveOutcome {
         saved: true,
@@ -677,130 +680,6 @@ pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
 /// pending count.
 pub fn discard_pending(vault: &mut Vault) -> CoreResult<usize> {
     vault.discard_working()
-}
-
-/// True when `now` is more than one second later than `at_unlock`. A `now` at
-/// or before `at_unlock` (clock went backward, or no external write) is not a
-/// conflict.
-fn exceeds_slack(at_unlock: SystemTime, now: SystemTime) -> bool {
-    match now.duration_since(at_unlock) {
-        Ok(delta) => delta > std::time::Duration::from_secs(1),
-        Err(_) => false,
-    }
-}
-
-/// Write `bytes` to `path` atomically: a uniquely-named temp file in the same
-/// directory, `write_all`, fsync the file, rename it over `path`, then a
-/// best-effort fsync of the parent directory. Returns the freshly written
-/// file's mtime. On any pre-rename failure the temp file is unlinked and
-/// `WRITE_FAILED` is returned, so the vault is untouched.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> CoreResult<SystemTime> {
-    use std::io::Write;
-
-    let parent = path.parent().ok_or_else(|| {
-        CoreError::new(ErrorCode::WriteFailed).with_message("vault path has no parent directory")
-    })?;
-
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "vault.kdbx".to_string());
-
-    let temp_path = parent.join(format!(
-        "{}.tmp.{}.{}",
-        file_name,
-        std::process::id(),
-        temp_suffix()
-    ));
-
-    // Open and write the temp file. The open uses create_new (O_EXCL), so it
-    // refuses to clobber a pre-existing temp file: if the name already exists,
-    // another save raced us and we surface WRITE_FAILED rather than overwrite a
-    // file that may be in use. Any failure here unlinks the temp and surfaces
-    // WRITE_FAILED; the vault file is untouched. (On a create_new failure the
-    // name was not ours to begin with, so the remove below is a harmless no-op
-    // most of the time, and the surrounding error path is unchanged.)
-    let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::options()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(CoreError::new(ErrorCode::WriteFailed)
-            .with_message(format!("writing the temp file failed: {e}")));
-    }
-
-    // Preserve the user's file hardening across the rename. create_new opens the
-    // temp with the umask-default mode (typically 0644), which would silently
-    // downgrade a vault the user chmod'ed 0600. Copy the existing vault file's
-    // mode onto the temp before the rename when the vault file exists; for a
-    // brand-new vault (no existing file) fall back to 0600. A failure to read or
-    // set the mode is non-fatal: the save proceeds with the temp's default mode
-    // rather than refusing to write.
-    preserve_temp_permissions(path, &temp_path);
-
-    // Atomic rename over the vault file.
-    if let Err(e) = std::fs::rename(&temp_path, path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(CoreError::new(ErrorCode::WriteFailed)
-            .with_message(format!("renaming the temp file over the vault failed: {e}")));
-    }
-
-    // Best-effort parent-directory fsync for POSIX durability. The rename has
-    // already happened, so a failure here does not corrupt anything: log-and-
-    // ignore rather than fail the save and leave the caller thinking it did not
-    // write.
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
-
-    // Re-stat for the new mtime. If the metadata read fails (unlikely right
-    // after a successful write), fall back to now: the save did succeed.
-    let new_mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or_else(|_| SystemTime::now());
-
-    Ok(new_mtime)
-}
-
-/// Copy the existing vault file's permission bits onto the temp file so the
-/// atomic rename preserves the user's hardening. When the vault file does not
-/// yet exist (a first save), fall back to 0600 so a new vault is owner-only
-/// rather than world-readable. POSIX-only: it uses the Unix permission model
-/// directly. Any error reading or setting permissions is swallowed: the save is
-/// more important than the mode tweak, and the temp keeps its default mode.
-#[cfg(unix)]
-fn preserve_temp_permissions(vault_path: &std::path::Path, temp_path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let perms = match std::fs::metadata(vault_path) {
-        Ok(meta) => meta.permissions(),
-        // No existing vault file (first save): default to owner-only 0600.
-        Err(_) => std::fs::Permissions::from_mode(0o600),
-    };
-    let _ = std::fs::set_permissions(temp_path, perms);
-}
-
-/// Non-Unix fallback: there is no portable POSIX permission model to copy, so
-/// leave the temp file's default permissions in place.
-#[cfg(not(unix))]
-fn preserve_temp_permissions(_vault_path: &std::path::Path, _temp_path: &std::path::Path) {}
-
-/// A per-call suffix for the temp file name. There is no `rand` crate in the
-/// dependency set, so derive a value from the current time's nanos. Combined
-/// with the pid in the file name, this is unique enough to avoid collisions
-/// between concurrent saves; the temp file is short-lived and gets renamed away
-/// immediately.
-fn temp_suffix() -> u128 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
 }
 
 /// Format a `SystemTime` as an RFC3339 / ISO 8601 UTC string via chrono.
@@ -1382,46 +1261,155 @@ mod tests {
         );
     }
 
-    #[test]
-    fn save_pending_refuses_when_file_modified_since_unlock() {
-        use std::time::Duration;
+    /// Replace the vault file's bytes with a different valid vault (as another
+    /// writer would) and stamp it with `mtime`.
+    fn external_rewrite(vault_path: &std::path::Path, mtime: SystemTime) {
+        let mut other = build_db();
+        other
+            .root_mut()
+            .add_entry()
+            .edit(|e| e.set_unprotected(fields::TITLE, "Written Elsewhere"));
+        let mut buf = Vec::new();
+        other
+            .save(&mut buf, DatabaseKey::new().with_password(TEST_PASSWORD))
+            .expect("serialize external vault");
+        std::fs::write(vault_path, &buf).expect("external write");
+        std::fs::File::options()
+            .write(true)
+            .open(vault_path)
+            .expect("open for set_modified")
+            .set_modified(mtime)
+            .expect("set mtime");
+    }
 
+    #[test]
+    fn save_pending_refuses_a_backdated_external_write() {
+        // A restore or sync tool that preserves an older mtime defeated the old
+        // "mtime moved forward by more than 1s" heuristic. Content identity
+        // catches it.
         let db = build_db();
         let (_tmp, mut vault) = unlocked_vault(&db);
         let vault_path = vault.path().to_path_buf();
+        let at_unlock = vault.mtime_at_unlock().expect("unlocked");
+        update_field(
+            vault.working_db_mut().unwrap(),
+            &addr("/Existing"),
+            "URL",
+            "x",
+            None,
+        )
+        .unwrap();
 
-        // Stage a change so has_pending_changes is true.
-        {
-            let working = vault.working_db_mut().expect("working");
-            add_entry(working, &path("/"), &simple_input("Staged")).expect("stage add");
-        }
-        assert!(vault.has_pending_changes());
+        external_rewrite(&vault_path, at_unlock - std::time::Duration::from_secs(60));
 
-        // Bump the on-disk file's mtime well past the unlock mtime: more than the
-        // one-second slack. set_modified is stable since Rust 1.75 and needs no
-        // new dependency. Ten seconds ahead clears the slack with room to spare.
-        let bumped = SystemTime::now() + Duration::from_secs(10);
-        std::fs::File::open(&vault_path)
-            .expect("open vault file")
-            .set_modified(bumped)
-            .expect("set mtime forward");
-
-        let err = save_pending(&mut vault).expect_err("save must refuse a modified file");
+        let err = save_pending(&mut vault).expect_err("must refuse");
         assert_eq!(err.code_enum(), ErrorCode::VaultFileModified);
-
-        // When details are populated, pending_changes is reported present.
-        if let Some(details) = err.details() {
-            assert!(
-                details.get("pending_changes").is_some(),
-                "details should carry pending_changes: {details:?}"
-            );
-        }
-
-        // The refusal preserves the stage: nothing was committed or dropped.
+        assert!(vault.has_pending_changes(), "stage preserved on refusal");
+        // The external write survives untouched.
+        let on_disk = Database::open(
+            &mut std::fs::File::open(&vault_path).unwrap(),
+            DatabaseKey::new().with_password(TEST_PASSWORD),
+        )
+        .unwrap();
         assert!(
-            vault.has_pending_changes(),
-            "stage preserved after a VAULT_FILE_MODIFIED refusal"
+            on_disk
+                .iter_all_entries()
+                .any(|e| e.get_title() == Some("Written Elsewhere"))
         );
+    }
+
+    #[test]
+    fn save_pending_refuses_an_external_write_within_one_second() {
+        // The old one-second slack let a write landing within it be clobbered.
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        let vault_path = vault.path().to_path_buf();
+        let at_unlock = vault.mtime_at_unlock().expect("unlocked");
+        update_field(
+            vault.working_db_mut().unwrap(),
+            &addr("/Existing"),
+            "URL",
+            "x",
+            None,
+        )
+        .unwrap();
+
+        external_rewrite(
+            &vault_path,
+            at_unlock + std::time::Duration::from_millis(900),
+        );
+
+        let err = save_pending(&mut vault).expect_err("must refuse");
+        assert_eq!(err.code_enum(), ErrorCode::VaultFileModified);
+    }
+
+    #[test]
+    fn save_pending_ignores_an_mtime_only_touch() {
+        // Identity is the content, not the timestamp: a touch that leaves the
+        // bytes unchanged is not a conflict.
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        let vault_path = vault.path().to_path_buf();
+        add_entry(
+            vault.working_db_mut().unwrap(),
+            &path("/"),
+            &simple_input("Staged"),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&vault_path)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(30))
+            .unwrap();
+        save_pending(&mut vault).expect("an mtime-only touch is not a conflict");
+    }
+
+    #[test]
+    fn vault_file_modified_reports_the_real_pending_count() {
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        let vault_path = vault.path().to_path_buf();
+        {
+            let working = vault.working_db_mut().unwrap();
+            add_entry(working, &path("/"), &simple_input("One")).unwrap();
+            add_entry(working, &path("/Web/"), &simple_input("Two")).unwrap();
+            update_field(working, &addr("/Existing"), "URL", "x", None).unwrap();
+        }
+        external_rewrite(&vault_path, SystemTime::now());
+
+        let err = save_pending(&mut vault).expect_err("must refuse");
+        assert_eq!(err.code_enum(), ErrorCode::VaultFileModified);
+        let details = err.details().expect("details");
+        assert_eq!(details["pending_changes"], serde_json::json!(3));
+        assert!(details["file_mtime_at_unlock"].is_string());
+        assert!(details["file_mtime_now"].is_string());
+    }
+
+    #[test]
+    fn save_pending_updates_the_baseline_to_the_written_file() {
+        // After a save the baseline is the file just written: a second save
+        // succeeds, and the recorded mtime is the new file's real mtime.
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        let vault_path = vault.path().to_path_buf();
+        add_entry(
+            vault.working_db_mut().unwrap(),
+            &path("/"),
+            &simple_input("First"),
+        )
+        .unwrap();
+        save_pending(&mut vault).expect("first save");
+        let on_disk_mtime = std::fs::metadata(&vault_path).unwrap().modified().unwrap();
+        assert_eq!(vault.mtime_at_unlock().unwrap(), on_disk_mtime);
+
+        add_entry(
+            vault.working_db_mut().unwrap(),
+            &path("/"),
+            &simple_input("Second"),
+        )
+        .unwrap();
+        save_pending(&mut vault).expect("second save against the new baseline");
     }
 
     #[test]

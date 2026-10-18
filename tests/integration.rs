@@ -15,7 +15,7 @@
 
 mod common;
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use common::*;
 use mcp_kdbx::kdbx_core::audit::hash_revealed;
@@ -279,26 +279,95 @@ fn external_modification_refuses_save_with_conflict() {
         json!({ "path": "/GitHub", "field_name": "URL", "value": "https://mine.example" }),
     );
 
-    // Simulate another writer (KeePassXC, a second mcp-kdbx) touching the file:
-    // push its mtime well past the mtime captured at unlock. The save must refuse
-    // rather than clobber the external change.
+    // Simulate another writer replacing the file, the way a restore or sync
+    // tool does: new content, but an mtime older than the one seen at unlock.
+    // The old mtime heuristic let this through; the content check must not.
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::copy(fixture_path("nested.kdbx"), &path).expect("external write");
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
-        .expect("open vault file to bump mtime");
-    file.set_modified(SystemTime::now() + Duration::from_secs(30))
-        .expect("set a future mtime on the vault file");
+        .expect("open vault file to backdate mtime");
+    file.set_modified(before - Duration::from_secs(60))
+        .expect("backdate the vault file mtime");
     drop(file);
 
     let err = server.call_error("kdbx_save_pending", json!({}));
     assert_eq!(err["code"], json!("VAULT_FILE_MODIFIED"));
     assert!(err["details"]["file_mtime_now"].is_string());
     assert!(err["details"]["file_mtime_at_unlock"].is_string());
+    assert_eq!(err["details"]["pending_changes"], json!(1));
 
     // The stage is preserved (the save was refused, not discarded): a diff still
     // shows the pending change.
     let diff = server.call_ok("kdbx_diff_pending", json!({}));
     assert_eq!(diff["summary"]["num_modified"], json!(1));
+}
+
+#[test]
+fn concurrent_instances_first_save_wins_second_is_refused() {
+    // Two mcp-kdbx processes on one vault, both staging a change. The first
+    // save wins; the second is refused even though it lands within the same
+    // second (the old one-second mtime slack let it clobber the first).
+    let (_dir, path) = temp_copy_of("flat.kdbx");
+    let envs = [
+        ("KDBX_VAULT_PATH", path.to_str().unwrap()),
+        ("KDBX_ALLOW_WRITES", "true"),
+    ];
+    let mut a = McpServer::spawn(&envs);
+    let mut b = McpServer::spawn(&envs);
+    a.unlock_with_fixture_password();
+    b.unlock_with_fixture_password();
+
+    a.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/GitHub", "field_name": "URL", "value": "https://from-a.example" }),
+    );
+    b.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/Bank", "field_name": "URL", "value": "https://from-b.example" }),
+    );
+
+    a.call_ok("kdbx_save_pending", json!({}));
+    let err = b.call_error("kdbx_save_pending", json!({}));
+    assert_eq!(err["code"], json!("VAULT_FILE_MODIFIED"));
+
+    // A's change is on disk; B did not clobber it.
+    drop(a);
+    drop(b);
+    let mut reader = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    reader.unlock_with_fixture_password();
+    let github = reader.call_ok("kdbx_get_entry", json!({ "path": "/GitHub" }));
+    assert_eq!(github["url"], json!("https://from-a.example"));
+}
+
+#[test]
+fn save_committed_audit_records_the_new_file_mtime() {
+    let (dir, path) = temp_copy_of("flat.kdbx");
+    let log = dir.path().join("audit.jsonl");
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", path.to_str().unwrap()),
+        ("KDBX_ALLOW_WRITES", "true"),
+        ("KDBX_LOG_FILE", log.to_str().unwrap()),
+    ]);
+    server.unlock_with_fixture_password();
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/GitHub", "field_name": "URL", "value": "https://x.example" }),
+    );
+    server.call_ok("kdbx_save_pending", json!({}));
+
+    let mtime: chrono::DateTime<chrono::Utc> =
+        std::fs::metadata(&path).unwrap().modified().unwrap().into();
+    let lines = read_audit_lines(&log);
+    let committed = lines
+        .iter()
+        .find(|l| l["event"] == json!("save_committed"))
+        .expect("save_committed event");
+    assert_eq!(
+        committed["details"]["after_mtime"],
+        json!(mtime.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    );
 }
 
 /// Idle-timeout test. The idle timer ticks on an interval clamped to a 5-second

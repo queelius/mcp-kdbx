@@ -80,7 +80,7 @@ These are non-negotiable from the spec; flag any change that violates them as a 
 - **Writes default off.** `KDBX_ALLOW_WRITES` MUST be exactly `"true"` to enable; other values rejected at startup.
 - **Stage-then-commit.** Writes mutate `working_db`; nothing hits disk until `kdbx_save_pending`. Lock (any reason) discards the stage; the next tool call returns VAULT_LOCKED with the discarded summary.
 - **Save atomicity via temp+fsync+rename+fsync(parent).** No partial-file window on power loss.
-- **mtime conflict refusal.** External vault modification (KeePassXC, another mcp-kdbx) refuses save with VAULT_FILE_MODIFIED.
+- **Content conflict refusal.** External vault modification (KeePassXC, another mcp-kdbx) refuses save with VAULT_FILE_MODIFIED. Identity is the sha256 of the bytes parsed at unlock (or written by the last save), re-checked under a sidecar `<vault>.lock` advisory lock held across check, write, and rename; mtimes are reported, never trusted.
 
 ## Voice rules for any prose written here
 

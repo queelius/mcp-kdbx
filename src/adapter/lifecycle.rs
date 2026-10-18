@@ -139,7 +139,10 @@ impl KdbxServer {
             }
         };
 
-        match vault.unlock(&password, keyfile.as_deref()) {
+        // The KDF in Database::open is deliberately slow; run it off the async
+        // worker (see kdbx_save_pending for the same pattern).
+        let unlocked = tokio::task::block_in_place(|| vault.unlock(&password, keyfile.as_deref()));
+        match unlocked {
             Ok(()) => {
                 let file_mtime = vault
                     .mtime_at_unlock()

@@ -162,15 +162,15 @@ fn collect_matches(
     // Entries directly in this group.
     let entry_ids: Vec<keepass::db::EntryId> = group.entry_ids().collect();
     for eid in entry_ids {
-        if let Some(er) = db.entry(eid) {
-            if entry_matches(&er, needle, fields) {
-                out.push(SearchMatch {
-                    uuid: er.id().uuid().to_string(),
-                    title: er.get_title().unwrap_or("").to_string(),
-                    group_path: here.clone(),
-                    entry_id: er.id(),
-                });
-            }
+        if let Some(er) = db.entry(eid)
+            && entry_matches(&er, needle, fields)
+        {
+            out.push(SearchMatch {
+                uuid: er.id().uuid().to_string(),
+                title: er.get_title().unwrap_or("").to_string(),
+                group_path: here.clone(),
+                entry_id: er.id(),
+            });
         }
     }
 

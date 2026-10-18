@@ -270,7 +270,7 @@ impl KdbxServer {
     /// staged (`NO_PENDING_CHANGES`) or when the file changed on disk since
     /// unlock (`VAULT_FILE_MODIFIED`).
     #[tool(
-        description = "Commit the staged changes to the vault file atomically. Requires writes to be enabled and the vault unlocked. Refuses when nothing is staged, or when the file changed on disk since it was unlocked. On success the stage settles and the working copy becomes the new baseline."
+        description = "Commit the staged changes to the vault file atomically. Requires writes to be enabled and the vault unlocked. Refuses when nothing is staged, or when the file content changed on disk since it was unlocked (VAULT_FILE_MODIFIED: discard and re-unlock to pick up the other change). On success the stage settles and the working copy becomes the new baseline."
     )]
     async fn kdbx_save_pending(&self) -> String {
         if !self.writes_allowed() {
@@ -292,12 +292,24 @@ impl KdbxServer {
             .unwrap_or_default();
         let pending_before = vault.pending_count() as u64;
 
-        match stage::save_pending(&mut vault) {
+        // The save runs the KDF and blocking file I/O (including a bounded wait
+        // for the writer lock). block_in_place moves that off the async worker
+        // so other tasks (the idle timer) keep running; the server runs on the
+        // multi-threaded runtime (#[tokio::main]).
+        let result = tokio::task::block_in_place(|| stage::save_pending(&mut vault));
+        match result {
             Ok(outcome) => {
+                // The baseline now describes the file just written, so its mtime
+                // is the real new file mtime.
+                let after_mtime = vault
+                    .mtime_at_unlock()
+                    .ok()
+                    .map(format_system_time)
+                    .unwrap_or_default();
                 self.emit(AuditEvent::SaveCommitted {
                     num_changes: outcome.num_changes as u64,
                     before_mtime,
-                    after_mtime: outcome.written_at.clone(),
+                    after_mtime,
                 });
                 responses::ok(outcome)
             }

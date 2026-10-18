@@ -2,9 +2,9 @@
 //!
 //! A [`Vault`] is either `Locked` (no secrets in memory) or `Unlocked`, holding
 //! the parsed canonical database, a working clone the write tools mutate, the
-//! master key, and two timestamps (last activity for the Phase 2 idle timer, and
-//! the file mtime captured at unlock for the Phase 3 external-modification
-//! check). See spec section 2 ("State machine", "Unlock sequence", "Lock
+//! master key, the last-activity timestamp for the idle timer, and the
+//! fingerprint (content sha256 plus mtime) of the file the canonical db came
+//! from, for the save path's external-modification check. See spec section 2 ("State machine", "Unlock sequence", "Lock
 //! sequence") and section 3 ("Working-copy model").
 //!
 //! This module is deliberately free of MCP types, audit emission, and idle-timer
@@ -22,6 +22,7 @@
 //! structure to clear.
 
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
+use crate::kdbx_core::vault_file::{FileFingerprint, read_with_fingerprint};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 use zeroize::Zeroize;
@@ -103,10 +104,11 @@ pub enum VaultState {
         /// When the vault was last touched by a tool call. The Phase 2 idle
         /// timer reads this; [`Vault::touch`] updates it.
         last_activity: Instant,
-        /// The vault file's mtime at unlock time. The Phase 3 save path compares
-        /// the current mtime against this to refuse writes when the file changed
-        /// out from under us.
-        file_mtime_at_unlock: SystemTime,
+        /// The identity of the vault file this session's canonical db came
+        /// from: the sha256 of the exact bytes parsed at unlock (or written by
+        /// the last save) plus the mtime seen on that handle. The save path
+        /// re-reads the file and refuses when the content differs.
+        file_baseline: FileFingerprint,
     },
 }
 
@@ -160,21 +162,15 @@ impl Vault {
             return Err(ErrorCode::VaultAlreadyUnlocked.into());
         }
 
-        let bytes = std::fs::read(&self.path).map_err(|e| {
+        // Read the bytes and their fingerprint through one handle, so the
+        // external-modification baseline is exactly the content we parse.
+        let (bytes, file_baseline) = read_with_fingerprint(&self.path).map_err(|e| {
             CoreError::new(ErrorCode::VaultNotFound).with_message(format!(
                 "could not read vault file at {}: {}",
                 self.path.display(),
                 e
             ))
         })?;
-
-        // Capture the mtime now, before decryption, so the external-modification
-        // baseline reflects the bytes we actually parsed. If the metadata read
-        // fails, fall back to the current time, which is conservative: the
-        // Phase 3 save check would then refuse on any later modification.
-        let file_mtime_at_unlock = std::fs::metadata(&self.path)
-            .and_then(|m| m.modified())
-            .unwrap_or_else(|_| SystemTime::now());
 
         let mut key = keepass::DatabaseKey::new().with_password(password);
         if let Some(keyfile_bytes) = keyfile {
@@ -195,7 +191,7 @@ impl Vault {
             working_db,
             key,
             last_activity: Instant::now(),
-            file_mtime_at_unlock,
+            file_baseline,
         };
 
         // A fresh session has no prior discard to report. Clear any LockInfo
@@ -413,18 +409,24 @@ impl Vault {
         }
     }
 
-    /// The vault file's mtime as captured at unlock. The save path compares the
-    /// current on-disk mtime against this to detect external modification.
+    /// The fingerprint of the vault file the canonical db corresponds to:
+    /// recorded at unlock, replaced by each successful save. The save path
+    /// compares the on-disk content against it.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn file_baseline(&self) -> CoreResult<FileFingerprint> {
+        match &self.state {
+            VaultState::Unlocked { file_baseline, .. } => Ok(*file_baseline),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// The vault file's mtime as observed with the baseline content (at unlock
+    /// or the last save). Reporting only: conflict detection uses the content.
     ///
     /// [`ErrorCode::VaultLocked`] when locked.
     pub fn mtime_at_unlock(&self) -> CoreResult<SystemTime> {
-        match &self.state {
-            VaultState::Unlocked {
-                file_mtime_at_unlock,
-                ..
-            } => Ok(*file_mtime_at_unlock),
-            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
-        }
+        self.file_baseline().map(|b| b.mtime())
     }
 
     /// Borrow the working db and the master key together, for serializing the
@@ -480,19 +482,19 @@ impl Vault {
 
     /// Record that the working db was successfully written to disk: adopt it as
     /// the new canonical baseline (so `has_pending_changes` settles to false) and
-    /// update the external-modification mtime to the freshly written file's.
+    /// replace the file baseline with the fingerprint of the bytes written.
     ///
     /// [`ErrorCode::VaultLocked`] when locked.
-    pub fn mark_saved(&mut self, new_mtime: SystemTime) -> CoreResult<()> {
+    pub fn mark_saved(&mut self, written: FileFingerprint) -> CoreResult<()> {
         match &mut self.state {
             VaultState::Unlocked {
                 canonical_db,
                 working_db,
-                file_mtime_at_unlock,
+                file_baseline,
                 ..
             } => {
                 *canonical_db = working_db.clone();
-                *file_mtime_at_unlock = new_mtime;
+                *file_baseline = written;
                 Ok(())
             }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
@@ -746,11 +748,13 @@ mod tests {
         }
         assert!(vault.has_pending_changes());
 
-        // Marking saved adopts working as the new canonical baseline and updates
-        // the external-modification mtime.
+        // Marking saved adopts working as the new canonical baseline and
+        // replaces the file fingerprint.
         let new_mtime = SystemTime::now() + Duration::from_secs(5);
-        vault.mark_saved(new_mtime).expect("mark saved");
+        let written = FileFingerprint::new(b"new bytes", new_mtime);
+        vault.mark_saved(written).expect("mark saved");
         assert!(!vault.has_pending_changes());
+        assert_eq!(vault.file_baseline().expect("unlocked"), written);
         assert_eq!(vault.mtime_at_unlock().expect("unlocked"), new_mtime);
     }
 

@@ -395,10 +395,10 @@ impl AuditLog {
         // stderr first so the record is visible even if the file write fails.
         let mut stderr = std::io::stderr();
         let _ = writeln!(stderr, "{line}");
-        if let Some(file) = &self.file {
-            if let Ok(mut handle) = file.lock() {
-                let _ = writeln!(handle, "{line}");
-            }
+        if let Some(file) = &self.file
+            && let Ok(mut handle) = file.lock()
+        {
+            let _ = writeln!(handle, "{line}");
         }
     }
 }
