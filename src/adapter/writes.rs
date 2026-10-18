@@ -21,7 +21,6 @@ use crate::adapter::{KdbxServer, responses};
 use crate::engine::address::{EntryAddress, GroupAddress};
 use crate::engine::audit::{AuditEvent, StageDiscardReason, WriteTool};
 use crate::engine::error::{CoreError, ErrorCode};
-use crate::engine::path::vault_path_to_entry;
 use crate::engine::secret::Secret;
 use crate::engine::stage;
 use crate::engine::vault_file::SaveStep;
@@ -177,9 +176,12 @@ impl KdbxServer {
         };
 
         // Capture the audit data into owned values before returning. The new
-        // entry's path is built from the working db (None only when its group
-        // has no addressable path); the uuid comes off the id.
-        let path = vault_path_to_entry(working, entry_id).map(|p| p.format());
+        // entry's path comes from a fresh view of the working db (None only
+        // when its group has no addressable path); the uuid comes off the id.
+        let path = vault
+            .view()
+            .ok()
+            .and_then(|view| view.path_string(entry_id.uuid()));
         let uuid = entry_id.uuid().to_string();
 
         self.emit(AuditEvent::WriteStaged {
@@ -238,7 +240,10 @@ impl KdbxServer {
 
         // Report the canonical path of the entry actually written (re-derived
         // after the write, since a Title change moves it) and its uuid.
-        let path = vault_path_to_entry(working, entry_id).map(|p| p.format());
+        let path = vault
+            .view()
+            .ok()
+            .and_then(|view| view.path_string(entry_id.uuid()));
         let uuid = entry_id.uuid().to_string();
         self.emit(AuditEvent::WriteStaged {
             tool: WriteTool::KdbxUpdateField,

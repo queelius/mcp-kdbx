@@ -533,6 +533,11 @@ fn error_path_invalid() {
         server.call_error_code("kdbx_list_entries", json!({ "group_path": "Web//x" })),
         "PATH_INVALID"
     );
+    // The ecosystem grammar (kdbx-core) is strict about escapes: an unknown
+    // escape is malformed rather than decoded to the bare character.
+    let err = server.call_error("kdbx_get_entry", json!({ "path": "/B\\q" }));
+    assert_eq!(err["code"], json!("PATH_INVALID"));
+    assert_eq!(err["details"]["path"], json!("/B\\q"));
 }
 
 #[test]
@@ -778,12 +783,15 @@ fn group_tools_accept_uuid_addressing() {
     let finance = server.call_ok("kdbx_list_groups", json!({ "uuid": personal["uuid"] }))["groups"]
         [0]
     .clone();
-    assert_eq!(finance["path"], json!("/Personal/Finance"));
+    // Group paths keep their trailing slash (kdbx-core's canonical form), so
+    // an emitted group path re-resolves as a group, never as an entry.
+    assert_eq!(finance["path"], json!("/Personal/Finance/"));
     let banking = server.call_ok(
         "kdbx_list_groups",
-        json!({ "parent_path": "/Personal/Finance" }),
+        json!({ "parent_path": finance["path"] }),
     )["groups"][0]
         .clone();
+    assert_eq!(banking["path"], json!("/Personal/Finance/Banking/"));
 
     let entries = server.call_ok("kdbx_list_entries", json!({ "uuid": banking["uuid"] }));
     assert_eq!(entries["entries"][0]["title"], json!("Checking Account"));

@@ -19,7 +19,7 @@
 //! id does not resolve, which the calling tool maps to `ENTRY_NOT_FOUND` or
 //! `GROUP_NOT_FOUND`.
 
-use crate::engine::path::{vault_path_to_entry, vault_path_to_group};
+use crate::engine::view::View;
 use crate::engine::visibility::{STANDARD_FIELDS, is_standard_field, metadata_value};
 use chrono::NaiveDateTime;
 use keepass::Database;
@@ -33,7 +33,7 @@ const NOTES_PREVIEW_CHARS: usize = 200;
 
 /// Build the list-view summary of an entry (the `kdbx_list_entries` and
 /// `kdbx_find_entry` element shape). Metadata only.
-pub fn entry_summary(db: &Database, entry_id: EntryId) -> Option<Value> {
+pub fn entry_summary(db: &Database, view: &View, entry_id: EntryId) -> Option<Value> {
     let entry = db.entry(entry_id)?;
     let notes_preview = metadata_value(&entry, fields::NOTES).map(|n| {
         let preview: String = n.chars().take(NOTES_PREVIEW_CHARS).collect();
@@ -41,7 +41,7 @@ pub fn entry_summary(db: &Database, entry_id: EntryId) -> Option<Value> {
     });
     Some(json!({
         "title": entry.get_title().unwrap_or(""),
-        "path": entry_path(db, entry_id),
+        "path": view.path_string(entry_id.uuid()),
         "uuid": entry.id().uuid().to_string(),
         "username": metadata_value(&entry, fields::USERNAME),
         "url": metadata_value(&entry, fields::URL),
@@ -57,11 +57,11 @@ pub fn entry_summary(db: &Database, entry_id: EntryId) -> Option<Value> {
 /// Build the full detail view of an entry (the `kdbx_get_entry` shape): full
 /// notes and the three timestamps, still without any protected value or
 /// attachment bytes.
-pub fn entry_detail(db: &Database, entry_id: EntryId) -> Option<Value> {
+pub fn entry_detail(db: &Database, view: &View, entry_id: EntryId) -> Option<Value> {
     let entry = db.entry(entry_id)?;
     Some(json!({
         "title": entry.get_title().unwrap_or(""),
-        "path": entry_path(db, entry_id),
+        "path": view.path_string(entry_id.uuid()),
         "uuid": entry.id().uuid().to_string(),
         "username": metadata_value(&entry, fields::USERNAME),
         "url": metadata_value(&entry, fields::URL),
@@ -77,11 +77,11 @@ pub fn entry_detail(db: &Database, entry_id: EntryId) -> Option<Value> {
 }
 
 /// Build the summary of a group (the `kdbx_list_groups` element shape).
-pub fn group_summary(db: &Database, group_id: GroupId) -> Option<Value> {
+pub fn group_summary(db: &Database, view: &View, group_id: GroupId) -> Option<Value> {
     let group = db.group(group_id)?;
     Some(json!({
         "name": group.name.clone(),
-        "path": group_path(db, group_id),
+        "path": view.path_string(group_id.uuid()),
         "uuid": group.id().uuid().to_string(),
         "num_entries": group.entries().count(),
         "num_subgroups": group.groups().count(),
@@ -151,16 +151,6 @@ fn has_otp(entry: &keepass::db::EntryRef<'_>) -> bool {
     crate::engine::totp::resolve_for_entry(entry).is_some()
 }
 
-/// The canonical path string of an entry, or null when it cannot be built.
-fn entry_path(db: &Database, entry_id: EntryId) -> Option<String> {
-    vault_path_to_entry(db, entry_id).map(|p| p.format())
-}
-
-/// The canonical path string of a group, or null when it cannot be built.
-fn group_path(db: &Database, group_id: GroupId) -> Option<String> {
-    vault_path_to_group(db, group_id).map(|p| p.format())
-}
-
 /// Format an optional KDBX timestamp as `YYYY-MM-DDTHH:MM:SSZ`, or null.
 fn format_time(time: Option<NaiveDateTime>) -> Option<String> {
     time.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -221,7 +211,7 @@ mod tests {
     #[test]
     fn entry_summary_is_metadata_only_with_path_and_customs() {
         let (db, id, _) = db_with_entry();
-        let v = entry_summary(&db, id).expect("entry exists");
+        let v = entry_summary(&db, &View::capture_ephemeral(&db), id).expect("entry exists");
         assert_eq!(v["title"], json!("MyBank"));
         assert_eq!(v["path"], json!("/Web/MyBank"));
         assert_eq!(v["username"], json!("alice"));
@@ -245,7 +235,7 @@ mod tests {
     #[test]
     fn entry_detail_has_full_notes_and_timestamps() {
         let (db, id, _) = db_with_entry();
-        let v = entry_detail(&db, id).expect("entry exists");
+        let v = entry_detail(&db, &View::capture_ephemeral(&db), id).expect("entry exists");
         assert_eq!(v["notes"], json!("a note"));
         assert!(v.get("created_at").is_some());
         assert!(v.get("modified_at").is_some());
@@ -305,7 +295,7 @@ mod tests {
     #[test]
     fn entry_summary_nulls_and_marks_protected_standard_fields() {
         let (db, id) = db_with_protected_standard_fields();
-        let v = entry_summary(&db, id).expect("entry exists");
+        let v = entry_summary(&db, &View::capture_ephemeral(&db), id).expect("entry exists");
         assert_eq!(v["username"], Value::Null);
         assert_eq!(v["url"], Value::Null);
         assert_eq!(v["notes_preview"], Value::Null);
@@ -321,7 +311,7 @@ mod tests {
     #[test]
     fn entry_detail_nulls_and_marks_protected_standard_fields() {
         let (db, id) = db_with_protected_standard_fields();
-        let v = entry_detail(&db, id).expect("entry exists");
+        let v = entry_detail(&db, &View::capture_ephemeral(&db), id).expect("entry exists");
         assert_eq!(v["username"], Value::Null);
         assert_eq!(v["url"], Value::Null);
         assert_eq!(v["notes"], Value::Null);
@@ -335,8 +325,8 @@ mod tests {
     fn unprotected_standard_fields_are_unchanged_and_listed_unprotected() {
         let (db, id, _) = db_with_entry();
         for v in [
-            entry_summary(&db, id).expect("entry exists"),
-            entry_detail(&db, id).expect("entry exists"),
+            entry_summary(&db, &View::capture_ephemeral(&db), id).expect("entry exists"),
+            entry_detail(&db, &View::capture_ephemeral(&db), id).expect("entry exists"),
         ] {
             assert_eq!(v["username"], json!("alice"));
             assert_eq!(v["url"], json!("https://bank.example"));
@@ -353,9 +343,9 @@ mod tests {
                 .collect();
             assert_eq!(names, ["Title", "UserName", "Password", "URL", "Notes"]);
         }
-        let summary = entry_summary(&db, id).unwrap();
+        let summary = entry_summary(&db, &View::capture_ephemeral(&db), id).unwrap();
         assert_eq!(summary["notes_preview"], json!("a note"));
-        let detail = entry_detail(&db, id).unwrap();
+        let detail = entry_detail(&db, &View::capture_ephemeral(&db), id).unwrap();
         assert_eq!(detail["notes"], json!("a note"));
     }
 
@@ -369,7 +359,7 @@ mod tests {
             e.edit(|e| e.set_unprotected(fields::TITLE, "Bare"));
             id
         };
-        let v = entry_summary(&db, id).expect("entry exists");
+        let v = entry_summary(&db, &View::capture_ephemeral(&db), id).expect("entry exists");
         assert_eq!(v["username"], Value::Null);
         assert_eq!(v["url"], Value::Null);
         assert_eq!(v["notes_preview"], Value::Null);
@@ -390,8 +380,8 @@ mod tests {
             id
         };
         for v in [
-            entry_summary(&db, id).unwrap(),
-            entry_detail(&db, id).unwrap(),
+            entry_summary(&db, &View::capture_ephemeral(&db), id).unwrap(),
+            entry_detail(&db, &View::capture_ephemeral(&db), id).unwrap(),
         ] {
             assert_eq!(v["title"], json!("Addressed"));
             assert!(
@@ -405,9 +395,9 @@ mod tests {
     #[test]
     fn group_summary_counts_children() {
         let (db, _, web) = db_with_entry();
-        let v = group_summary(&db, web).expect("group exists");
+        let v = group_summary(&db, &View::capture_ephemeral(&db), web).expect("group exists");
         assert_eq!(v["name"], json!("Web"));
-        assert_eq!(v["path"], json!("/Web"));
+        assert_eq!(v["path"], json!("/Web/"));
         assert_eq!(v["num_entries"], json!(1));
         assert_eq!(v["num_subgroups"], json!(0));
     }
@@ -422,7 +412,7 @@ mod tests {
                 .edit(|e| e.set_unprotected(fields::TITLE, "x"));
             d.iter_all_entries().next().unwrap().id()
         };
-        assert!(entry_summary(&db, other).is_none());
-        assert!(entry_detail(&db, other).is_none());
+        assert!(entry_summary(&db, &View::capture_ephemeral(&db), other).is_none());
+        assert!(entry_detail(&db, &View::capture_ephemeral(&db), other).is_none());
     }
 }

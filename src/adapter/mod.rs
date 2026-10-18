@@ -26,6 +26,7 @@ use crate::engine::config::Config;
 use crate::engine::error::{CoreError, ErrorCode};
 use crate::engine::secret::Secret;
 use crate::engine::vault::Vault;
+use crate::engine::view::View;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool_handler};
@@ -166,9 +167,10 @@ protected fields and attachments require a separate consent-gated reveal. Writes
 enabled) are staged in memory and committed atomically with kdbx_save_pending.\n\n\
 Paths: every path has a leading '/' (the root group is '/'), and '/' separates group names \
 from the entry title, as in /Web/Banking/MyBank. Inside a name, write a literal '/' as \\/, \
-a literal backslash as \\\\, and a literal ':' before digits as \\:. When siblings share a \
-name, ':N' picks the Nth (1-based), as in /Web/MyBank:2. A trailing '/' names a group, never \
-an entry. Copy paths verbatim from tool output; ordinals can shift between sessions, so \
+a literal backslash as \\\\, and a literal ':' before digits as \\:; a control character \
+appears as \\n, \\t, \\r or \\u{XXXX}, and any other backslash escape is invalid. When \
+siblings share a name, ':N' picks the Nth (1-based), as in /Web/MyBank:2. A trailing '/' \
+names a group, never an entry, and group paths in tool output always end in '/'. Copy paths verbatim from tool output; ordinals can shift between sessions, so \
 for a stable reference pass the entry's or group's uuid (every read returns it) instead of \
 its path. A record whose path is null has no addressable path: use its uuid.\n\n\
 Unlocking: call kdbx_unlock with no arguments; the server reads the master password from \
@@ -183,11 +185,12 @@ password into the chat.";
 /// addressing behave identically across reads, reveals, and writes.
 pub(crate) fn locate_entry<'a>(
     db: &'a keepass::Database,
+    view: &View,
     path: Option<&str>,
     uuid: Option<&str>,
     path_param: &str,
 ) -> Result<keepass::db::EntryRef<'a>, CoreError> {
-    let id = EntryAddress::from_parts(path, uuid, path_param)?.resolve(db)?;
+    let id = EntryAddress::from_parts(path, uuid, path_param)?.resolve(db, view)?;
     db.entry(id)
         .ok_or_else(|| CoreError::new(ErrorCode::EntryNotFound))
 }
@@ -196,10 +199,10 @@ pub(crate) fn locate_entry<'a>(
 /// path. Audit events and responses report this rather than echoing the
 /// caller's input, so they name the record actually touched.
 pub(crate) fn canonical_entry_path(
-    db: &keepass::Database,
+    view: &View,
     entry: &keepass::db::EntryRef<'_>,
 ) -> Option<String> {
-    crate::engine::path::vault_path_to_entry(db, entry.id()).map(|p| p.format())
+    view.path_string(entry.id().uuid())
 }
 
 /// Tool inputs wrap secret values in [`Secret`]; their JSON Schema is the inner

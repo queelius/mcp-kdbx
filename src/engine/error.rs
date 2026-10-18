@@ -106,7 +106,7 @@ impl ErrorCode {
             ErrorCode::FieldNameInvalid => "The field name is invalid.",
             ErrorCode::InvalidInput => "A supplied value is invalid.",
             ErrorCode::PathInvalid => {
-                "The path is malformed. Paths start with '/', separate groups with '/', escape a literal '/' as '\\/' and '\\' as '\\\\', and may end a segment with ':N' to pick the Nth same-named sibling."
+                "The path is malformed. Paths start with '/', separate groups with '/', escape a literal '/' as '\\/', '\\' as '\\\\' and a ':' before digits as '\\:', write control characters as '\\n', '\\t', '\\r' or '\\u{XXXX}', and may end a segment with ':N' to pick the Nth same-named sibling."
             }
             ErrorCode::VaultUnreadable => {
                 "The vault file is not a readable KDBX database (see details.reason)."

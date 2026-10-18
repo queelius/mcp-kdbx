@@ -23,7 +23,10 @@
 
 use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 use crate::engine::vault_file::{FileFingerprint, read_with_fingerprint};
+use crate::engine::view::{View, ephemeral_key};
+use kdbx_core::fingerprint::FingerprintKey;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 use zeroize::Zeroize;
 
@@ -152,6 +155,14 @@ pub enum VaultState {
         /// the last save) plus the mtime seen on that handle. The save path
         /// re-reads the file and refuses when the content differs.
         file_baseline: FileFingerprint,
+        /// The key this session's snapshots are sealed under. Zeroized on
+        /// drop, so locking (which drops this state) wipes it.
+        fingerprint_key: FingerprintKey,
+        /// The cached [`View`] of `working_db`, captured on first use and
+        /// dropped by every path that can change the working db
+        /// ([`Vault::working_db_mut`], a discard, a save). A lock drops it
+        /// with the rest of this state.
+        view: OnceLock<View>,
     },
 }
 
@@ -245,6 +256,8 @@ impl Vault {
             key,
             last_activity: Instant::now(),
             file_baseline,
+            fingerprint_key: ephemeral_key(),
+            view: OnceLock::new(),
         };
 
         // Hand back the prior lock's discard summary (consuming it): the caller
@@ -344,12 +357,45 @@ impl Vault {
 
     /// Mutably borrow the working db so write tools can stage changes.
     ///
+    /// Drops the cached [`View`]: the caller may change the working db, so
+    /// the next [`view`](Self::view) captures it afresh.
+    ///
     /// [`ErrorCode::VaultLocked`] when locked.
     pub fn working_db_mut(&mut self) -> CoreResult<&mut keepass::Database> {
         match &mut self.state {
-            VaultState::Unlocked { working_db, .. } => Ok(working_db),
+            VaultState::Unlocked {
+                working_db, view, ..
+            } => {
+                view.take();
+                Ok(working_db)
+            }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
         }
+    }
+
+    /// The [`View`] of the working db (its kdbx-core snapshot, sealed under
+    /// this session's fingerprint key, and its path index), captured on first
+    /// use and reused until the working db can have changed.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn view(&self) -> CoreResult<&View> {
+        match &self.state {
+            VaultState::Unlocked {
+                working_db,
+                fingerprint_key,
+                view,
+                ..
+            } => Ok(view.get_or_init(|| View::capture(working_db, fingerprint_key))),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// The working db and its [`View`] together, for tools that resolve an
+    /// address against the view and then read the live record.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn working_db_and_view(&self) -> CoreResult<(&keepass::Database, &View)> {
+        Ok((self.working_db()?, self.view()?))
     }
 
     /// Borrow the canonical db (the on-disk baseline).
@@ -528,9 +574,11 @@ impl Vault {
             VaultState::Unlocked {
                 canonical_db,
                 working_db,
+                view,
                 ..
             } => {
                 *working_db = canonical_db.clone();
+                view.take();
                 Ok(pending)
             }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
@@ -548,10 +596,12 @@ impl Vault {
                 canonical_db,
                 working_db,
                 file_baseline,
+                view,
                 ..
             } => {
                 *canonical_db = working_db.clone();
                 *file_baseline = written;
+                view.take();
                 Ok(())
             }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
@@ -871,6 +921,42 @@ mod tests {
         db.entry_mut(id)
             .expect("entry")
             .edit(|e| e.set_unprotected(keepass::db::fields::URL, "https://example.com"));
+    }
+
+    /// The URL the cached view shows for the fixture's only entry.
+    fn viewed_url(vault: &Vault) -> Option<String> {
+        let view = vault.view().expect("unlocked");
+        let entry = view.snapshot().entries().next().expect("an entry");
+        kdbx_core::visibility::metadata_value(entry, "URL").map(str::to_owned)
+    }
+
+    #[test]
+    fn view_is_cached_until_the_working_db_can_change() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        assert_eq!(
+            vault.view().unwrap_err().code_enum(),
+            ErrorCode::VaultLocked
+        );
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        let first: *const View = vault.view().unwrap();
+        let again: *const View = vault.view().unwrap();
+        assert_eq!(first, again, "a second read reuses the captured view");
+        assert_eq!(viewed_url(&vault), None);
+
+        // Any mutable access drops the cache, so the change is visible.
+        stage_one_change(&mut vault);
+        assert_eq!(viewed_url(&vault).as_deref(), Some("https://example.com"));
+
+        // A discard drops it again.
+        vault.discard_working().expect("discard");
+        assert_eq!(viewed_url(&vault), None);
+
+        // The view is sealed: the fixture's protected password is a
+        // fingerprint, not plaintext.
+        let view = vault.view().unwrap();
+        let entry = view.snapshot().entries().next().unwrap();
+        assert!(entry.field("Password").unwrap().value.is_sealed());
     }
 
     #[test]

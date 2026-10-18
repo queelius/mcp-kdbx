@@ -27,22 +27,19 @@
 
 use crate::engine::address::{EntryAddress, GroupAddress};
 use crate::engine::error::{CoreError, CoreResult, ErrorCode};
-use crate::engine::path::{vault_path_to_entry, vault_path_to_group};
 use crate::engine::secret::Secret;
 use crate::engine::vault::Vault;
 use crate::engine::vault_file::{
     LockUnavailable, SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint,
     resolve_write_target, write_atomically,
 };
+use crate::engine::view::{View, ephemeral_key};
 use diff_kdbx::{Change, DiffOptions, NodeStatus, Property, PropertyChange, Shown};
-use kdbx_core::capture::keepass_0_12::capture;
-use kdbx_core::fingerprint::FingerprintKey;
-use kdbx_core::model::{Sealing, Value as SnapValue};
+use kdbx_core::model::Value as SnapValue;
 use keepass::Database;
 use keepass::db::{EntryId, Value, fields};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
-use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
 // Input structs (built by the Phase 3 MCP adapter from tool JSON).
@@ -99,7 +96,7 @@ pub struct DiffPending {
 ///
 /// `path` and `group_path` are `None` (JSON `null`) when the record has no
 /// addressable path (an empty title or group name, see
-/// [`vault_path_to_entry`]); `uuid` always identifies it.
+/// `kdbx_core::path::PathIndex`); `uuid` always identifies it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AddedEntry {
     pub path: Option<String>,
@@ -316,7 +313,7 @@ pub fn add_entry(
         validate_field_write(&f.name, f.value.expose())?;
     }
 
-    let group_id = group.resolve(working)?;
+    let group_id = group.resolve(working, &View::capture_ephemeral(working))?;
 
     // Clone the inputs the closure needs. The edit closure is FnOnce and the
     // keepass write API takes owned values, so we move owned copies in.
@@ -383,7 +380,7 @@ pub fn update_field(
 ) -> CoreResult<EntryId> {
     validate_field_write(field_name, value)?;
 
-    let entry_id = target.resolve(working)?;
+    let entry_id = target.resolve(working, &View::capture_ephemeral(working))?;
 
     // Decide the protection state before taking the mutable borrow: when the
     // caller did not force it, read the current field's state (false when the
@@ -529,21 +526,6 @@ fn maintain_history(working: &mut Database, entry_id: EntryId) {
 // The stage diff.
 // ---------------------------------------------------------------------------
 
-/// A fingerprint key for one stage diff: 32 bytes from the OS random number
-/// generator. The diff compares both sides within one call, so a fresh key
-/// costs nothing (no KDF) and makes every fingerprint meaningless outside
-/// the call.
-///
-/// Panics only if the OS random number generator fails, as `uuid::Uuid::new_v4`
-/// and keepass's own save path (which draws fresh nonces) would.
-fn ephemeral_key() -> FingerprintKey {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("the OS random number generator failed");
-    let key = FingerprintKey::from_bytes(bytes);
-    bytes.zeroize();
-    key
-}
-
 /// Compute the staged diff between the canonical baseline and the working db,
 /// mapped to the `kdbx_diff_pending` shape (spec section 4).
 ///
@@ -554,12 +536,10 @@ fn ephemeral_key() -> FingerprintKey {
 /// tools add entries and update fields, nothing else.
 pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
     let key = ephemeral_key();
-    let sealing = Sealing::Fingerprint(&key);
-    let change_set = diff_kdbx::compute(
-        &capture(canonical, &sealing),
-        &capture(working, &sealing),
-        &DiffOptions::default(),
-    );
+    let before = View::capture(canonical, &key);
+    let after = View::capture(working, &key);
+    let change_set =
+        diff_kdbx::compute(before.snapshot(), after.snapshot(), &DiffOptions::default());
 
     let mut added: Vec<AddedEntry> = Vec::new();
     let mut modified: Vec<ModifiedEntry> = Vec::new();
@@ -571,12 +551,12 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
         };
         match &node.status {
             NodeStatus::Added => {
-                if let Some(entry) = map_added_entry(working, node.uuid) {
+                if let Some(entry) = map_added_entry(working, &after, node.uuid) {
                     added.push(entry);
                 }
             }
             NodeStatus::Modified { changes, .. } => {
-                if let Some(entry) = map_modified_entry(working, node.uuid, changes) {
+                if let Some(entry) = map_modified_entry(&after, node.uuid, changes) {
                     modified.push(entry);
                 }
             }
@@ -587,16 +567,15 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
 
     // Stable order: sort each list by (group_path, title), with the uuid as a
     // final tie-break so same-titled siblings order deterministically. Modified
-    // entries carry no group_path field, so derive it from the working db.
+    // entries carry no group_path field, so derive it from the working view.
     added.sort_by(|a, b| {
         (&a.group_path, &a.title, &a.uuid).cmp(&(&b.group_path, &b.title, &b.uuid))
     });
     modified.sort_by_cached_key(|m| {
-        (
-            group_path_of(working, &m.uuid),
-            m.title.clone(),
-            m.uuid.clone(),
-        )
+        let group_path = uuid::Uuid::parse_str(&m.uuid)
+            .ok()
+            .and_then(|u| after.parent_path_string(u));
+        (group_path, m.title.clone(), m.uuid.clone())
     });
 
     let num_added = added.len();
@@ -613,31 +592,15 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
     }
 }
 
-/// The vault path of the group holding the entry whose hyphenated UUID is
-/// `uuid`, used as a sort key. `None` when the entry is gone or its group has
-/// no addressable path.
-fn group_path_of(working: &Database, uuid: &str) -> Option<String> {
-    let entry = working
-        .iter_all_entries()
-        .find(|e| e.id().uuid().hyphenated().to_string() == uuid)?;
-    containing_group_path(working, &entry)
-}
-
-/// The vault path of the group that holds `entry`, or `None` when that group
-/// has no addressable path.
-fn containing_group_path(working: &Database, entry: &keepass::db::EntryRef<'_>) -> Option<String> {
-    vault_path_to_group(working, entry.parent().id()).map(|p| p.format())
-}
-
-/// Build an [`AddedEntry`] by looking up `uuid` in the working db.
-fn map_added_entry(working: &Database, uuid: uuid::Uuid) -> Option<AddedEntry> {
+/// Build an [`AddedEntry`] for the entry `uuid` of the working db, whose
+/// [`View`] is `after`.
+fn map_added_entry(working: &Database, after: &View, uuid: uuid::Uuid) -> Option<AddedEntry> {
     let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
-    let eid = entry_ref.id();
 
     // Both paths are None for a record with no addressable path. There is no
     // fallback string: a placeholder like "/" would alias the root group.
-    let path = vault_path_to_entry(working, eid).map(|p| p.format());
-    let group_path = containing_group_path(working, &entry_ref);
+    let path = after.path_string(uuid);
+    let group_path = after.parent_path_string(uuid);
 
     let title = entry_ref.get_title().unwrap_or("").to_string();
     let field_count = entry_ref.fields.len();
@@ -658,20 +621,18 @@ fn map_added_entry(working: &Database, uuid: uuid::Uuid) -> Option<AddedEntry> {
     })
 }
 
-/// Build a [`ModifiedEntry`] by looking up `uuid` in the working db and
+/// Build a [`ModifiedEntry`] by looking up `uuid` in the working view and
 /// partitioning its property changes into field-level and attachment-level
 /// lists. Other properties (tags, history items, icons) are not part of the
 /// v0.1 diff surface.
 fn map_modified_entry(
-    working: &Database,
+    after: &View,
     uuid: uuid::Uuid,
     changes: &[PropertyChange],
 ) -> Option<ModifiedEntry> {
-    let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
-    let eid = entry_ref.id();
-
-    let path = vault_path_to_entry(working, eid).map(|p| p.format());
-    let title = entry_ref.get_title().unwrap_or("").to_string();
+    let entry = after.snapshot().find_entry(uuid)?;
+    let path = after.path_string(uuid);
+    let title = entry.title().unwrap_or("").to_string();
 
     let mut field_out: Vec<FieldChangeOut> = Vec::new();
     let mut attachment_out: Vec<AttachmentChangeOut> = Vec::new();
@@ -846,8 +807,8 @@ fn absolute_path_string(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::path::VaultPath;
     use crate::engine::vault::Vault;
+    use kdbx_core::path::VaultPath;
     use keepass::{Database, DatabaseKey};
     use std::io::Write;
     use std::path::PathBuf;
@@ -881,6 +842,11 @@ mod tests {
 
     fn gaddr(s: &str) -> GroupAddress {
         GroupAddress::Path(path(s))
+    }
+
+    /// Resolve the entry path `s` in `db`, as the write tools do.
+    fn resolve(db: &Database, s: &str) -> CoreResult<EntryId> {
+        addr(s).resolve(db, &View::capture_ephemeral(db))
     }
 
     fn simple_input(title: &str) -> EntryInput {
@@ -926,7 +892,7 @@ mod tests {
         assert_eq!(entry.get_title(), Some("New Root Entry"));
         assert_eq!(entry.get("UserName"), Some("alice"));
         // Resolves by path too.
-        let resolved = path("/New Root Entry").resolve_entry(&db).expect("resolve");
+        let resolved = resolve(&db, "/New Root Entry").expect("resolve");
         assert_eq!(resolved, id);
     }
 
@@ -935,7 +901,7 @@ mod tests {
         let mut db = build_db();
         let id =
             add_entry(&mut db, &gaddr("/Web/"), &simple_input("Nested")).expect("add into /Web");
-        let resolved = path("/Web/Nested").resolve_entry(&db).expect("resolve");
+        let resolved = resolve(&db, "/Web/Nested").expect("resolve");
         assert_eq!(resolved, id);
     }
 
@@ -1104,7 +1070,7 @@ mod tests {
         };
         let err = add_entry(&mut db, &gaddr("/"), &input).expect_err("Title in fields");
         assert_eq!(err.code_enum(), ErrorCode::FieldNameInvalid);
-        assert!(path("/Valid").resolve_entry(&db).is_err(), "nothing staged");
+        assert!(resolve(&db, "/Valid").is_err(), "nothing staged");
     }
 
     #[test]
@@ -1117,7 +1083,7 @@ mod tests {
         }
         // A valid rename works and the entry is reachable at its new path.
         update_field(&mut db, &addr("/Existing"), fields::TITLE, "Renamed", None).unwrap();
-        assert!(path("/Renamed").resolve_entry(&db).is_ok());
+        assert!(resolve(&db, "/Renamed").is_ok());
     }
 
     #[test]
@@ -1165,7 +1131,7 @@ mod tests {
             None,
         )
         .expect("update");
-        let id = path("/Existing").resolve_entry(&db).expect("resolve");
+        let id = resolve(&db, "/Existing").expect("resolve");
         let entry = db.entry(id).expect("entry");
         assert_eq!(entry.get("URL"), Some("https://new.example.com"));
     }
@@ -1177,7 +1143,7 @@ mod tests {
         // protected.
         update_field(&mut db, &addr("/Existing"), "Password", "new-secret", None)
             .expect("update password");
-        let id = path("/Existing").resolve_entry(&db).expect("resolve");
+        let id = resolve(&db, "/Existing").expect("resolve");
         let entry = db.entry(id).expect("entry");
         let pw = entry.fields.get("Password").expect("password");
         assert!(pw.is_protected(), "protection preserved when None");
@@ -1202,7 +1168,7 @@ mod tests {
         let mut db = build_db();
         update_field(&mut db, &addr("/Existing"), "URL", "secret-url", Some(true))
             .expect("force protect");
-        let id = path("/Existing").resolve_entry(&db).expect("resolve");
+        let id = resolve(&db, "/Existing").expect("resolve");
         let url = db
             .entry(id)
             .unwrap()
@@ -1217,14 +1183,14 @@ mod tests {
     fn update_field_empty_value_clears() {
         let mut db = build_db();
         update_field(&mut db, &addr("/Existing"), "URL", "", None).expect("clear");
-        let id = path("/Existing").resolve_entry(&db).expect("resolve");
+        let id = resolve(&db, "/Existing").expect("resolve");
         assert_eq!(db.entry(id).unwrap().get("URL"), Some(""));
     }
 
     /// Backdate every timestamp of the entry at `p` so a modification made
     /// now is visible at KDBX's one-second precision.
     fn backdate(db: &mut Database, p: &str) {
-        let id = path(p).resolve_entry(db).unwrap();
+        let id = resolve(db, p).unwrap();
         let old = chrono::DateTime::from_timestamp(1_600_000_000, 0)
             .unwrap()
             .naive_utc();
@@ -1237,7 +1203,7 @@ mod tests {
     fn update_field_snapshots_history_and_bumps_modification_time() {
         let mut db = build_db();
         backdate(&mut db, "/Existing");
-        let id = path("/Existing").resolve_entry(&db).unwrap();
+        let id = resolve(&db, "/Existing").unwrap();
         let (created, modified) = {
             let e = db.entry(id).unwrap();
             assert!(e.history.is_none() || e.history.as_ref().unwrap().get_entries().is_empty());
@@ -1264,7 +1230,7 @@ mod tests {
     /// The URL values held by the history snapshots of the entry at `p`, in
     /// stored order.
     fn history_urls(db: &Database, p: &str) -> Vec<String> {
-        let id = path(p).resolve_entry(db).unwrap();
+        let id = resolve(db, p).unwrap();
         db.entry(id)
             .unwrap()
             .history
@@ -1431,7 +1397,11 @@ mod tests {
         let a = &d.added[0];
         assert_eq!(a.title, "Brand New");
         assert_eq!(a.path.as_deref(), Some("/Web/Brand New"));
-        assert_eq!(a.group_path.as_deref(), Some("/Web"));
+        assert_eq!(
+            a.group_path.as_deref(),
+            Some("/Web/"),
+            "group paths keep their trailing slash"
+        );
         // Title plus the two fields.
         assert_eq!(a.field_count, 3);
         assert!(!a.has_attachments);

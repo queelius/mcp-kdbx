@@ -102,16 +102,22 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let (db, view) = match vault.working_db_and_view() {
+            Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
 
-        let entry = match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+        let entry = match locate_entry(
+            db,
+            view,
+            params.path.as_deref(),
+            params.uuid.as_deref(),
+            "path",
+        ) {
             Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let target_path = canonical_entry_path(db, &entry);
+        let target_path = canonical_entry_path(view, &entry);
 
         // Read the value into an owned String before emitting and returning, so
         // we do not hold a borrow into the db across the audit emit.
@@ -149,16 +155,22 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let (db, view) = match vault.working_db_and_view() {
+            Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
 
-        let entry = match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+        let entry = match locate_entry(
+            db,
+            view,
+            params.path.as_deref(),
+            params.uuid.as_deref(),
+            "path",
+        ) {
             Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let target_path = canonical_entry_path(db, &entry);
+        let target_path = canonical_entry_path(view, &entry);
 
         // Look the field up directly so we can distinguish "no such field"
         // (FIELD_NOT_FOUND) from "present but not protected" (FIELD_NOT_PROTECTED).
@@ -205,13 +217,14 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let (db, view) = match vault.working_db_and_view() {
+            Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
 
         let entry = match locate_entry(
             db,
+            view,
             params.entry_path.as_deref(),
             params.uuid.as_deref(),
             "entry_path",
@@ -219,7 +232,7 @@ impl KdbxServer {
             Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let target_path = canonical_entry_path(db, &entry);
+        let target_path = canonical_entry_path(view, &entry);
 
         // Find the attachment by its per-entry name, reading the bytes into an
         // owned Vec so the response and emit do not borrow the db.
@@ -279,16 +292,22 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let (db, view) = match vault.working_db_and_view() {
+            Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
 
-        let entry = match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+        let entry = match locate_entry(
+            db,
+            view,
+            params.path.as_deref(),
+            params.uuid.as_deref(),
+            "path",
+        ) {
             Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let target_path = canonical_entry_path(db, &entry);
+        let target_path = canonical_entry_path(view, &entry);
 
         // Resolve a config (otpauth, KeePass native, then legacy) through
         // the shared resolver, the same one the read views use for has_otp, so
