@@ -57,6 +57,11 @@ rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io"] }
 # it without breaking the core/adapter split.
 schemars = "1"
 
+# O_NOFOLLOW / O_NONBLOCK / ELOOP for opening the sidecar writer-lock file
+# safely (kdbx_core::vault_file). Already in the tree through tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Gates the gen-fixtures helper binary (added in Phase 4). Matches the
 # diff-kdbx / web-kdbx convention of a `cli`-gated fixture generator.

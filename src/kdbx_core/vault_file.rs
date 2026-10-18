@@ -161,21 +161,50 @@ impl WriterLock {
 /// the lock file exists but this user cannot write it (another user created
 /// it), it is opened read-only instead: flock(2) needs only an open
 /// descriptor, not write access, so the lock still excludes other savers.
+///
+/// Someone who can write the vault directory could plant something other than
+/// a lock file at the path. On Unix both opens use `O_NOFOLLOW` (a symlink is
+/// refused rather than followed, so the lock cannot be redirected) and
+/// `O_NONBLOCK` (opening a FIFO cannot block the save past its lock-wait
+/// deadline), and the opened descriptor must be a regular file (not a FIFO,
+/// device, or socket). Each refusal is an error naming the problem.
 fn open_lock_file(path: &Path, vault: &Path) -> std::io::Result<File> {
-    let mut options = File::options();
-    options.read(true).write(true).create(true).truncate(false);
+    let mut read_write = File::options();
+    read_write
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false);
+    let mut read_only = File::options();
+    read_only.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mode = std::fs::metadata(vault)
             .map(|m| m.permissions().mode() & 0o666)
             .unwrap_or(0o600);
-        options.mode(mode);
+        read_write.mode(mode);
+        for options in [&mut read_write, &mut read_only] {
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
     }
-    match options.open(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => File::open(path),
+    let file = match read_write.open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => read_only.open(path),
         other => other,
     }
+    .map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return std::io::Error::other("it is a symlink, which is refused");
+        }
+        e
+    })?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other(
+            "it is not a regular file (a FIFO, device, socket, or directory is refused)",
+        ));
+    }
+    Ok(file)
 }
 
 /// Which step of a save failed. Carried as `details.step` on `WRITE_FAILED` so
@@ -491,6 +520,60 @@ mod tests {
         // And it still excludes a second holder.
         assert!(WriterLock::acquire(&vault, Duration::from_millis(30)).is_err());
         drop(held);
+    }
+
+    /// Run `f` on a helper thread and fail the test if it does not return
+    /// within a few seconds, so a regression that blocks shows up as a
+    /// failure instead of a hung suite.
+    fn within_deadline<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("must fail fast, not block")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_at_the_lock_path_is_refused() {
+        // Someone able to write the vault directory could point <vault>.lock
+        // somewhere else to redirect (or defeat) the lock.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("v.kdbx");
+        std::fs::write(&vault, b"x").unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, lock_path(&vault)).unwrap();
+
+        let err = WriterLock::acquire(&vault, Duration::ZERO).expect_err("symlink refused");
+        assert_eq!(err.code_enum(), ErrorCode::WriteFailed);
+        assert_eq!(err.details().unwrap()["step"], serde_json::json!("lock"));
+        assert!(err.message().contains("symlink"), "{}", err.message());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_fifo_at_the_lock_path_fails_fast_instead_of_blocking() {
+        // Opening a FIFO blocks until a peer opens the other end, which would
+        // hang the save past any lock-wait deadline.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("v.kdbx");
+        std::fs::write(&vault, b"x").unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(lock_path(&vault))
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+
+        let err = within_deadline(move || WriterLock::acquire(&vault, Duration::ZERO))
+            .expect_err("FIFO refused");
+        assert_eq!(err.code_enum(), ErrorCode::WriteFailed);
+        assert!(
+            err.message().contains("not a regular file"),
+            "{}",
+            err.message()
+        );
     }
 
     #[test]

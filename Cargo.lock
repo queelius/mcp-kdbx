@@ -1028,6 +1028,7 @@ dependencies = [
  "clap",
  "diff-kdbx",
  "keepass",
+ "libc",
  "predicates",
  "rmcp",
  "schemars",

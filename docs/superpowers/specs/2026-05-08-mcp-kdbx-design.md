@@ -1207,7 +1207,11 @@ integration tests assert them.
     A new sidecar takes the vault file's permission bits (filtered by the
     umask), and a sidecar this user cannot write is opened read-only (flock
     needs no write access), so a group-shared vault stays saveable by every
-    member. A
+    member. Both opens use `O_NOFOLLOW | O_NONBLOCK` and the descriptor must
+    be a regular file: a symlink or FIFO planted at the lock path (by anyone
+    able to write the vault directory) fails the save at once with
+    `WRITE_FAILED`, `details.step: "lock"`, instead of redirecting the lock
+    or blocking past the wait deadline. A
     lock still held after the wait is `WRITE_FAILED` with `details.step:
     "lock"`.
   - After the rename the baseline becomes the sha256 of the bytes written and
