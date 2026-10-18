@@ -64,12 +64,12 @@ pub struct FindEntryParams {
     /// The substring to look for. Plain substring match, case-insensitive: no
     /// regex, no globs, no boolean operators.
     pub query: String,
-    /// Which fields to search. Allowed values are `title`, `username`, `url`,
-    /// and `notes`. Defaults to `title`, `username`, and `url` when omitted;
-    /// notes is searched only when asked for explicitly. Unknown values are
-    /// ignored.
+    /// Which fields to search: any of `title`, `username`, `url`, `notes`.
+    /// Defaults to `title`, `username`, and `url` when omitted or empty; notes
+    /// is searched only when asked for explicitly. Any other value is
+    /// rejected.
     #[serde(default)]
-    pub fields: Option<Vec<String>>,
+    pub fields: Option<Vec<Field>>,
 }
 
 /// The default `parent_path` for `kdbx_list_groups`: the root group.
@@ -216,16 +216,10 @@ impl KdbxServer {
             Ok(db) => db,
             Err(e) => return responses::err(&e),
         };
-        // Map the requested field strings to Field variants, dropping any value
-        // that is not one of the four searchable fields. An empty resulting set
-        // (no field key given, or only unknowns) lets search apply its default
-        // (title, username, url), matching the spec's documented default.
-        let fields: Vec<Field> = params
-            .fields
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|name| parse_field(name))
-            .collect();
+        // The fields arrive as typed Field values (serde rejected anything
+        // else). An empty set lets search apply its default (title, username,
+        // url), matching the spec's documented default.
+        let fields: Vec<Field> = params.fields.unwrap_or_default();
 
         let results = search::find_entry(db, &params.query, &fields);
         let entries: Vec<_> = results
@@ -241,44 +235,9 @@ impl KdbxServer {
     }
 }
 
-/// Map a field name string (case-insensitive) to a [`Field`] variant, or `None`
-/// for an unrecognized name. The four searchable fields are the only valid
-/// values; anything else is dropped by the caller.
-fn parse_field(name: &str) -> Option<Field> {
-    match name.to_lowercase().as_str() {
-        "title" => Some(Field::Title),
-        "username" => Some(Field::Username),
-        "url" => Some(Field::Url),
-        "notes" => Some(Field::Notes),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_field_maps_the_four_searchable_names() {
-        assert_eq!(parse_field("title"), Some(Field::Title));
-        assert_eq!(parse_field("username"), Some(Field::Username));
-        assert_eq!(parse_field("url"), Some(Field::Url));
-        assert_eq!(parse_field("notes"), Some(Field::Notes));
-    }
-
-    #[test]
-    fn parse_field_is_case_insensitive() {
-        assert_eq!(parse_field("Title"), Some(Field::Title));
-        assert_eq!(parse_field("URL"), Some(Field::Url));
-        assert_eq!(parse_field("UserName"), Some(Field::Username));
-    }
-
-    #[test]
-    fn parse_field_drops_unknown_names() {
-        assert_eq!(parse_field("password"), None);
-        assert_eq!(parse_field(""), None);
-        assert_eq!(parse_field("otp"), None);
-    }
 
     #[test]
     fn default_root_path_is_slash() {

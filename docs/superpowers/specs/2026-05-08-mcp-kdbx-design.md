@@ -1295,3 +1295,9 @@ integration tests assert them.
   every failure that can only arise after decryption with some key (a block
   HMAC or XML error), stays `AUTH_FAILED`; `VAULT_UNREADABLE` emits no
   `auth_failed` audit event.
+- **`kdbx_find_entry.fields` is a closed enum.** Unknown names (and wrong
+  case, such as `"Title"`) used to be dropped silently, so a typo quietly
+  reverted to the default field set. The input is now typed: the schema lists
+  `title`, `username`, `url`, `notes`, and any other value is refused at the
+  protocol level as invalid params (JSON-RPC error -32602, "unknown variant"),
+  before the tool runs. An omitted or empty list still means the default set.

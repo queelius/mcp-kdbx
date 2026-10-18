@@ -449,6 +449,36 @@ fn error_auth_failed() {
 }
 
 #[test]
+fn find_entry_rejects_unknown_field_names_and_lists_the_allowed_ones() {
+    let mut server = unlocked("flat.kdbx");
+    // An unknown field name is rejected as invalid params instead of being
+    // silently dropped.
+    let resp = server.call_raw(
+        "kdbx_find_entry",
+        json!({ "query": "x", "fields": ["password"] }),
+    );
+    let rejected = resp.get("error").is_some() || resp["result"]["isError"] == json!(true);
+    assert!(rejected, "unknown field name must be rejected: {resp}");
+
+    // The schema enumerates the allowed values.
+    let tools = server.list_tools();
+    let find = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == json!("kdbx_find_entry"))
+        .unwrap()
+        .clone();
+    let schema = find["inputSchema"].to_string();
+    for name in ["title", "username", "url", "notes"] {
+        assert!(
+            schema.contains(&format!("\"{name}\"")),
+            "{name} missing: {schema}"
+        );
+    }
+}
+
+#[test]
 fn error_vault_unreadable() {
     // A file that is not a KDBX database fails before any key is checked:
     // VAULT_UNREADABLE with a reason, not AUTH_FAILED.

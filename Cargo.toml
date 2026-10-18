@@ -50,6 +50,11 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rmcp = { version = "1.7.0", features = ["server", "macros", "transport-io"] }
+# JSON Schema derive for core input enums (search::Field), so a tool schema can
+# enumerate allowed values. The same major version rmcp uses, so it unifies with
+# rmcp's copy; it is a JSON Schema crate, not an MCP type, so kdbx_core may use
+# it without breaking the core/adapter split.
+schemars = "1"
 
 [features]
 # Gates the gen-fixtures helper binary (added in Phase 4). Matches the

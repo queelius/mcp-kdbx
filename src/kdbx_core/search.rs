@@ -30,10 +30,13 @@ use crate::kdbx_core::visibility::metadata_value;
 
 /// One field of an entry that a search may look at.
 ///
-/// The string used to read each variant from a keepass entry is fixed here, so
-/// adding a searchable field is a one-line change with no parallel lookup table
-/// to keep in sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// This enum is also the tool input type: it deserializes from the lowercase
+/// variant name (`title`, `username`, `url`, `notes`) and anything else is a
+/// deserialization error, and its JSON Schema enumerates exactly those values.
+/// The keepass field each variant reads comes from `keepass::db::fields`.
+/// Adding a searchable field is one variant plus one arm in `keepass_name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum Field {
     Title,
     Username,
@@ -42,14 +45,14 @@ pub enum Field {
 }
 
 impl Field {
-    /// The keepass field name this variant reads. `get_title` and `get` on an
-    /// entry both key off these strings.
+    /// The keepass standard field this variant reads.
     fn keepass_name(&self) -> &'static str {
+        use keepass::db::fields;
         match self {
-            Field::Title => "Title",
-            Field::Username => "UserName",
-            Field::Url => "URL",
-            Field::Notes => "Notes",
+            Field::Title => fields::TITLE,
+            Field::Username => fields::USERNAME,
+            Field::Url => fields::URL,
+            Field::Notes => fields::NOTES,
         }
     }
 }
@@ -197,6 +200,35 @@ mod tests {
     use super::*;
     use keepass::Database;
     use keepass::db::fields;
+
+    #[test]
+    fn field_deserializes_only_the_four_lowercase_names() {
+        for (wire, field) in [
+            ("title", Field::Title),
+            ("username", Field::Username),
+            ("url", Field::Url),
+            ("notes", Field::Notes),
+        ] {
+            let parsed: Field = serde_json::from_value(serde_json::json!(wire)).unwrap();
+            assert_eq!(parsed, field);
+        }
+        // Unknown names are an error, not silently dropped (a typo used to
+        // shrink the search to the default set without telling anyone).
+        for bad in ["password", "Title", "otp", ""] {
+            assert!(
+                serde_json::from_value::<Field>(serde_json::json!(bad)).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn field_reads_the_keepass_standard_field_constants() {
+        assert_eq!(Field::Title.keepass_name(), fields::TITLE);
+        assert_eq!(Field::Username.keepass_name(), fields::USERNAME);
+        assert_eq!(Field::Url.keepass_name(), fields::URL);
+        assert_eq!(Field::Notes.keepass_name(), fields::NOTES);
+    }
 
     /// A field to set on a seeded entry: (keepass field name, value).
     type SeedField = (&'static str, &'static str);
