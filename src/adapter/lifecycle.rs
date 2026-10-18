@@ -12,10 +12,11 @@ use crate::kdbx_core::audit::AuditEvent;
 use crate::kdbx_core::error::{CoreError, ErrorCode};
 use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::unlock::resolve_unlock_source;
-use crate::kdbx_core::vault::LockReason;
+use crate::kdbx_core::vault::{LockReason, UnreadableReason};
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
+use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 /// Input for `kdbx_unlock`: an optional password and an optional base64 keyfile.
@@ -162,11 +163,25 @@ impl KdbxServer {
                 }))
             }
             Err(e) => {
-                if e.code_enum() == ErrorCode::AuthFailed {
-                    self.emit(AuditEvent::AuthFailed {
+                match e.code_enum() {
+                    ErrorCode::AuthFailed => self.emit(AuditEvent::AuthFailed {
                         source,
                         error_code: e.code_enum(),
-                    });
+                    }),
+                    // Not an authentication failure (no key was checked), but
+                    // still a failed unlock worth a record. The reason is the
+                    // typed UnreadableReason the vault put in the details.
+                    ErrorCode::VaultUnreadable => {
+                        let reason = e
+                            .details()
+                            .and_then(|d| d.get("reason"))
+                            .and_then(|r| UnreadableReason::deserialize(r).ok());
+                        self.emit(AuditEvent::UnlockFailed {
+                            unlock_source: source,
+                            reason,
+                        });
+                    }
+                    _ => {}
                 }
                 responses::err(&e)
             }

@@ -33,7 +33,7 @@
 
 use crate::kdbx_core::error::ErrorCode;
 use crate::kdbx_core::unlock::UnlockSource;
-use crate::kdbx_core::vault::LockReason;
+use crate::kdbx_core::vault::{LockReason, UnreadableReason};
 use crate::kdbx_core::vault_file::{LockUnavailable, SaveStep};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -129,6 +129,14 @@ pub enum AuditEvent {
         reason: LockReason,
         pending_discarded_count: u64,
     },
+    /// An unlock failed before any key was checked: the vault file is not a
+    /// readable KDBX database (`VAULT_UNREADABLE`). Distinct from
+    /// `auth_failed`, which is a wrong key. `reason` is null only if the
+    /// error carried none, which the vault never does.
+    UnlockFailed {
+        unlock_source: UnlockSource,
+        reason: Option<UnreadableReason>,
+    },
     /// Authentication failed. `source` matches the unlock source that failed.
     AuthFailed {
         source: UnlockSource,
@@ -215,6 +223,7 @@ impl AuditEvent {
             AuditEvent::VaultUnlocked { .. } => "vault_unlocked",
             AuditEvent::VaultLocked { .. } => "vault_locked",
             AuditEvent::AuthFailed { .. } => "auth_failed",
+            AuditEvent::UnlockFailed { .. } => "unlock_failed",
             AuditEvent::WriteStaged { .. } => "write_staged",
             AuditEvent::StageDiscarded { .. } => "stage_discarded",
             AuditEvent::SaveCommitted { .. } => "save_committed",
@@ -236,6 +245,7 @@ impl AuditEvent {
             AuditEvent::VaultUnlocked { .. } => Level::Info,
             AuditEvent::VaultLocked { .. } => Level::Info,
             AuditEvent::AuthFailed { .. } => Level::Error,
+            AuditEvent::UnlockFailed { .. } => Level::Warn,
             AuditEvent::WriteStaged { .. } => Level::Info,
             AuditEvent::StageDiscarded { .. } => Level::Info,
             AuditEvent::SaveCommitted { .. } => Level::Info,
@@ -363,6 +373,13 @@ impl AuditEvent {
                 "sha256": sha256,
             }),
             AuditEvent::WriterLockUnavailable { reason } => json!({ "reason": reason }),
+            AuditEvent::UnlockFailed {
+                unlock_source,
+                reason,
+            } => json!({
+                "unlock_source": unlock_source,
+                "reason": reason,
+            }),
             AuditEvent::GetOtp {
                 target_path,
                 target_uuid,
@@ -593,6 +610,14 @@ mod tests {
                 Level::Info,
             ),
             (
+                AuditEvent::UnlockFailed {
+                    unlock_source: UnlockSource::Input,
+                    reason: Some(UnreadableReason::NotKdbx),
+                },
+                "unlock_failed",
+                Level::Warn,
+            ),
+            (
                 AuditEvent::WriterLockUnavailable {
                     reason: LockUnavailable::NoLocks,
                 },
@@ -620,6 +645,7 @@ mod tests {
         r#"{"details":{"field_name":"RecoveryKey","sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_protected","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"attachment_name":"key.pem","sha256":"deadbeef","size_bytes":2048,"target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"download_attachment","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"requested_time_unix":null,"target_path":"/Web/GitHub","target_uuid":"abcd","time_unix":1700000000},"event":"get_otp","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"reason":"not_kdbx","unlock_source":"input"},"event":"unlock_failed","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"reason":"no_locks"},"event":"writer_lock_unavailable","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
     ];
 

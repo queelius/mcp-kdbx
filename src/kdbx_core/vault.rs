@@ -72,7 +72,7 @@ pub struct LockInfo {
 /// Why a vault file could not be read, for the `VAULT_UNREADABLE` error. Every
 /// reason is found before any key is checked, so naming it reveals nothing
 /// about the password.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnreadableReason {
     /// The file does not start with the KeePass signature.

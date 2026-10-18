@@ -535,3 +535,28 @@ fn download_attachment_audit_records_the_entry_uuid() {
     assert_eq!(download["details"]["target_uuid"], json!(uuid));
     assert_eq!(download["details"]["target_path"], json!("/Document A"));
 }
+
+#[test]
+fn unreadable_vault_unlock_is_audited_with_its_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("not-a-vault.kdbx");
+    std::fs::write(&vault, b"plain text, not a keepass database").unwrap();
+    let log = dir.path().join("audit.jsonl");
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", vault.to_str().unwrap()),
+        ("KDBX_LOG_FILE", log.to_str().unwrap()),
+    ]);
+    let err = server.call_error("kdbx_unlock", json!({ "password": FIXTURE_PASSWORD }));
+    assert_eq!(err["code"], json!("VAULT_UNREADABLE"));
+
+    let lines = read_audit_lines(&log);
+    let failed = lines
+        .iter()
+        .find(|l| l["event"] == json!("unlock_failed"))
+        .expect("unlock_failed event");
+    assert_eq!(failed["level"], json!("warn"));
+    assert_eq!(failed["details"]["reason"], json!("not_kdbx"));
+    assert_eq!(failed["details"]["unlock_source"], json!("input"));
+    // It is not an authentication failure, so no auth_failed event.
+    assert!(!lines.iter().any(|l| l["event"] == json!("auth_failed")));
+}

@@ -1306,8 +1306,9 @@ integration tests assert them.
   `corrupt_header` (the outer header does not parse or fails its sha256
   check). Naming these reveals nothing about the password. A wrong key, and
   every failure that can only arise after decryption with some key (a block
-  HMAC or XML error), stays `AUTH_FAILED`; `VAULT_UNREADABLE` emits no
-  `auth_failed` audit event.
+  HMAC or XML error), stays `AUTH_FAILED`. `VAULT_UNREADABLE` emits no
+  `auth_failed` event; it emits a warn-level `unlock_failed` event with
+  `unlock_source` and the `reason`.
 - **`kdbx_find_entry.fields` is a closed enum.** Unknown names (and wrong
   case, such as `"Title"`) used to be dropped silently, so a typo quietly
   reverted to the default field set. The input is now typed: the schema lists
