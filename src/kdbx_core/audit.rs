@@ -34,7 +34,7 @@
 use crate::kdbx_core::error::ErrorCode;
 use crate::kdbx_core::unlock::UnlockSource;
 use crate::kdbx_core::vault::LockReason;
-use crate::kdbx_core::vault_file::SaveStep;
+use crate::kdbx_core::vault_file::{LockUnavailable, SaveStep};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -192,6 +192,9 @@ pub enum AuditEvent {
         size_bytes: u64,
         sha256: String,
     },
+    /// A save proceeded without the inter-instance writer lock because the
+    /// filesystem cannot lock (the content check still ran).
+    WriterLockUnavailable { reason: LockUnavailable },
     /// A TOTP code was computed. The code itself is never logged.
     GetOtp {
         target_path: Option<String>,
@@ -221,6 +224,7 @@ impl AuditEvent {
             AuditEvent::RevealProtected { .. } => "reveal_protected",
             AuditEvent::DownloadAttachment { .. } => "download_attachment",
             AuditEvent::GetOtp { .. } => "get_otp",
+            AuditEvent::WriterLockUnavailable { .. } => "writer_lock_unavailable",
         }
     }
 
@@ -241,6 +245,7 @@ impl AuditEvent {
             AuditEvent::RevealProtected { .. } => Level::Info,
             AuditEvent::DownloadAttachment { .. } => Level::Info,
             AuditEvent::GetOtp { .. } => Level::Info,
+            AuditEvent::WriterLockUnavailable { .. } => Level::Warn,
         }
     }
 
@@ -357,6 +362,7 @@ impl AuditEvent {
                 "size_bytes": size_bytes,
                 "sha256": sha256,
             }),
+            AuditEvent::WriterLockUnavailable { reason } => json!({ "reason": reason }),
             AuditEvent::GetOtp {
                 target_path,
                 target_uuid,
@@ -586,6 +592,13 @@ mod tests {
                 "get_otp",
                 Level::Info,
             ),
+            (
+                AuditEvent::WriterLockUnavailable {
+                    reason: LockUnavailable::NoLocks,
+                },
+                "writer_lock_unavailable",
+                Level::Warn,
+            ),
         ]
     }
 
@@ -607,6 +620,7 @@ mod tests {
         r#"{"details":{"field_name":"RecoveryKey","sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_protected","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"attachment_name":"key.pem","sha256":"deadbeef","size_bytes":2048,"target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"download_attachment","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"requested_time_unix":null,"target_path":"/Web/GitHub","target_uuid":"abcd","time_unix":1700000000},"event":"get_otp","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"reason":"no_locks"},"event":"writer_lock_unavailable","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
     ];
 
     #[test]

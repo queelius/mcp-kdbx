@@ -111,9 +111,45 @@ pub fn lock_path(vault: &Path) -> PathBuf {
 
 /// An exclusive advisory lock on a vault's sidecar lock file. Released when
 /// dropped (closing the file releases the flock).
+///
+/// On a filesystem that cannot lock at all (see [`LockUnavailable`]) the
+/// save proceeds without the inter-instance lock, still guarded by the
+/// content check, and [`WriterLock::unavailable`] says so for the audit trail.
 #[derive(Debug)]
 pub struct WriterLock {
     _file: File,
+    unavailable: Option<LockUnavailable>,
+}
+
+/// Why the writer lock could not be taken on this filesystem, so the save went
+/// ahead without it. Reported in the warn-level `writer_lock_unavailable`
+/// audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockUnavailable {
+    /// The filesystem has no lock support (ENOLCK, for example NFS without a
+    /// lock daemon).
+    NoLocks,
+    /// The filesystem reports file locking as unsupported (some FUSE and SMB
+    /// mounts).
+    Unsupported,
+}
+
+/// Decide what a lock error (other than "held by someone else") means. A
+/// filesystem that cannot lock at all degrades to no inter-instance lock,
+/// returning the reason; every other error is fatal (`WRITE_FAILED`,
+/// `details.step: "lock"`), since it may hide a real problem.
+fn classify_lock_error(e: std::io::Error) -> CoreResult<LockUnavailable> {
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::ENOLCK) {
+        return Ok(LockUnavailable::NoLocks);
+    }
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return Ok(LockUnavailable::Unsupported);
+    }
+    Err(CoreError::new(ErrorCode::WriteFailed)
+        .with_message(format!("could not take the writer lock: {e}"))
+        .with_details(serde_json::json!({ "step": SaveStep::Lock })))
 }
 
 impl WriterLock {
@@ -133,7 +169,12 @@ impl WriterLock {
         let deadline = Instant::now() + wait;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(WriterLock { _file: file }),
+                Ok(()) => {
+                    return Ok(WriterLock {
+                        _file: file,
+                        unavailable: None,
+                    });
+                }
                 Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(WRITER_LOCK_POLL);
                 }
@@ -145,12 +186,22 @@ impl WriterLock {
                         .with_details(serde_json::json!({ "step": SaveStep::Lock })));
                 }
                 Err(std::fs::TryLockError::Error(e)) => {
-                    return Err(CoreError::new(ErrorCode::WriteFailed)
-                        .with_message(format!("could not take the writer lock: {e}"))
-                        .with_details(serde_json::json!({ "step": SaveStep::Lock })));
+                    let reason = classify_lock_error(e)?;
+                    return Ok(WriterLock {
+                        _file: file,
+                        unavailable: Some(reason),
+                    });
                 }
             }
         }
+    }
+}
+
+impl WriterLock {
+    /// `Some(reason)` when the filesystem could not lock and the save is
+    /// proceeding without the inter-instance lock.
+    pub fn unavailable(&self) -> Option<LockUnavailable> {
+        self.unavailable
     }
 }
 
@@ -574,6 +625,34 @@ mod tests {
             "{}",
             err.message()
         );
+    }
+
+    #[test]
+    fn unsupported_locking_degrades_but_other_lock_errors_stay_fatal() {
+        // NFS without lockd answers ENOLCK; some FUSE and SMB mounts report
+        // the operation as unsupported. Those degrade to no inter-instance
+        // lock (reported to the caller); anything else is a real failure.
+        #[cfg(unix)]
+        assert_eq!(
+            classify_lock_error(std::io::Error::from_raw_os_error(libc::ENOLCK)).unwrap(),
+            LockUnavailable::NoLocks
+        );
+        assert_eq!(
+            classify_lock_error(std::io::Error::from(std::io::ErrorKind::Unsupported)).unwrap(),
+            LockUnavailable::Unsupported
+        );
+        let fatal = classify_lock_error(std::io::Error::other("disk on fire")).unwrap_err();
+        assert_eq!(fatal.code_enum(), ErrorCode::WriteFailed);
+        assert_eq!(fatal.details().unwrap()["step"], serde_json::json!("lock"));
+    }
+
+    #[test]
+    fn a_normal_lock_reports_no_degradation() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("v.kdbx");
+        std::fs::write(&vault, b"x").unwrap();
+        let lock = WriterLock::acquire(&vault, Duration::ZERO).unwrap();
+        assert_eq!(lock.unavailable(), None);
     }
 
     #[test]

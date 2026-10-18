@@ -304,6 +304,9 @@ impl KdbxServer {
         let result = tokio::task::block_in_place(|| stage::save_pending(&mut vault));
         match result {
             Ok(outcome) => {
+                if let Some(reason) = outcome.writer_lock_unavailable {
+                    self.emit(AuditEvent::WriterLockUnavailable { reason });
+                }
                 // The baseline now describes the file just written, so its mtime
                 // is the real new file mtime.
                 let after_mtime = vault

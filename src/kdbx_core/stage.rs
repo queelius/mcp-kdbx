@@ -31,8 +31,8 @@ use crate::kdbx_core::path::{VaultPath, vault_path_to_entry, vault_path_to_group
 use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::vault::Vault;
 use crate::kdbx_core::vault_file::{
-    SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint, resolve_write_target,
-    write_atomically,
+    LockUnavailable, SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint,
+    resolve_write_target, write_atomically,
 };
 use diff_kdbx::change_set::{Change, EntryChangeKind, FieldChange, ValueChange, ValueDisplay};
 use diff_kdbx::options::DiffOptions;
@@ -185,6 +185,11 @@ pub struct DiffSummary {
 /// The result of a successful save.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SaveOutcome {
+    /// Set when the filesystem could not take the writer lock and the save
+    /// went ahead without it. Not part of the tool response; the adapter
+    /// reports it as the warn-level `writer_lock_unavailable` audit event.
+    #[serde(skip)]
+    pub writer_lock_unavailable: Option<LockUnavailable>,
     pub saved: bool,
     pub num_changes: usize,
     pub vault_path: String,
@@ -817,7 +822,7 @@ pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
     // Resolve symlinks so the rename replaces the real file, not the link.
     let target = resolve_write_target(&path)?;
 
-    let _lock = WriterLock::acquire(&target, WRITER_LOCK_WAIT)?;
+    let lock = WriterLock::acquire(&target, WRITER_LOCK_WAIT)?;
 
     let (_, current) = read_with_fingerprint(&target).map_err(|e| {
         CoreError::new(ErrorCode::WriteFailed)
@@ -839,6 +844,7 @@ pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
     vault.mark_saved(written)?;
 
     Ok(SaveOutcome {
+        writer_lock_unavailable: lock.unavailable(),
         saved: true,
         num_changes,
         vault_path: absolute_path_string(&path),

@@ -1359,3 +1359,10 @@ integration tests assert them.
   attachment bytes, an approximation of KeePass's `PwEntry.GetSize`.
   Binaries used only by a removed backup stay in the binary pool until
   KeePass next saves.
+- **A filesystem without locks degrades, audibly.** If the writer lock fails
+  because the filesystem cannot lock at all (`ENOLCK`, for example NFS
+  without a lock daemon, or an "unsupported" error from some FUSE and SMB
+  mounts), the save proceeds without the inter-instance lock (the content
+  check still runs) and a successful save emits a new warn-level audit event,
+  `writer_lock_unavailable`, with `reason`: `no_locks` or `unsupported`. Any
+  other lock error stays `WRITE_FAILED` (`details.step: "lock"`).
