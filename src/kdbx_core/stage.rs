@@ -195,26 +195,45 @@ pub struct SaveOutcome {
 // Validation (spec section 3).
 // ---------------------------------------------------------------------------
 
-/// The first character of `s` that is invisible or reorders text: a Unicode
-/// control character (General_Category Cc, which covers ASCII controls, DEL,
-/// and the C1 range) or a format character (Cf: bidi overrides and isolates,
-/// zero-width space and joiners, the byte-order mark, and so on). Such a
-/// character makes a title or field name display as something it is not.
-/// Returns the character and its code point label (`U+202E`) for the error.
+/// Format characters that make text display as something it is not:
+///
+/// - Unicode's Bidi_Control property (UAX #9): the Arabic letter mark, the
+///   left-to-right and right-to-left marks, the embeddings and overrides, and
+///   the isolates. They reorder how surrounding text renders, so
+///   "\u{202E}buHtiG" displays as "GitHub".
+/// - Zero-width space and the byte-order mark (zero-width no-break space):
+///   invisible separators that make two different names look identical.
+///
+/// Deliberately not here: the zero-width non-joiner and joiner (U+200C,
+/// U+200D), which Persian, Hindi, Malayalam, and emoji sequences need, and the
+/// soft hyphen (U+00AD). They are format characters too, but they neither
+/// reorder text nor hide a difference a reader could miss.
+const SPOOFING_FORMAT_CHARS: [std::ops::RangeInclusive<char>; 6] = [
+    '\u{061C}'..='\u{061C}', // ARABIC LETTER MARK (Bidi_Control)
+    '\u{200B}'..='\u{200B}', // ZERO WIDTH SPACE
+    '\u{200E}'..='\u{200F}', // LEFT-TO-RIGHT MARK, RIGHT-TO-LEFT MARK (Bidi_Control)
+    '\u{202A}'..='\u{202E}', // embeddings, pop, overrides (Bidi_Control)
+    '\u{2066}'..='\u{2069}', // isolates and pop isolate (Bidi_Control)
+    '\u{FEFF}'..='\u{FEFF}', // ZERO WIDTH NO-BREAK SPACE (byte-order mark)
+];
+
+/// True when `c` may not appear in a title or field name: a control character
+/// (General_Category Cc: ASCII controls, DEL, the C1 range; exactly what
+/// `char::is_control` tests) or one of the [`SPOOFING_FORMAT_CHARS`].
+fn is_disallowed_name_char(c: char) -> bool {
+    c.is_control() || SPOOFING_FORMAT_CHARS.iter().any(|r| r.contains(&c))
+}
+
+/// The first disallowed character of `s` (see [`is_disallowed_name_char`]), as
+/// its code point label (`U+202E`) for the error details.
 fn first_invisible_char(s: &str) -> Option<String> {
-    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
     s.chars()
-        .find(|c| {
-            matches!(
-                c.general_category(),
-                GeneralCategory::Control | GeneralCategory::Format
-            )
-        })
+        .find(|c| is_disallowed_name_char(*c))
         .map(|c| format!("U+{:04X}", c as u32))
 }
 
-/// Validate an entry title: length 1..=4096, no control (Cc) or format (Cf)
-/// characters. Every write to the Title field goes through here: the `title`
+/// Validate an entry title: length 1..=4096, no control characters or
+/// spoofing format characters (see [`is_disallowed_name_char`]). Every write to the Title field goes through here: the `title`
 /// of `add_entry`, and `update_field` on `Title`.
 fn validate_title(title: &str) -> CoreResult<()> {
     let len = title.chars().count();
@@ -231,8 +250,8 @@ fn validate_title(title: &str) -> CoreResult<()> {
     Ok(())
 }
 
-/// Validate a field name: length 1..=256, no control (Cc) or format (Cf)
-/// characters, no leading or trailing whitespace.
+/// Validate a field name: length 1..=256, no control characters or spoofing
+/// format characters, no leading or trailing whitespace.
 fn validate_field_name(name: &str) -> CoreResult<()> {
     let len = name.chars().count();
     if !(1..=256).contains(&len) {
@@ -904,9 +923,44 @@ mod tests {
     }
 
     #[test]
+    fn script_joiners_and_soft_hyphen_are_accepted() {
+        // ZWNJ and ZWJ are format characters (Cf) that real text needs:
+        // Persian, Hindi, and Malayalam spelling, and emoji sequences. The soft
+        // hyphen is Cf too and harmless. None of them reorders or hides text.
+        for good in [
+            "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}", // Persian, with ZWNJ
+            "\u{915}\u{94d}\u{200d}\u{937}",                             // Devanagari, with ZWJ
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} family",
+            "pass\u{ad}word",
+        ] {
+            validate_title(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            validate_field_name(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn every_bidi_control_is_rejected() {
+        // Unicode's Bidi_Control set, each one individually.
+        let bidi = ['\u{61c}', '\u{200e}', '\u{200f}']
+            .into_iter()
+            .chain('\u{202a}'..='\u{202e}')
+            .chain('\u{2066}'..='\u{2069}');
+        for c in bidi {
+            let title = format!("Git{c}Hub");
+            let err = validate_title(&title).expect_err(&format!("U+{:04X}", c as u32));
+            assert_eq!(err.code_enum(), ErrorCode::EntryTitleInvalid);
+            assert_eq!(
+                err.details().unwrap()["code_point"],
+                serde_json::json!(format!("U+{:04X}", c as u32))
+            );
+        }
+    }
+
+    #[test]
     fn titles_and_field_names_reject_unicode_control_and_format_chars() {
-        // Cc beyond ASCII (DEL, a C1 control) and Cf (a bidi override, a
-        // zero-width space, a byte-order mark) are invisible or reorder text,
+        // Cc beyond ASCII (DEL, a C1 control) and spoofing format characters
+        // (a bidi override, an isolate, a zero-width space, a byte-order mark)
+        // are invisible or reorder text,
         // so a title that looks like "GitHub" could name something else.
         for bad in [
             "Git\u{7f}Hub",
@@ -914,6 +968,7 @@ mod tests {
             "\u{202e}buHtiG",
             "Git\u{200b}Hub",
             "\u{feff}GitHub",
+            "\u{2067}x",
         ] {
             assert_eq!(
                 validate_title(bad).unwrap_err().code_enum(),

@@ -31,10 +31,6 @@ serde_json = "1"
 # Unicode NFC normalization for case-sensitive, normalization-aware path name
 # comparison. Small, single-purpose crate.
 unicode-normalization = "0.1"
-# Unicode General_Category lookup (same unicode-rs family as
-# unicode-normalization), for rejecting control (Cc) and format (Cf) characters
-# in titles and field names. std only exposes Cc (char::is_control).
-unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
