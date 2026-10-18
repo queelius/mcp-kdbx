@@ -14,15 +14,26 @@ keywords = ["keepass", "kdbx", "mcp", "credentials", "agent"]
 categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
-# Substrate: the only maintained Rust KDBX library. 0.12.5 is the floor that
-# carries EntryRef::attachments_named() (upstream PR #321). save_kdbx4 enables
-# the write path (Database::save).
-keepass = { version = "0.12.5", features = ["serialization", "save_kdbx4"] }
-# Sibling ecosystem member, used as a library for the semantic stage diff
-# (kdbx_diff_pending). Path dependency for local development; publishing v0.1
-# needs diff-kdbx on crates.io or a git URL. diff_kdbx::compute::compute takes
-# two keepass::Database values and is I/O-free, so it composes cleanly here.
+# Substrate: the only maintained Rust KDBX library. 0.12.9 is the floor
+# kdbx-core's keepass-0_12 adapter needs (it also carries
+# EntryRef::attachments_named(), upstream PR #321). save_kdbx4 enables the
+# write path (Database::save).
+keepass = { version = "0.12.9", features = ["serialization", "save_kdbx4"] }
+# The ecosystem's shared vault model and rules (path grammar, visibility,
+# field schema, keyed fingerprints, TOTP). keepass-0_12 adds snapshot capture
+# from this crate's keepass version; the default `kdf` feature adds the
+# Argon2id-derived fingerprint key the audit log uses. When mcp-kdbx bumps
+# keepass, it switches this feature, not diff-kdbx. Path dependency until
+# kdbx-core is published.
+kdbx-core = { path = "../kdbx-core", features = ["keepass-0_12"] }
+# Sibling ecosystem member, used as a library (no `cli`) for the semantic
+# stage diff (kdbx_diff_pending). Its API is a pure function of two kdbx-core
+# snapshots and names no keepass type, so it no longer constrains this crate's
+# keepass version. Path dependency until diff-kdbx is published.
 diff-kdbx = { path = "../diff-kdbx" }
+# The OS random number generator, for the one-off fingerprint key each stage
+# diff uses (already in the tree through uuid).
+getrandom = "0.4"
 # Async runtime: tokio drives the unlock-command shell-out (timeout-bounded),
 # the idle timer (Phase 2), and the stdio transport (Phase 3).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "process", "io-util"] }

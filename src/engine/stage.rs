@@ -10,20 +10,20 @@
 //!
 //! - [`add_entry`] and [`update_field`]: stage writes onto the working db,
 //!   after validating titles and field names (spec section 3).
-//! - [`diff_pending`]: the canonical-vs-working semantic diff, computed by
-//!   `diff_kdbx::compute::compute` and mapped to the spec's `kdbx_diff_pending`
-//!   shape (spec section 4). Protected fields are redacted: the diff reports
-//!   that a protected field changed, never its before/after value.
+//! - [`diff_pending`]: the canonical-vs-working semantic diff. Both databases
+//!   are captured as kdbx-core snapshots under fingerprint sealing, compared
+//!   by `diff_kdbx::compute`, and mapped to the spec's `kdbx_diff_pending`
+//!   shape (spec section 4). Secret fields are redacted: the diff reports that
+//!   a secret field changed, never its before/after value.
 //! - [`save_pending`] and [`discard_pending`]: commit or drop the stage.
 //!
-//! ## Protected-vs-nonprotected discriminator
+//! ## Redaction is structural
 //!
-//! The diff mapping leans on one fact: `DiffOptions::default()` masks protected
-//! fields to `ValueDisplay::Masked { hash }` and leaves non-protected fields as
-//! `ValueDisplay::Plain { value }`. We never pass `show_secrets = true`, so a
-//! `Masked` value is exactly a protected field and a `Plain` value is exactly a
-//! non-protected one. That is how we decide whether to redact a field change
-//! without ever holding a protected plaintext.
+//! The snapshot holds a keyed fingerprint (`Value::Sealed`) in place of every
+//! secret value (protected, or a Password; never the Title), decided once at
+//! capture by `kdbx_core::visibility::is_secret`. A field change is shown with
+//! values only when both sides are plain, so no protected plaintext is ever
+//! held, let alone emitted, by the diff.
 
 use crate::engine::address::{EntryAddress, GroupAddress};
 use crate::engine::error::{CoreError, CoreResult, ErrorCode};
@@ -34,12 +34,15 @@ use crate::engine::vault_file::{
     LockUnavailable, SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint,
     resolve_write_target, write_atomically,
 };
-use diff_kdbx::change_set::{Change, EntryChangeKind, FieldChange, ValueChange, ValueDisplay};
-use diff_kdbx::options::DiffOptions;
+use diff_kdbx::{Change, DiffOptions, NodeStatus, Property, PropertyChange, Shown};
+use kdbx_core::capture::keepass_0_12::capture;
+use kdbx_core::fingerprint::FingerprintKey;
+use kdbx_core::model::{Sealing, Value as SnapValue};
 use keepass::Database;
 use keepass::db::{EntryId, Value, fields};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
+use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
 // Input structs (built by the Phase 3 MCP adapter from tool JSON).
@@ -526,42 +529,59 @@ fn maintain_history(working: &mut Database, entry_id: EntryId) {
 // The stage diff.
 // ---------------------------------------------------------------------------
 
+/// A fingerprint key for one stage diff: 32 bytes from the OS random number
+/// generator. The diff compares both sides within one call, so a fresh key
+/// costs nothing (no KDF) and makes every fingerprint meaningless outside
+/// the call.
+///
+/// Panics only if the OS random number generator fails, as `uuid::Uuid::new_v4`
+/// and keepass's own save path (which draws fresh nonces) would.
+fn ephemeral_key() -> FingerprintKey {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("the OS random number generator failed");
+    let key = FingerprintKey::from_bytes(bytes);
+    bytes.zeroize();
+    key
+}
+
 /// Compute the staged diff between the canonical baseline and the working db,
 /// mapped to the `kdbx_diff_pending` shape (spec section 4).
 ///
-/// Uses `DiffOptions::default()`, which masks protected fields. We only inspect
-/// `Change::Entry` changes with kind Added or Modified: v0.1 write tools add
-/// entries and update fields, nothing else. Group changes, database metadata
-/// changes, Moved entries, and Removed entries do not arise from our writes, so
-/// they are ignored. (A removed entry would need a delete tool we do not have;
-/// a moved entry, a move tool we do not have.) Tag and history field changes are
-/// likewise ignored: our writes do not intentionally create them.
+/// Both databases are captured as kdbx-core snapshots under fingerprint
+/// sealing with one [`ephemeral_key`], so no secret value is ever copied out of
+/// keepass, and `diff_kdbx::compute` compares them with the default options
+/// (timestamp noise suppressed). Only entry records are mapped: v0.1 write
+/// tools add entries and update fields, nothing else.
 pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
-    let change_set = diff_kdbx::compute::compute(canonical, working, &DiffOptions::default());
+    let key = ephemeral_key();
+    let sealing = Sealing::Fingerprint(&key);
+    let change_set = diff_kdbx::compute(
+        &capture(canonical, &sealing),
+        &capture(working, &sealing),
+        &DiffOptions::default(),
+    );
 
     let mut added: Vec<AddedEntry> = Vec::new();
     let mut modified: Vec<ModifiedEntry> = Vec::new();
 
     for change in &change_set.changes {
-        let Change::Entry { uuid, kind, .. } = change else {
-            // Ignore Database and Group changes: our writes do not create them.
+        let Change::Entry(node) = change else {
+            // Database and group records do not arise from our writes.
             continue;
         };
-
-        match kind {
-            EntryChangeKind::Added => {
-                if let Some(entry) = map_added_entry(working, *uuid) {
+        match &node.status {
+            NodeStatus::Added => {
+                if let Some(entry) = map_added_entry(working, node.uuid) {
                     added.push(entry);
                 }
             }
-            EntryChangeKind::Modified { fields } => {
-                if let Some(entry) = map_modified_entry(working, *uuid, fields) {
+            NodeStatus::Modified { changes, .. } => {
+                if let Some(entry) = map_modified_entry(working, node.uuid, changes) {
                     modified.push(entry);
                 }
             }
-            // No delete tool (Removed) and no move tool (Moved) in v0.1, so
-            // these do not arise from our writes. Leave `removed` empty.
-            EntryChangeKind::Removed | EntryChangeKind::Moved { .. } => {}
+            // No delete tool in v0.1, so `removed` stays empty.
+            _ => {}
         }
     }
 
@@ -624,8 +644,7 @@ fn map_added_entry(working: &Database, uuid: uuid::Uuid) -> Option<AddedEntry> {
     let has_attachments = entry_ref.attachments_named().next().is_some();
     // Route has_otp through the same resolver the read views use
     // (src/adapter/views.rs), so kdbx_diff_pending and kdbx_list_entries agree on
-    // whether an entry has a usable TOTP source (every source the resolver
-    // knows, not just a bare `otp` presence check).
+    // whether an entry has a usable TOTP source.
     let has_otp = crate::engine::totp::resolve_for_entry(&entry_ref).is_some();
 
     Some(AddedEntry {
@@ -640,11 +659,13 @@ fn map_added_entry(working: &Database, uuid: uuid::Uuid) -> Option<AddedEntry> {
 }
 
 /// Build a [`ModifiedEntry`] by looking up `uuid` in the working db and
-/// partitioning its field changes into field-level and attachment-level lists.
+/// partitioning its property changes into field-level and attachment-level
+/// lists. Other properties (tags, history items, icons) are not part of the
+/// v0.1 diff surface.
 fn map_modified_entry(
     working: &Database,
     uuid: uuid::Uuid,
-    field_changes: &[FieldChange],
+    changes: &[PropertyChange],
 ) -> Option<ModifiedEntry> {
     let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
     let eid = entry_ref.id();
@@ -655,41 +676,27 @@ fn map_modified_entry(
     let mut field_out: Vec<FieldChangeOut> = Vec::new();
     let mut attachment_out: Vec<AttachmentChangeOut> = Vec::new();
 
-    for fc in field_changes {
-        match fc {
-            FieldChange::Modified { name, change } => {
-                field_out.push(map_modified_field(name, change));
+    for pc in changes {
+        match &pc.property {
+            Property::Field(name) => {
+                field_out.push(map_field_change(
+                    name.as_str(),
+                    pc.before.as_ref(),
+                    pc.after.as_ref(),
+                ));
             }
-            FieldChange::Added { name, value } => {
-                field_out.push(map_added_field(name, value));
-            }
-            FieldChange::Removed { name, value } => {
-                field_out.push(map_removed_field(name, value));
-            }
-            FieldChange::AttachmentAdded { name, .. } => {
+            Property::Attachment(name) => {
+                let change = match (&pc.before, &pc.after) {
+                    (None, _) => "added",
+                    (_, None) => "removed",
+                    _ => "modified",
+                };
                 attachment_out.push(AttachmentChangeOut {
                     name: name.clone(),
-                    change: "added".to_string(),
+                    change: change.to_string(),
                 });
             }
-            FieldChange::AttachmentRemoved { name, .. } => {
-                attachment_out.push(AttachmentChangeOut {
-                    name: name.clone(),
-                    change: "removed".to_string(),
-                });
-            }
-            FieldChange::AttachmentModified { name, .. } => {
-                attachment_out.push(AttachmentChangeOut {
-                    name: name.clone(),
-                    change: "modified".to_string(),
-                });
-            }
-            // Tags and history: our writes do not intentionally create these,
-            // and they are not part of the v0.1 diff surface. Ignore them.
-            FieldChange::TagAdded { .. }
-            | FieldChange::TagRemoved { .. }
-            | FieldChange::HistoryGrew { .. }
-            | FieldChange::HistoryRewritten { .. } => {}
+            _ => {}
         }
     }
 
@@ -702,72 +709,36 @@ fn map_modified_entry(
     })
 }
 
-/// Map a value-to-value field change. A protected field (either side masked)
-/// is redacted; a non-protected change carries its before/after.
-fn map_modified_field(name: &str, change: &ValueChange) -> FieldChangeOut {
-    if is_masked(&change.from) || is_masked(&change.to) {
-        redacted(name)
-    } else {
-        FieldChangeOut::Plain {
+/// Map one field change. When either side is sealed (a secret: protected, or a
+/// Password), only the fact of the change is reported; otherwise the plain
+/// before and after values are, with `null` for an absent side.
+fn map_field_change(name: &str, before: Option<&Shown>, after: Option<&Shown>) -> FieldChangeOut {
+    match (plain_side(before), plain_side(after)) {
+        (Some(before), Some(after)) => FieldChangeOut::Plain {
             field_name: name.to_string(),
-            before: plain_to_json(&change.from),
-            after: plain_to_json(&change.to),
+            before,
+            after,
             protected: false,
-        }
-    }
-}
-
-/// Map a newly-added field: before is null, after is the value (or redacted if
-/// the field is protected).
-fn map_added_field(name: &str, value: &ValueDisplay) -> FieldChangeOut {
-    if is_masked(value) {
-        redacted(name)
-    } else {
-        FieldChangeOut::Plain {
+        },
+        _ => FieldChangeOut::Redacted {
             field_name: name.to_string(),
-            before: serde_json::Value::Null,
-            after: plain_to_json(value),
-            protected: false,
-        }
+            changed: true,
+            protected: true,
+        },
     }
 }
 
-/// Map a removed field: before is the value, after is null (or redacted if the
-/// field is protected).
-fn map_removed_field(name: &str, value: &ValueDisplay) -> FieldChangeOut {
-    if is_masked(value) {
-        redacted(name)
-    } else {
-        FieldChangeOut::Plain {
-            field_name: name.to_string(),
-            before: plain_to_json(value),
-            after: serde_json::Value::Null,
-            protected: false,
-        }
-    }
-}
-
-/// The redacted form for a protected field change.
-fn redacted(name: &str) -> FieldChangeOut {
-    FieldChangeOut::Redacted {
-        field_name: name.to_string(),
-        changed: true,
-        protected: true,
-    }
-}
-
-/// True when a `ValueDisplay` is the masked (protected) form.
-fn is_masked(v: &ValueDisplay) -> bool {
-    matches!(v, ValueDisplay::Masked { .. })
-}
-
-/// Render a non-masked `ValueDisplay` to a JSON string value. A `Masked` value
-/// should never reach here (callers redact first); it maps to null defensively
-/// so a protected plaintext can never leak through this path.
-fn plain_to_json(v: &ValueDisplay) -> serde_json::Value {
-    match v {
-        ValueDisplay::Plain { value } => serde_json::Value::String(value.clone()),
-        ValueDisplay::Masked { .. } => serde_json::Value::Null,
+/// One side of a field change as JSON: `Some(null)` for an absent side,
+/// `Some(string)` for a plain value, and `None` for anything that may not be
+/// shown (a sealed value, or a value kind this version does not know).
+fn plain_side(side: Option<&Shown>) -> Option<serde_json::Value> {
+    match side {
+        None => Some(serde_json::Value::Null),
+        Some(Shown::Field {
+            value: SnapValue::Plain(text),
+            ..
+        }) => Some(serde_json::Value::String(text.clone())),
+        Some(_) => None,
     }
 }
 
