@@ -352,8 +352,8 @@ pub fn resolve_for_entry(entry: &keepass::db::Entry) -> Option<TotpConfig> {
 
 impl TotpConfig {
     /// Build a config from KeePass 2's native `TimeOtp-*` fields, read through
-    /// `get`. Exactly one of the four secret fields must be present (KeePass's
-    /// rule); `TimeOtp-Length` (1..=8, default 6), `TimeOtp-Period` (default
+    /// `get`. Exactly one of the four secret fields must be present and
+    /// non-empty (KeePass's rule; an empty one is skipped); `TimeOtp-Length` (1..=8, default 6), `TimeOtp-Period` (default
     /// 30), and `TimeOtp-Algorithm` (default `HMAC-SHA-1`) are optional. Any
     /// malformed or unknown value yields `None`.
     pub fn from_keepass_native<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Self> {
@@ -370,9 +370,12 @@ impl TotpConfig {
                     .ok()
             }),
         ];
-        let mut present = decoders
-            .iter()
-            .filter_map(|(name, decode)| get(name).map(|value| (*decode, value)));
+        // An empty secret field does not count (KeePass skips it).
+        let mut present = decoders.iter().filter_map(|(name, decode)| {
+            get(name)
+                .filter(|value| !value.is_empty())
+                .map(|value| (*decode, value))
+        });
         let (decode, value) = present.next()?;
         if present.next().is_some() {
             return None;
@@ -674,6 +677,20 @@ mod tests {
             assert_eq!(cfg.digits, 6, "{field} default length");
             assert_eq!(cfg.compute_at(59).code.expose(), RFC_SHA1_AT_59, "{field}");
         }
+    }
+
+    #[test]
+    fn empty_native_secret_fields_are_ignored_when_counting() {
+        // KeePass skips empty TimeOtp-Secret* fields, so an entry carrying an
+        // empty plain secret alongside a real base32 one has exactly one
+        // secret. And an entry whose only secret field is empty has none.
+        let cfg = resolve_fields(&[
+            ("TimeOtp-Secret", ""),
+            ("TimeOtp-Secret-Base32", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
+        ])
+        .expect("the non-empty secret is used");
+        assert_eq!(cfg.compute_at(59).code.expose(), RFC_SHA1_AT_59);
+        assert!(resolve_fields(&[("TimeOtp-Secret-Hex", "")]).is_none());
     }
 
     #[test]
