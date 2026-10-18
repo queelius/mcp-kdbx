@@ -23,7 +23,7 @@
 //! the period is echoed back as `period_seconds`, and a legacy field-pair
 //! constructor is added that web-kdbx does not have.
 
-use serde::{Deserialize, Serialize};
+use crate::kdbx_core::secret::Secret;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
@@ -34,10 +34,13 @@ use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 /// the current time step (it equals `period_seconds` at the start of a step and
 /// `1` on the last second). `period_seconds` echoes the step length so a caller
 /// can render a progress indicator without re-reading the config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The code is a [`Secret`]: it is meant for the agent's response only and
+/// must never reach a log, so `Debug` redacts it.
+#[derive(Debug, Clone)]
 pub struct TotpCode {
     /// The current one-time code, as a string of digits.
-    pub code: String,
+    pub code: Secret<String>,
     /// Seconds left before the code rolls over to the next step.
     pub valid_for_seconds: u32,
     /// The configured step length in seconds (the TOTP period).
@@ -54,11 +57,11 @@ pub enum TotpAlgo {
 }
 
 /// A parsed TOTP configuration: the decoded secret plus the parameters needed
-/// to compute a code.
+/// to compute a code. The secret is a [`Secret`], so `Debug` redacts it.
 #[derive(Debug, Clone)]
 pub struct TotpConfig {
     /// The decoded (raw bytes) shared secret.
-    pub secret: Vec<u8>,
+    pub secret: Secret<Vec<u8>>,
     /// The time step in seconds.
     pub period: u32,
     /// The number of digits in the produced code.
@@ -143,7 +146,7 @@ impl TotpConfig {
         checked_params(period, digits)?;
 
         Some(Self {
-            secret: secret?,
+            secret: Secret::new(secret?),
             period,
             digits,
             algo,
@@ -177,7 +180,7 @@ impl TotpConfig {
         checked_params(period, digits)?;
 
         Some(Self {
-            secret,
+            secret: Secret::new(secret),
             period,
             digits,
             algo: TotpAlgo::Sha1,
@@ -191,26 +194,26 @@ impl TotpConfig {
             TotpAlgo::Sha1 => totp_lite::totp_custom::<totp_lite::Sha1>(
                 self.period as u64,
                 self.digits,
-                &self.secret,
+                self.secret.expose(),
                 now_unix,
             ),
             TotpAlgo::Sha256 => totp_lite::totp_custom::<totp_lite::Sha256>(
                 self.period as u64,
                 self.digits,
-                &self.secret,
+                self.secret.expose(),
                 now_unix,
             ),
             TotpAlgo::Sha512 => totp_lite::totp_custom::<totp_lite::Sha512>(
                 self.period as u64,
                 self.digits,
-                &self.secret,
+                self.secret.expose(),
                 now_unix,
             ),
         };
         let elapsed_in_window = now_unix % self.period as u64;
         let valid_for_seconds = (self.period as u64 - elapsed_in_window) as u32;
         TotpCode {
-            code: raw,
+            code: Secret::new(raw),
             valid_for_seconds,
             period_seconds: self.period,
         }
@@ -318,7 +321,7 @@ mod tests {
     #[test]
     fn parses_minimal_otpauth_uri() {
         let cfg = TotpConfig::parse(SAMPLE_URI).expect("parse");
-        assert!(!cfg.secret.is_empty());
+        assert!(!cfg.secret.expose().is_empty());
         assert_eq!(cfg.period, 30);
         assert_eq!(cfg.digits, 6);
         assert_eq!(cfg.algo, TotpAlgo::Sha1);
@@ -383,7 +386,7 @@ mod tests {
         let cfg = TotpConfig::parse("otpauth://totp/Test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
             .expect("parse");
         let code = cfg.compute_at(59);
-        assert_eq!(code.code, "287082");
+        assert_eq!(code.code.expose(), "287082");
         assert_eq!(code.period_seconds, 30);
     }
 
@@ -417,7 +420,7 @@ mod tests {
         assert_eq!(cfg.digits, 6);
         assert_eq!(cfg.algo, TotpAlgo::Sha1);
         let code = cfg.compute_at(59);
-        assert_eq!(code.code, "287082");
+        assert_eq!(code.code.expose(), "287082");
         assert_eq!(code.period_seconds, 30);
     }
 
@@ -493,7 +496,7 @@ mod tests {
         let cfg = TotpConfig::parse("otpauth://totp/Test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
             .expect("parse");
         let code = code_or_error(Some(cfg), 59).expect("code");
-        assert_eq!(code.code, "287082");
+        assert_eq!(code.code.expose(), "287082");
     }
 
     #[test]

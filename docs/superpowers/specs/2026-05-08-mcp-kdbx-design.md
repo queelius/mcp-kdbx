@@ -1257,3 +1257,17 @@ integration tests assert them.
   parses it for `KDBX_AUTO_CLEAN_ORPHANS`, which now removes only names with
   two decimal parts, so a user file like `vault.kdbx.tmp.old.bak` is never
   deleted.
+- **Secret hygiene.** Every secret-bearing field is a `Secret<T>`
+  (`kdbx_core::secret`): `Debug` prints `<redacted>`, the value is zeroized on
+  drop, and reading it takes an explicit `expose()`. This covers `Config`'s
+  password and unlock command, `kdbx_unlock`'s inputs, `kdbx_add_entry` and
+  `kdbx_update_field` values and attachment content, the staged
+  `FieldInput`/`AttachmentInput`, and the TOTP secret and computed code. Tool
+  input schemas are unchanged (the wrapper's schema is the inner type's). The
+  CI audit's check D is structural: any struct deriving `Debug` with a
+  secret-named field (`password`, `unlock_cmd`, `keyfile_bytes`, `secret`,
+  `value`, `base64`, `bytes`, `code`) holding a raw `String` or `Vec<u8>`
+  fails. The `KDBX_UNLOCK_CMD` stdout and stderr buffers are zeroized, and the
+  output is decoded as strict UTF-8: non-UTF-8 output is `AUTH_FAILED` with
+  `details.reason: "unlock_cmd_output_not_utf8"` (a lossy decode used to
+  substitute U+FFFD and try a password the command never printed).

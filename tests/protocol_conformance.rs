@@ -162,6 +162,15 @@ fn tools_list_matches_the_spec_surface() {
             *required,
             "required fields for {name} drifted from the spec"
         );
+        // Secret-wrapped inputs keep a plain string schema on the wire.
+        for secret_prop in ["value", "password", "keyfile_bytes"] {
+            if let Some(prop) = schema["properties"].get(secret_prop) {
+                assert!(
+                    prop.to_string().contains("\"string\""),
+                    "{name}.{secret_prop} schema is not a string: {prop}"
+                );
+            }
+        }
         // Every tool must carry a non-empty description (agents rely on it).
         assert!(
             tool["description"]

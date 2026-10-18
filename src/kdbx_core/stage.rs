@@ -28,6 +28,7 @@
 use crate::kdbx_core::address::EntryAddress;
 use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
 use crate::kdbx_core::path::{VaultPath, vault_path_to_entry, vault_path_to_group};
+use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::vault::Vault;
 use crate::kdbx_core::vault_file::{
     SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint, resolve_write_target,
@@ -45,10 +46,11 @@ use std::time::SystemTime;
 // ---------------------------------------------------------------------------
 
 /// One field on a staged entry: a name, a value, and whether it is protected.
+/// The value is a [`Secret`] (any field may hold one), so `Debug` redacts it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FieldInput {
     pub name: String,
-    pub value: String,
+    pub value: Secret<String>,
     pub protected: bool,
 }
 
@@ -62,7 +64,7 @@ pub struct FieldInput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttachmentInput {
     pub name: String,
-    pub bytes: Vec<u8>,
+    pub bytes: Secret<Vec<u8>>,
 }
 
 /// A staged new entry: a title plus zero or more fields and attachments.
@@ -291,7 +293,7 @@ pub fn add_entry(
                 .with_message("set the title with the title parameter, not in fields")
                 .with_details(serde_json::json!({ "name": f.name })));
         }
-        validate_field_write(&f.name, &f.value)?;
+        validate_field_write(&f.name, f.value.expose())?;
     }
 
     let group_id = group_path.resolve_group(working)?;
@@ -302,12 +304,12 @@ pub fn add_entry(
     let field_specs: Vec<(String, String, bool)> = input
         .fields
         .iter()
-        .map(|f| (f.name.clone(), f.value.clone(), f.protected))
+        .map(|f| (f.name.clone(), f.value.expose().clone(), f.protected))
         .collect();
     let attachment_specs: Vec<(String, Vec<u8>)> = input
         .attachments
         .iter()
-        .map(|a| (a.name.clone(), a.bytes.clone()))
+        .map(|a| (a.name.clone(), a.bytes.expose().clone()))
         .collect();
 
     let mut group_mut = working.group_mut(group_id).ok_or_else(|| {
@@ -796,7 +798,7 @@ mod tests {
             title: title.to_string(),
             fields: vec![FieldInput {
                 name: "UserName".to_string(),
-                value: "alice".to_string(),
+                value: "alice".to_string().into(),
                 protected: false,
             }],
             attachments: Vec::new(),
@@ -854,7 +856,7 @@ mod tests {
             title: "Has Secret".to_string(),
             fields: vec![FieldInput {
                 name: "Password".to_string(),
-                value: "s3cret".to_string(),
+                value: "s3cret".to_string().into(),
                 protected: true,
             }],
             attachments: Vec::new(),
@@ -874,7 +876,7 @@ mod tests {
             fields: Vec::new(),
             attachments: vec![AttachmentInput {
                 name: "note.txt".to_string(),
-                bytes: b"hello".to_vec(),
+                bytes: b"hello".to_vec().into(),
             }],
         };
         let id = add_entry(&mut db, &path("/"), &input).expect("add with attachment");
@@ -944,7 +946,7 @@ mod tests {
             title: "Valid".to_string(),
             fields: vec![FieldInput {
                 name: fields::TITLE.to_string(),
-                value: String::new(),
+                value: String::new().into(),
                 protected: false,
             }],
             attachments: Vec::new(),
@@ -974,7 +976,7 @@ mod tests {
             title: "T".to_string(),
             fields: vec![FieldInput {
                 name: "".to_string(),
-                value: "v".to_string(),
+                value: "v".to_string().into(),
                 protected: false,
             }],
             attachments: Vec::new(),
@@ -990,7 +992,7 @@ mod tests {
             title: "T".to_string(),
             fields: vec![FieldInput {
                 name: " Leading".to_string(),
-                value: "v".to_string(),
+                value: "v".to_string().into(),
                 protected: false,
             }],
             attachments: Vec::new(),
@@ -1171,12 +1173,12 @@ mod tests {
             fields: vec![
                 FieldInput {
                     name: "UserName".to_string(),
-                    value: "bob".to_string(),
+                    value: "bob".to_string().into(),
                     protected: false,
                 },
                 FieldInput {
                     name: "URL".to_string(),
-                    value: "https://b.example.com".to_string(),
+                    value: "https://b.example.com".to_string().into(),
                     protected: false,
                 },
             ],
@@ -1382,7 +1384,9 @@ mod tests {
             title: "With OTP".to_string(),
             fields: vec![FieldInput {
                 name: fields::OTP.to_string(),
-                value: "otpauth://totp/Example?secret=JBSWY3DPEHPK3PXP".to_string(),
+                value: "otpauth://totp/Example?secret=JBSWY3DPEHPK3PXP"
+                    .to_string()
+                    .into(),
                 protected: true,
             }],
             attachments: Vec::new(),
@@ -1725,12 +1729,12 @@ mod tests {
             fields: vec![
                 FieldInput {
                     name: "TOTP Seed".to_string(),
-                    value: "JBSWY3DPEHPK3PXP".to_string(),
+                    value: "JBSWY3DPEHPK3PXP".to_string().into(),
                     protected: true,
                 },
                 FieldInput {
                     name: "TOTP Settings".to_string(),
-                    value: "30;6".to_string(),
+                    value: "30;6".to_string().into(),
                     protected: false,
                 },
             ],

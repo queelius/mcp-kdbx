@@ -10,6 +10,7 @@ use crate::adapter::views::format_system_time;
 use crate::adapter::{KEEPASS_RS_VERSION, KdbxServer, responses};
 use crate::kdbx_core::audit::AuditEvent;
 use crate::kdbx_core::error::{CoreError, ErrorCode};
+use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::unlock::resolve_unlock_source;
 use crate::kdbx_core::vault::LockReason;
 use base64::Engine;
@@ -18,30 +19,17 @@ use rmcp::{schemars, tool, tool_router};
 use std::time::{Duration, Instant};
 
 /// Input for `kdbx_unlock`: an optional password and an optional base64 keyfile.
-#[derive(serde::Deserialize, schemars::JsonSchema)]
+/// Both are [`Secret`]s, so the derived `Debug` shows only whether each was
+/// supplied, never the value.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UnlockParams {
     /// The master password. When omitted, the server resolves it from
     /// `KDBX_PASSWORD` or `KDBX_UNLOCK_CMD`.
     #[serde(default)]
-    pub password: Option<String>,
+    pub password: Option<Secret<String>>,
     /// An optional keyfile for two-factor unlock, base64-encoded.
     #[serde(default)]
-    pub keyfile_bytes: Option<String>,
-}
-
-/// Hand-written `Debug` that never prints the secrets. Both fields render as
-/// `Some("<redacted>")`/`None`, so a stray `tracing::debug!(?params)` reveals
-/// only whether a password or keyfile was supplied, never the value.
-impl std::fmt::Debug for UnlockParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnlockParams")
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
-            .field(
-                "keyfile_bytes",
-                &self.keyfile_bytes.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
+    pub keyfile_bytes: Option<Secret<String>>,
 }
 
 #[tool_router(router = lifecycle_router, vis = "pub(crate)")]
@@ -104,22 +92,26 @@ impl KdbxServer {
         // result is zeroized on drop and never logged. resolve_unlock_source
         // returns the source it actually used, so the audit label cannot drift
         // from the resolution order.
-        let (password, source) =
-            match resolve_unlock_source(params.password.as_deref(), &self.config).await {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    if e.code_enum() == ErrorCode::AuthFailed {
-                        // The source the command path tried; resolution failed
-                        // before returning one, so label it "cmd" (the only
-                        // source that can fail with AUTH_FAILED here).
-                        self.emit(AuditEvent::AuthFailed {
-                            source: "cmd".to_string(),
-                            error_code: e.code().to_string(),
-                        });
-                    }
-                    return responses::err(&e);
+        let (password, source) = match resolve_unlock_source(
+            params.password.as_ref().map(|p| p.expose().as_str()),
+            &self.config,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                if e.code_enum() == ErrorCode::AuthFailed {
+                    // The source the command path tried; resolution failed
+                    // before returning one, so label it "cmd" (the only
+                    // source that can fail with AUTH_FAILED here).
+                    self.emit(AuditEvent::AuthFailed {
+                        source: "cmd".to_string(),
+                        error_code: e.code().to_string(),
+                    });
                 }
-            };
+                return responses::err(&e);
+            }
+        };
         let source_label = source.as_str().to_string();
 
         // Resolve the keyfile: the per-call keyfile_bytes wins; otherwise fall
@@ -206,7 +198,7 @@ fn resolve_keyfile_bytes(
     params: &UnlockParams,
     config: &crate::kdbx_core::config::Config,
 ) -> Result<Option<Vec<u8>>, CoreError> {
-    if let Some(encoded) = params.keyfile_bytes.as_deref() {
+    if let Some(encoded) = params.keyfile_bytes.as_ref().map(|k| k.expose()) {
         return base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map(Some)

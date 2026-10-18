@@ -32,6 +32,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::kdbx_core::secret::Secret;
+
 /// Upper bound for the two integer settings, in seconds. 86400 is one day,
 /// which is far beyond any sane idle window or secret-manager round trip while
 /// still rejecting obvious overflow or garbage values.
@@ -129,10 +131,10 @@ pub enum ConfigError {
 /// startup. Every field corresponds to one row of the spec section 2
 /// configuration surface.
 ///
-/// `Debug` is implemented by hand (see below) so that the two secret fields,
-/// `password` and `unlock_cmd`, never render their values. Deriving `Debug`
-/// would let a stray `tracing::debug!(?config)` leak the master password.
-#[derive(Clone, PartialEq, Eq)]
+/// The two secret fields, `password` and `unlock_cmd`, are [`Secret`]s, so the
+/// derived `Debug` shows only whether each is set, never its value: a stray
+/// `tracing::debug!(?config)` cannot leak the master password.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Absolute path to the .kdbx vault. Required, and validated to exist and
     /// be a readable regular file.
@@ -144,11 +146,11 @@ pub struct Config {
 
     /// Master password from `KDBX_PASSWORD`, if injected directly. This is a
     /// secret: it is never logged and never echoed by `kdbx_status`.
-    pub password: Option<String>,
+    pub password: Option<Secret<String>>,
 
     /// Shell command whose stdout is the master password (`KDBX_UNLOCK_CMD`).
     /// Also a secret source: not logged, not echoed.
-    pub unlock_cmd: Option<String>,
+    pub unlock_cmd: Option<Secret<String>>,
 
     /// Timeout for the unlock command, in seconds
     /// (`KDBX_UNLOCK_CMD_TIMEOUT_SECONDS`). Default 30.
@@ -174,36 +176,6 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
 }
 
-/// Hand-written `Debug` that redacts the two secret fields. `password` and
-/// `unlock_cmd` render as `Some("<redacted>")` when set and `None` when unset,
-/// so debug output reveals whether a secret source is configured without ever
-/// printing the secret itself. Every other field, including the path fields
-/// `keyfile_path` and `log_file` (paths, not secrets), prints normally. This is
-/// defense in depth: it makes `tracing::debug!(?config)` safe by construction.
-impl std::fmt::Debug for Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Map each secret to a redaction marker that preserves only its
-        // set/unset shape, then format with the standard derived layout.
-        let password = self.password.as_ref().map(|_| "<redacted>");
-        let unlock_cmd = self.unlock_cmd.as_ref().map(|_| "<redacted>");
-        f.debug_struct("Config")
-            .field("vault_path", &self.vault_path)
-            .field("keyfile_path", &self.keyfile_path)
-            .field("password", &password)
-            .field("unlock_cmd", &unlock_cmd)
-            .field(
-                "unlock_cmd_timeout_seconds",
-                &self.unlock_cmd_timeout_seconds,
-            )
-            .field("allow_writes", &self.allow_writes)
-            .field("idle_timeout_seconds", &self.idle_timeout_seconds)
-            .field("auto_clean_orphans", &self.auto_clean_orphans)
-            .field("log_level", &self.log_level)
-            .field("log_file", &self.log_file)
-            .finish()
-    }
-}
-
 impl Config {
     /// Build a [`Config`] from a map of variable names to values, validating
     /// every field per spec section 5. This is the testable core: it does not
@@ -222,8 +194,8 @@ impl Config {
         let vault_path = resolve_vault_path(vault_path_raw)?;
 
         let keyfile_path = optional_path(vars, "KDBX_KEYFILE_PATH");
-        let password = optional_string(vars, "KDBX_PASSWORD");
-        let unlock_cmd = optional_string(vars, "KDBX_UNLOCK_CMD");
+        let password = optional_string(vars, "KDBX_PASSWORD").map(Secret::new);
+        let unlock_cmd = optional_string(vars, "KDBX_UNLOCK_CMD").map(Secret::new);
 
         let unlock_cmd_timeout_seconds =
             parse_seconds(vars, "KDBX_UNLOCK_CMD_TIMEOUT_SECONDS", 30, 1, MAX_SECONDS)?;
@@ -423,8 +395,14 @@ mod tests {
 
         assert_eq!(cfg.vault_path, file.path());
         assert_eq!(cfg.keyfile_path, Some(PathBuf::from("/keys/vault.key")));
-        assert_eq!(cfg.password.as_deref(), Some("hunter2"));
-        assert_eq!(cfg.unlock_cmd.as_deref(), Some("pass show vault"));
+        assert_eq!(
+            cfg.password.as_ref().map(|p| p.expose().as_str()),
+            Some("hunter2")
+        );
+        assert_eq!(
+            cfg.unlock_cmd.as_ref().map(|c| c.expose().as_str()),
+            Some("pass show vault")
+        );
         assert_eq!(cfg.unlock_cmd_timeout_seconds, 45);
         assert!(cfg.allow_writes);
         assert_eq!(cfg.idle_timeout_seconds, 300);
@@ -676,8 +654,8 @@ mod tests {
     #[test]
     fn debug_redacts_password_and_unlock_cmd_when_set() {
         let cfg = Config {
-            password: Some("hunter2".to_string()),
-            unlock_cmd: Some("pass show vault".to_string()),
+            password: Some("hunter2".to_string().into()),
+            unlock_cmd: Some("pass show vault".to_string().into()),
             ..Config::default()
         };
         let rendered = format!("{cfg:?}");
@@ -685,8 +663,8 @@ mod tests {
         assert!(!rendered.contains("hunter2"));
         assert!(!rendered.contains("pass show vault"));
         // Both secrets render as a set marker, showing presence without value.
-        assert!(rendered.contains("password: Some(\"<redacted>\")"));
-        assert!(rendered.contains("unlock_cmd: Some(\"<redacted>\")"));
+        assert!(rendered.contains("password: Some(<redacted>)"));
+        assert!(rendered.contains("unlock_cmd: Some(<redacted>)"));
     }
 
     #[test]

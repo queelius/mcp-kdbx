@@ -22,6 +22,7 @@ use crate::kdbx_core::address::EntryAddress;
 use crate::kdbx_core::audit::AuditEvent;
 use crate::kdbx_core::error::{CoreError, ErrorCode};
 use crate::kdbx_core::path::{VaultPath, vault_path_to_entry};
+use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::stage;
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
@@ -29,11 +30,12 @@ use rmcp::{schemars, tool, tool_router};
 use std::collections::HashMap;
 
 /// One field on a new entry in the `kdbx_add_entry` input map: a value and its
-/// protection flag. Keyed by field name in the surrounding map.
+/// protection flag. Keyed by field name in the surrounding map. The value is a
+/// [`Secret`] (redacted in `Debug`).
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct FieldSpec {
     /// The field value. Stored protected or not per `protected`.
-    pub value: String,
+    pub value: Secret<String>,
     /// Whether to store the field as a protected (encrypted-at-rest) value.
     pub protected: bool,
 }
@@ -43,7 +45,7 @@ pub struct FieldSpec {
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct AttachmentSpec {
     /// The attachment bytes, base64-encoded (standard alphabet).
-    pub base64: String,
+    pub base64: Secret<String>,
 }
 
 /// Input for `kdbx_add_entry`: a destination group, a title, and optional
@@ -78,7 +80,7 @@ pub struct UpdateFieldParams {
     /// The field name to set or change.
     pub field_name: String,
     /// The new value. An empty value clears the field.
-    pub value: String,
+    pub value: Secret<String>,
     /// Force the field's protection state. When omitted, an existing field keeps
     /// its current protection and a new field defaults to unprotected.
     #[serde(default)]
@@ -131,8 +133,9 @@ impl KdbxServer {
             params.attachments.into_iter().collect();
         attachment_names.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, spec) in attachment_names {
-            let bytes = match base64::engine::general_purpose::STANDARD.decode(&spec.base64) {
-                Ok(bytes) => bytes,
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(spec.base64.expose())
+            {
+                Ok(bytes) => Secret::new(bytes),
                 Err(_) => {
                     return responses::err(
                         &CoreError::new(ErrorCode::InvalidInput)
@@ -213,7 +216,7 @@ impl KdbxServer {
             working,
             &target,
             &params.field_name,
-            &params.value,
+            params.value.expose(),
             params.protected,
         ) {
             Ok(id) => id,

@@ -24,6 +24,7 @@ use crate::kdbx_core::address::EntryAddress;
 use crate::kdbx_core::audit::{AuditEvent, AuditLog};
 use crate::kdbx_core::config::Config;
 use crate::kdbx_core::error::{CoreError, ErrorCode};
+use crate::kdbx_core::secret::Secret;
 use crate::kdbx_core::vault::Vault;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -180,6 +181,31 @@ pub(crate) fn canonical_entry_path(
     crate::kdbx_core::path::vault_path_to_entry(db, entry.id()).map(|p| p.format())
 }
 
+/// Tool inputs wrap secret values in [`Secret`]; their JSON Schema is the inner
+/// type's, unchanged, so the wire contract an MCP host sees does not move.
+/// (Implemented here, not in `kdbx_core`, which stays free of the rmcp/schemars
+/// dependency.)
+impl<T> rmcp::schemars::JsonSchema for Secret<T>
+where
+    T: zeroize::Zeroize + rmcp::schemars::JsonSchema,
+{
+    fn inline_schema() -> bool {
+        T::inline_schema()
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        T::schema_name()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        T::schema_id()
+    }
+
+    fn json_schema(generator: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        T::json_schema(generator)
+    }
+}
+
 /// Map a level name (`error`/`warn`/`info`/`debug`/`trace`) to a verbosity rank,
 /// least verbose first. An event emits when its rank is at most the configured
 /// level's rank. Both `audit::Level` and `config::LogLevel` render to these
@@ -212,5 +238,69 @@ impl ServerHandler for KdbxServer {
         // ServerInfo is non-exhaustive, so set the field after construction.
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::kdbx_core::{config::Config, stage, totp::TotpConfig};
+
+    /// A value that must never appear in any Debug rendering below.
+    const MARK: &str = "SECRET-MARK-7f3a";
+
+    fn assert_redacted(what: &str, rendered: String) {
+        assert!(
+            !rendered.contains(MARK),
+            "{what} Debug leaked the secret: {rendered}"
+        );
+    }
+
+    #[test]
+    fn every_secret_bearing_type_redacts_debug() {
+        // Tool inputs, built from the JSON an agent would send.
+        let add: super::writes::AddEntryParams = serde_json::from_value(serde_json::json!({
+            "group_path": "/",
+            "title": "T",
+            "fields": { "Password": { "value": MARK, "protected": true } },
+            "attachments": { "a.bin": { "base64": MARK } },
+        }))
+        .unwrap();
+        assert_redacted("AddEntryParams", format!("{add:?}"));
+        let update: super::writes::UpdateFieldParams = serde_json::from_value(serde_json::json!({
+            "path": "/T", "field_name": "Password", "value": MARK,
+        }))
+        .unwrap();
+        assert_redacted("UpdateFieldParams", format!("{update:?}"));
+        let unlock: super::lifecycle::UnlockParams = serde_json::from_value(serde_json::json!({
+            "password": MARK, "keyfile_bytes": MARK,
+        }))
+        .unwrap();
+        assert_redacted("UnlockParams", format!("{unlock:?}"));
+
+        // Core types that carry the same values onward.
+        let entry = stage::EntryInput {
+            title: "T".to_string(),
+            fields: vec![stage::FieldInput {
+                name: "Password".to_string(),
+                value: MARK.to_string().into(),
+                protected: true,
+            }],
+            attachments: vec![stage::AttachmentInput {
+                name: "a.bin".to_string(),
+                bytes: MARK.as_bytes().to_vec().into(),
+            }],
+        };
+        assert_redacted("EntryInput", format!("{entry:?}"));
+        let totp = TotpConfig::parse("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP").unwrap();
+        let rendered = format!("{totp:?}");
+        assert!(rendered.contains("<redacted>"), "TotpConfig: {rendered}");
+        let code = totp.compute_at(59);
+        assert!(!format!("{code:?}").contains(code.code.expose().as_str()));
+        let config = Config {
+            password: Some(MARK.to_string().into()),
+            unlock_cmd: Some(MARK.to_string().into()),
+            ..Config::default()
+        };
+        assert_redacted("Config", format!("{config:?}"));
     }
 }

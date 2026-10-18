@@ -319,7 +319,7 @@ impl KdbxServer {
         });
 
         responses::ok(serde_json::json!({
-            "code": code.code,
+            "code": code.code.expose(),
             "valid_for_seconds": code.valid_for_seconds,
             "period_seconds": code.period_seconds,
             "time_unix": time_unix,
