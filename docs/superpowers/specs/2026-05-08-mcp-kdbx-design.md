@@ -1203,7 +1203,11 @@ integration tests assert them.
     and refuses with `VAULT_FILE_MODIFIED` when the content hash differs from
     the baseline, whatever the mtimes say. A touch that changes only the mtime
     is not a conflict. The lock is held through the temp write and rename, so
-    two mcp-kdbx instances cannot interleave. The sidecar is never deleted. A
+    two mcp-kdbx instances cannot interleave. The sidecar is never deleted.
+    A new sidecar takes the vault file's permission bits (filtered by the
+    umask), and a sidecar this user cannot write is opened read-only (flock
+    needs no write access), so a group-shared vault stays saveable by every
+    member. A
     lock still held after the wait is `WRITE_FAILED` with `details.step:
     "lock"`.
   - After the rename the baseline becomes the sha256 of the bytes written and

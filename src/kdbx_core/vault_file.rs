@@ -122,7 +122,7 @@ impl WriterLock {
     /// file that cannot be opened, is `WRITE_FAILED`.
     pub fn acquire(vault: &Path, wait: Duration) -> CoreResult<WriterLock> {
         let path = lock_path(vault);
-        let file = open_lock_file(&path).map_err(|e| {
+        let file = open_lock_file(&path, vault).map_err(|e| {
             CoreError::new(ErrorCode::WriteFailed)
                 .with_message(format!(
                     "could not open the writer lock file {}: {e}",
@@ -154,16 +154,28 @@ impl WriterLock {
     }
 }
 
-/// Open (creating if needed) the sidecar lock file, owner-only on Unix.
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
+/// Open (creating if needed) the sidecar lock file for `vault`.
+///
+/// A new lock file takes the vault file's permission bits (as filtered by the
+/// umask), so on a group-shared vault the other members can open it too. When
+/// the lock file exists but this user cannot write it (another user created
+/// it), it is opened read-only instead: flock(2) needs only an open
+/// descriptor, not write access, so the lock still excludes other savers.
+fn open_lock_file(path: &Path, vault: &Path) -> std::io::Result<File> {
     let mut options = File::options();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = std::fs::metadata(vault)
+            .map(|m| m.permissions().mode() & 0o666)
+            .unwrap_or(0o600);
+        options.mode(mode);
     }
-    options.open(path)
+    match options.open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => File::open(path),
+        other => other,
+    }
 }
 
 /// Which step of a save failed. Carried as `details.step` on `WRITE_FAILED` so
@@ -428,6 +440,57 @@ mod tests {
         let p = dir.path().join(TempName::new("v.kdbx").file_name());
         let file = create_temp_file(&p).unwrap();
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lock_file_takes_the_vault_permission_bits() {
+        // A group-shared vault (0660) gets a lock file other group members can
+        // at least open; it never gets bits the vault itself lacks.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("v.kdbx");
+        std::fs::write(&vault, b"x").unwrap();
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o660)).unwrap();
+
+        drop(WriterLock::acquire(&vault, Duration::ZERO).expect("lock"));
+
+        let mode = std::fs::metadata(lock_path(&vault))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode & !0o660,
+            0,
+            "lock mode {mode:o} exceeds the vault's 660"
+        );
+        assert_eq!(mode & 0o600, 0o600, "owner can read and write: {mode:o}");
+        assert_ne!(
+            mode & 0o040,
+            0,
+            "group can open it (umask permitting): {mode:o}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unwritable_lock_file_is_locked_through_a_read_only_open() {
+        // A second user on a shared vault may find a lock file it cannot write
+        // (created by the first user). flock works on a read-only descriptor,
+        // so the save must still be able to lock it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("v.kdbx");
+        std::fs::write(&vault, b"x").unwrap();
+        let lock = lock_path(&vault);
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let held = WriterLock::acquire(&vault, Duration::ZERO).expect("read-only lock");
+        // And it still excludes a second holder.
+        assert!(WriterLock::acquire(&vault, Duration::from_millis(30)).is_err());
+        drop(held);
     }
 
     #[test]
