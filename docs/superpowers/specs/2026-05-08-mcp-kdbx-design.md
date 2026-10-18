@@ -1341,3 +1341,16 @@ integration tests assert them.
   every event. The one value change: `save_failed.failure_step` now names the
   real step (`lock`, `reread`, `serialize`, `write_temp`, `rename`) instead of
   always `"write"`.
+- **History is kept in KeePass order and within the vault's limits.**
+  keepass 0.12's `History::add_entry` (used by `edit_tracking`) inserts each
+  new snapshot at index 0, while its XML parse and write keep file order and
+  KeePass writes history oldest first; it also never applies
+  `HistoryMaxItems` / `HistoryMaxSize`. After every tracked edit the server
+  moves the new snapshot to the end (oldest first) and applies KeePass's
+  `MaintainBackups`: remove the oldest backup (smallest LastModificationTime,
+  first on a tie) while there are more than `HistoryMaxItems`, then while
+  their total size exceeds `HistoryMaxSize`. Negative means unlimited; unset
+  means KeePass's defaults (10 items, 6 MiB). Size is field bytes plus
+  attachment bytes, an approximation of KeePass's `PwEntry.GetSize`.
+  Binaries used only by a removed backup stay in the binary pool until
+  KeePass next saves.

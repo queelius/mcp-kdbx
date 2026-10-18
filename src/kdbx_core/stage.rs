@@ -419,7 +419,109 @@ pub fn update_field(
     // the old value was lost from history on save.)
     entry_mut.edit_tracking(|e| e.set(name, new_value));
 
+    maintain_history(working, entry_id);
+
     Ok(entry_id)
+}
+
+/// KeePass's default `HistoryMaxItems` when the vault does not set one.
+const DEFAULT_HISTORY_MAX_ITEMS: isize = 10;
+
+/// KeePass's default `HistoryMaxSize` (6 MiB) when the vault does not set one.
+const DEFAULT_HISTORY_MAX_SIZE: isize = 6 * 1024 * 1024;
+
+/// Restore KeePass history order and limits after a tracked edit.
+///
+/// Order: KeePass stores history oldest first (it appends each backup), and
+/// keepass 0.12 keeps the file order when it parses and writes. But its
+/// `History::add_entry`, which `edit_tracking` calls, inserts the new snapshot
+/// at index 0. Left alone, a loaded entry's history becomes newest, then
+/// oldest to second-newest, and the newest backup is written first. Since
+/// every tracked edit here goes through this function, the list is oldest
+/// first before the edit, so moving index 0 to the end restores the order.
+///
+/// Limits: keepass 0.12 never applies `Meta::history_max_items` or
+/// `history_max_size`, so history grew by a full snapshot per edit. This
+/// applies KeePass's `PwEntry.MaintainBackups`: while there are more than
+/// `max_items` backups, remove the oldest; then while their total size is over
+/// `max_size`, remove the oldest. A negative limit means unlimited; an unset
+/// one takes KeePass's default (10 items, 6 MiB). "Oldest" is the smallest
+/// LastModificationTime, the first such on a tie (KeePass's
+/// `RemoveOldestBackup`). The size of a backup is the bytes of its field names
+/// and values plus its attachments, an approximation of KeePass's
+/// `PwEntry.GetSize`.
+///
+/// keepass 0.12 exposes no way to edit a history list in place, so the kept
+/// snapshots are re-added newest-to-oldest through `add_entry` (each insert at
+/// index 0), which leaves them oldest first. Attachments that only a removed
+/// backup used stay in the database's binary pool, as with any keepass 0.12
+/// edit; KeePass drops unreferenced binaries when it next saves.
+fn maintain_history(working: &mut Database, entry_id: EntryId) {
+    let max_items = working
+        .meta
+        .history_max_items
+        .unwrap_or(DEFAULT_HISTORY_MAX_ITEMS);
+    let max_size = working
+        .meta
+        .history_max_size
+        .unwrap_or(DEFAULT_HISTORY_MAX_SIZE);
+
+    let Some(entry) = working.entry(entry_id) else {
+        return;
+    };
+    let Some(history) = entry.history.as_ref() else {
+        return;
+    };
+    // (snapshot, size), in stored order: newest first, then oldest first.
+    let mut backups: Vec<(keepass::db::Entry, usize)> = history
+        .get_entries()
+        .iter()
+        .enumerate()
+        .map(|(i, snapshot)| {
+            let attachment_bytes: usize = entry
+                .historical(i)
+                .map(|h| h.attachments_named().map(|(_, a)| a.get().len()).sum())
+                .unwrap_or(0);
+            let field_bytes: usize = snapshot
+                .fields
+                .iter()
+                .map(|(name, value)| name.len() + value.get().len())
+                .sum();
+            (snapshot.clone(), field_bytes + attachment_bytes)
+        })
+        .collect();
+    if !backups.is_empty() {
+        backups.rotate_left(1);
+    }
+
+    let remove_oldest = |backups: &mut Vec<(keepass::db::Entry, usize)>| {
+        let oldest = backups
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, (snapshot, _))| (snapshot.times.last_modification, *i))
+            .map(|(i, _)| i);
+        if let Some(i) = oldest {
+            backups.remove(i);
+        }
+    };
+    if let Ok(max) = usize::try_from(max_items) {
+        while backups.len() > max {
+            remove_oldest(&mut backups);
+        }
+    }
+    if let Ok(max) = usize::try_from(max_size) {
+        while backups.iter().map(|(_, size)| size).sum::<usize>() > max {
+            remove_oldest(&mut backups);
+        }
+    }
+
+    let mut rebuilt = keepass::db::History::default();
+    for (snapshot, _) in backups.into_iter().rev() {
+        rebuilt.add_entry(snapshot);
+    }
+    if let Some(mut entry) = working.entry_mut(entry_id) {
+        entry.history = Some(rebuilt);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1259,94 @@ mod tests {
             "modification time bumped"
         );
         assert_eq!(e.times.creation, created, "creation time untouched");
+    }
+
+    /// The URL values held by the history snapshots of the entry at `p`, in
+    /// stored order.
+    fn history_urls(db: &Database, p: &str) -> Vec<String> {
+        let id = path(p).resolve_entry(db).unwrap();
+        db.entry(id)
+            .unwrap()
+            .history
+            .as_ref()
+            .map(|h| {
+                h.get_entries()
+                    .iter()
+                    .map(|e| e.get(fields::URL).unwrap_or("").to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Set URL to v1..=vN in turn. The snapshots then hold the pre-edit
+    /// values: the original URL, then v1..v(N-1).
+    fn edit_url_n_times(db: &mut Database, n: usize) {
+        for i in 1..=n {
+            update_field(db, &addr("/Existing"), fields::URL, &format!("v{i}"), None).unwrap();
+        }
+    }
+
+    #[test]
+    fn history_is_stored_oldest_first_and_trimmed_to_ten_by_default() {
+        // KeePass stores history oldest first and, by default, keeps 10
+        // items. keepass 0.12 inserts each new snapshot at index 0 and never
+        // trims, so the entry would grow without bound in mixed order.
+        let mut db = build_db();
+        edit_url_n_times(&mut db, 12);
+        let urls = history_urls(&db, "/Existing");
+        let expected: Vec<String> = (2..=11).map(|i| format!("v{i}")).collect();
+        assert_eq!(urls, expected, "the 10 newest snapshots, oldest first");
+    }
+
+    #[test]
+    fn history_order_survives_save_and_a_further_edit_after_reopen() {
+        // Saved oldest first, reopened in file order, and a further edit on the
+        // reopened entry appends its snapshot at the end.
+        let db = build_db();
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        edit_url_n_times(vault.working_db_mut().unwrap(), 3);
+        save_pending(&mut vault).unwrap();
+        let path_on_disk = vault.path().to_path_buf();
+        drop(vault);
+
+        let mut reopened = Vault::new(path_on_disk);
+        reopened.unlock(TEST_PASSWORD, None).unwrap();
+        let working = reopened.working_db_mut().unwrap();
+        assert_eq!(
+            history_urls(working, "/Existing"),
+            ["https://old.example.com", "v1", "v2"]
+        );
+        update_field(working, &addr("/Existing"), fields::URL, "v4", None).unwrap();
+        assert_eq!(
+            history_urls(working, "/Existing"),
+            ["https://old.example.com", "v1", "v2", "v3"]
+        );
+    }
+
+    #[test]
+    fn history_honors_the_vault_max_items_and_negative_means_unlimited() {
+        let mut db = build_db();
+        db.meta.history_max_items = Some(3);
+        edit_url_n_times(&mut db, 6);
+        assert_eq!(history_urls(&db, "/Existing"), ["v3", "v4", "v5"]);
+
+        let mut db = build_db();
+        db.meta.history_max_items = Some(-1);
+        edit_url_n_times(&mut db, 12);
+        assert_eq!(history_urls(&db, "/Existing").len(), 12);
+    }
+
+    #[test]
+    fn history_honors_the_vault_max_size_dropping_the_oldest() {
+        // Each snapshot carries a ~1000-byte URL, so a 2500-byte budget keeps
+        // the newest two.
+        let mut db = build_db();
+        db.meta.history_max_size = Some(2500);
+        let big = |c: char| c.to_string().repeat(1000);
+        for c in ['a', 'b', 'c', 'd'] {
+            update_field(&mut db, &addr("/Existing"), fields::URL, &big(c), None).unwrap();
+        }
+        assert_eq!(history_urls(&db, "/Existing"), [big('b'), big('c')]);
     }
 
     #[test]
