@@ -105,7 +105,7 @@ impl KdbxServer {
 
     /// Read: list the direct entries of a group.
     #[tool(
-        description = "List the direct entries of a group. Provide group_path. Returns each entry's title, path, uuid, username, url, a notes preview, custom field names with protected flags, attachment and otp flags, and the modified timestamp. Metadata only: no passwords or protected values."
+        description = "List the direct entries of a group. Provide group_path. Returns each entry's title, path, uuid, username, url, a notes preview, standard and custom field names with protected flags, attachment and otp flags, and the modified timestamp. Metadata only: no passwords or protected values. A username, url, or notes field marked protected is returned as null and flagged protected in standard_field_names; read it with kdbx_reveal_protected."
     )]
     async fn kdbx_list_entries(&self, Parameters(params): Parameters<ListEntriesParams>) -> String {
         let mut vault = self.vault().await;
@@ -169,7 +169,7 @@ impl KdbxServer {
 
     /// Read: fetch the full detail view of one entry.
     #[tool(
-        description = "Fetch the full detail of an entry. Provide path. Returns title, path, uuid, username, url, full notes, custom field names with protected flags, attachment and otp flags, and the created, modified, and accessed timestamps. No password, protected values, or attachment bytes."
+        description = "Fetch the full detail of an entry. Provide path. Returns title, path, uuid, username, url, full notes, standard and custom field names with protected flags, attachment and otp flags, and the created, modified, and accessed timestamps. No password, protected values, or attachment bytes. A username, url, or notes field marked protected is returned as null and flagged protected in standard_field_names; read it with kdbx_reveal_protected."
     )]
     async fn kdbx_get_entry(&self, Parameters(params): Parameters<GetEntryParams>) -> String {
         let mut vault = self.vault().await;
@@ -197,7 +197,7 @@ impl KdbxServer {
     /// Read: find entries whose requested fields contain the query as a
     /// substring.
     #[tool(
-        description = "Find entries whose fields contain a substring. Provide query and optionally fields (a subset of title, username, url, notes; default title, username, url). Returns matching entries in list-entry shape, the total matched_count, and a truncated flag set when more than 100 entries matched. Metadata only."
+        description = "Find entries whose fields contain a substring. Provide query and optionally fields (a subset of title, username, url, notes; default title, username, url). Returns matching entries in list-entry shape, the total matched_count, and a truncated flag set when more than 100 entries matched. Metadata only. Protected field values are never searched."
     )]
     async fn kdbx_find_entry(&self, Parameters(params): Parameters<FindEntryParams>) -> String {
         let mut vault = self.vault().await;

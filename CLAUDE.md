@@ -12,7 +12,7 @@ User-facing summary: `README.md`. Full v0.1 design (motivation, protocol surface
 
 **All five v0.1 phases complete (the full server, its automated test suite, CI gates, and docs). Merged to `main` locally (merge commit, `feat/v0.1` deleted); `main` is ahead of `origin/main` and not yet pushed. v0.1 is feature-complete, pending a crates.io release.**
 
-The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 226 tests pass (194 library unit tests, 27 protocol-conformance, 5 integration); `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the source security audit (`bash scripts/ci-audit.sh`) are clean. The server runs: all 17 tools register and respond over real stdio MCP.
+The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 240 tests pass (207 library unit tests, 27 protocol-conformance, 6 integration); `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the source security audit (`bash scripts/ci-audit.sh`) are clean. The server runs: all 17 tools register and respond over real stdio MCP.
 
 Phase 1 (tasks 1 to 9), the `kdbx_core` foundation: `error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`.
 

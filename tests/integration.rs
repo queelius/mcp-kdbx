@@ -96,6 +96,116 @@ fn audit_log_records_unlock_and_reveal_without_plaintext() {
     );
 }
 
+/// A protected standard field (KeePassXC's per-attribute "Protect" toggle on
+/// UserName or Notes) must behave like any other protected value: bulk reads
+/// return it as null and mark it protected, search never matches it, and the
+/// only way out is `kdbx_reveal_protected`, which audits a sha256 of the value.
+#[test]
+fn protected_standard_fields_are_hidden_from_reads_and_search_but_revealable() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let (_vault_dir, _path, mut server) = writable(
+        "flat.kdbx",
+        &[("KDBX_LOG_FILE", log_path.to_str().unwrap())],
+    );
+
+    // Flip protection on in place: same values, now protected.
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/GitHub", "field_name": "UserName", "value": "octocat", "protected": true }),
+    );
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/GitHub", "field_name": "Notes", "value": "primary dev account", "protected": true }),
+    );
+
+    // Summary view (list): protected values are null and flagged; the
+    // unprotected URL is unchanged.
+    let listed = server.call_ok("kdbx_list_entries", json!({ "group_path": "/" }));
+    let github = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["title"] == json!("GitHub"))
+        .expect("GitHub listed")
+        .clone();
+    assert_eq!(github["username"], Value::Null);
+    assert_eq!(github["notes_preview"], Value::Null);
+    assert_eq!(github["url"], json!("https://github.com"));
+    let flags: Vec<(String, bool)> = github["standard_field_names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["name"].as_str().unwrap().to_string(),
+                f["protected"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert!(flags.contains(&("UserName".to_string(), true)), "{flags:?}");
+    assert!(flags.contains(&("Notes".to_string(), true)), "{flags:?}");
+    assert!(flags.contains(&("URL".to_string(), false)), "{flags:?}");
+
+    // Full view (get): same treatment, full notes field is null too.
+    let detail = server.call_ok("kdbx_get_entry", json!({ "path": "/GitHub" }));
+    assert_eq!(detail["username"], Value::Null);
+    assert_eq!(detail["notes"], Value::Null);
+    assert_eq!(detail["url"], json!("https://github.com"));
+    let detail_text = detail.to_string();
+    assert!(!detail_text.contains("octocat") && !detail_text.contains("primary dev account"));
+
+    // Search is not an oracle on the protected values, but unprotected fields
+    // still match.
+    let by_user = server.call_ok("kdbx_find_entry", json!({ "query": "octocat" }));
+    assert_eq!(by_user["matched_count"], json!(0));
+    let by_notes = server.call_ok(
+        "kdbx_find_entry",
+        json!({ "query": "primary dev", "fields": ["notes"] }),
+    );
+    assert_eq!(by_notes["matched_count"], json!(0));
+    let by_url = server.call_ok(
+        "kdbx_find_entry",
+        json!({ "query": "github.com", "fields": ["url"] }),
+    );
+    assert_eq!(by_url["matched_count"], json!(1));
+
+    // The consent-gated reveal returns each value by its standard field name.
+    let user = server.call_ok(
+        "kdbx_reveal_protected",
+        json!({ "path": "/GitHub", "field_name": "UserName" }),
+    );
+    assert_eq!(user["value"], json!("octocat"));
+    let notes = server.call_ok(
+        "kdbx_reveal_protected",
+        json!({ "path": "/GitHub", "field_name": "Notes" }),
+    );
+    assert_eq!(notes["value"], json!("primary dev account"));
+
+    // Each reveal is audited with the domain-separated hash, never the value.
+    let events = read_audit_lines(&log_path);
+    for (field, value) in [("UserName", "octocat"), ("Notes", "primary dev account")] {
+        let reveal = events
+            .iter()
+            .find(|e| {
+                e["event"] == json!("reveal_protected")
+                    && e["details"]["field_name"] == json!(field)
+            })
+            .unwrap_or_else(|| panic!("reveal_protected event for {field} present"));
+        assert_eq!(reveal["details"]["target_path"], json!("/GitHub"));
+        assert_eq!(reveal["details"]["sha256"], json!(hash_revealed(value)));
+    }
+    let raw = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        !raw.contains("octocat"),
+        "revealed UserName leaked into the audit log"
+    );
+    assert!(
+        !raw.contains("primary dev account"),
+        "revealed Notes leaked into the audit log"
+    );
+}
+
 #[test]
 fn stage_save_reopen_persists_changes() {
     let (_dir, path, mut server) = writable("flat.kdbx", &[]);

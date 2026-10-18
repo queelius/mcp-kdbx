@@ -197,9 +197,10 @@ output: {
       title: string,
       path: string,
       uuid: string,
-      username: string | null,
-      url: string | null,
-      notes_preview: string | null,                       // first 200 chars
+      username: string | null,                            // null if absent or protected
+      url: string | null,                                 // null if absent or protected
+      notes_preview: string | null,                       // first 200 chars; null if absent or protected
+      standard_field_names: { name: string, protected: boolean }[],  // present standard fields, canonical order
       custom_field_names: { name: string, protected: boolean }[],
       has_attachments: boolean,
       has_otp: boolean,
@@ -222,7 +223,8 @@ input:  { path: string }
 output: {
   ok: true,
   data: {
-    title, path, uuid, username, url, notes,              // notes full, not preview
+    title, path, uuid, username, url, notes,              // notes full, not preview; null if absent or protected
+    standard_field_names: { name: string, protected: boolean }[],
     custom_field_names: { name: string, protected: boolean }[],
     has_attachments: boolean,
     has_otp: boolean,
@@ -529,6 +531,8 @@ Memory cost: 2x the parsed database. Negligible for typical KDBX vaults.
 **Standard fields** (KDBX-canonical): `Title`, `UserName`, `Password` (default protected), `URL`, `Notes`.
 **Custom fields:** arbitrary user-defined with explicit `protected` flag.
 
+Protection is a per-field flag on every field, standard or custom. Any standard field can be marked protected (KeePassXC's per-attribute "Protect" toggle; KeePass 2's "protect in memory" option for UserName, URL, Notes). Read views and search honor the stored flag, never the field name: a protected value is withheld from metadata and reachable only through a reveal tool. Title is the one exception (see the implementation notes).
+
 `kdbx_update_field` rules:
 - Standard or custom field names accepted.
 - `value` required; empty string allowed (clears the field).
@@ -556,6 +560,7 @@ Returns `ENTRY_TITLE_INVALID` on rejection.
 `kdbx_find_entry`:
 - Lowercase via Unicode case folding (not ASCII-only).
 - Substring match against the configured field-list (default: title, username, url).
+- A protected field is never compared (Title excepted, since it is visible metadata), so search is not an oracle on protected values.
 - Stable sort by `(group_path, title)`.
 - Cap at 100 results; set `truncated: true` if more match.
 - Plain substring only. No regex, no boolean operators, no globs.
@@ -1106,3 +1111,40 @@ against them.
   when unlocked (status counts as activity, so it is the full window after a
   status call), and `null` when locked or when idle lock is disabled
   (`KDBX_IDLE_TIMEOUT_SECONDS=0`).
+
+- **Protected standard fields (security fix, 2026-10-18).** v0.1 originally
+  emitted `username`, `url`, `notes`, and `notes_preview` from the raw field
+  value and searched them the same way, so a UserName, URL, or Notes the user
+  had marked protected leaked in plaintext through `kdbx_list_entries`,
+  `kdbx_get_entry`, and `kdbx_find_entry` (and repeated `kdbx_find_entry`
+  substring queries recovered it), bypassing the reveal tools and the audit
+  trail. The fix, all derived from the stored per-field flag through one rule
+  (`kdbx_core::visibility::metadata_value`) shared by the views and search:
+  - A protected `UserName`, `URL`, or `Notes` is emitted as JSON `null` under
+    its usual key (`username`, `url`, `notes` / `notes_preview`).
+  - Every read view now carries `standard_field_names: { name, protected }[]`,
+    listing the standard fields present on the entry in canonical order
+    (Title, UserName, Password, URL, Notes). It reuses the
+    `custom_field_names` record shape rather than adding per-key flags, so the
+    two lists together inventory every field with its protection. A
+    `protected: true` record means the value is withheld and must be read with
+    `kdbx_reveal_password` (Password) or `kdbx_reveal_protected` (any other
+    field, standard names included, for example `field_name: "UserName"`),
+    which audits a sha256 as usual. The key is additive: unprotected values
+    appear exactly as before, and `custom_field_names` is unchanged. A `null`
+    value with no matching record in `standard_field_names` means the field is
+    absent.
+  - `kdbx_find_entry` never compares against a protected value; unprotected
+    fields match as before.
+  - Example, an entry whose UserName is protected and whose URL is not:
+    `"username": null, "url": "https://github.com", "standard_field_names":
+    [{"name": "Title", "protected": false}, {"name": "UserName", "protected":
+    true}, {"name": "Password", "protected": true}, {"name": "URL",
+    "protected": false}]`.
+  - **Known, deliberate exception: Title.** Entries are addressed by title in
+    vault paths (`/Group/Title`), and every read tool returns `path`, so a
+    protected Title is visible regardless. It is still emitted under `title`
+    and is still searchable; `standard_field_names` reports its true
+    `protected` flag. Hiding it would require an addressing scheme that does
+    not embed titles (UUID-only paths), which is out of scope for v0.1.
+  - Password is still never emitted by any view, protected or not.

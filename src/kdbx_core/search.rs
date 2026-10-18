@@ -15,10 +15,18 @@
 //! way a full case-fold would. KDBX titles are short Latin strings in practice,
 //! so this is acceptable for now and can be revisited if it bites.
 //!
-//! This module depends only on `keepass` and `std`. It builds the group path
-//! inline during the walk rather than going through `crate::kdbx_core::path`,
-//! since tracking the path as we recurse is simpler and matches the shape that
-//! the read tooling (Phase 3) needs.
+//! Protected values are never compared. A field is read through
+//! [`crate::kdbx_core::visibility::metadata_value`], the same rule the read
+//! views use, so a field is searchable exactly when the views would show it.
+//! Without this, repeated substring queries against a protected UserName, URL,
+//! or Notes would recover the value with no reveal and no audit event.
+//!
+//! Besides that rule, this module depends only on `keepass` and `std`. It
+//! builds the group path inline during the walk rather than going through
+//! `crate::kdbx_core::path`, since tracking the path as we recurse is simpler
+//! and matches the shape that the read tooling (Phase 3) needs.
+
+use crate::kdbx_core::visibility::metadata_value;
 
 /// One field of an entry that a search may look at.
 ///
@@ -174,11 +182,11 @@ fn collect_matches(
 }
 
 /// True when any requested field's lowercased value contains `needle`. `needle`
-/// is assumed already lowercased by the caller.
+/// is assumed already lowercased by the caller. A protected field (other than
+/// the Title address) has no metadata value and so never matches.
 fn entry_matches(entry: &keepass::db::EntryRef<'_>, needle: &str, fields: &[Field]) -> bool {
     fields.iter().any(|f| {
-        entry
-            .get(f.keepass_name())
+        metadata_value(entry, f.keepass_name())
             .map(|v| v.to_lowercase().contains(needle))
             .unwrap_or(false)
     })
@@ -417,6 +425,73 @@ mod tests {
         assert_eq!(results.matched_count, 0);
         assert!(results.entries.is_empty());
         assert!(!results.truncated);
+    }
+
+    /// Build a database with one root entry carrying the given unprotected and
+    /// protected fields.
+    fn db_with_protection(unprotected: &[SeedField], protected: &[SeedField]) -> Database {
+        let mut db = Database::new();
+        db.root_mut().add_entry().edit(|e| {
+            for (name, value) in unprotected {
+                e.set_unprotected(*name, *value);
+            }
+            for (name, value) in protected {
+                e.set_protected(*name, *value);
+            }
+        });
+        db
+    }
+
+    const ALL_FIELDS: &[Field] = &[Field::Title, Field::Username, Field::Url, Field::Notes];
+
+    #[test]
+    fn protected_fields_are_never_matched() {
+        // The needle occurs only inside protected UserName, URL, and Notes. No
+        // field set, default or explicit, may match it: find_entry must not be
+        // an oracle on protected values.
+        let db = db_with_protection(
+            &[(fields::TITLE, "Covert")],
+            &[
+                (fields::USERNAME, "zebra-user"),
+                (fields::URL, "https://zebra.example"),
+                (fields::NOTES, "zebra notes"),
+            ],
+        );
+        assert_eq!(find_entry(&db, "zebra", &[]).matched_count, 0);
+        assert_eq!(find_entry(&db, "zebra", ALL_FIELDS).matched_count, 0);
+        for field in ALL_FIELDS {
+            assert_eq!(
+                find_entry(&db, "zebra", &[*field]).matched_count,
+                0,
+                "matched a protected value via {field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unprotected_fields_still_match_next_to_protected_ones() {
+        let db = db_with_protection(
+            &[
+                (fields::TITLE, "Mixed"),
+                (fields::URL, "https://open.example"),
+                (fields::NOTES, "open notes"),
+            ],
+            &[(fields::USERNAME, "hidden-user")],
+        );
+        assert_eq!(find_entry(&db, "open.example", &[]).matched_count, 1);
+        assert_eq!(
+            find_entry(&db, "open notes", &[Field::Notes]).matched_count,
+            1
+        );
+        assert_eq!(find_entry(&db, "hidden", ALL_FIELDS).matched_count, 0);
+    }
+
+    #[test]
+    fn protected_title_still_matches_as_visible_metadata() {
+        // Title is the entry's address and is shown by every read view even
+        // when protected, so searching it reveals nothing new.
+        let db = db_with_protection(&[], &[(fields::TITLE, "Addressed")]);
+        assert_eq!(find_entry(&db, "address", &[]).matched_count, 1);
     }
 
     #[test]
