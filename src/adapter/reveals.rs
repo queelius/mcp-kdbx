@@ -17,6 +17,7 @@
 use crate::adapter::{KdbxServer, canonical_entry_path, locate_entry, responses};
 use crate::engine::audit::{AuditEvent, hash_revealed};
 use crate::engine::error::{CoreError, ErrorCode};
+use crate::engine::otp;
 use base64::Engine;
 use kdbx_core::fields::StandardField;
 use kdbx_core::visibility::is_secret;
@@ -287,11 +288,11 @@ impl KdbxServer {
     }
 
     /// Reveal: compute the current TOTP code for an entry, from whichever
-    /// source `totp::resolve_for_entry` finds (otpauth URI, KeePass 2 native
+    /// source kdbx-core's resolver finds (otpauth URI, KeePass 2 native
     /// `TimeOtp-*` fields, or the legacy pair). The secret never leaves the process;
     /// only the code crosses out, and the audit event logs no code.
     #[tool(
-        description = "Compute the current TOTP code for an entry. Reads the otp field (otpauth URI), the KeePass 2 TimeOtp-* fields, or the legacy TOTP Seed and TOTP Settings pair, in that order. Returns the code with its remaining validity, period, and the time_unix it was computed at (an optional time_unix is clamped to now plus or minus one period). The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
+        description = "Compute the current TOTP code for an entry. Reads the otp field (otpauth URI), the KeePass 2 TimeOtp-* fields, or the legacy TOTP Seed and TOTP Settings pair, in that order; Steam Guard codes are supported. A configuration that is present but malformed is OTP_INVALID (details name the source and reason); none at all is NO_OTP_CONFIGURED. Returns the code with its remaining validity, period, and the time_unix it was computed at (an optional time_unix is clamped to now plus or minus one period). The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
     )]
     async fn kdbx_get_otp(&self, Parameters(params): Parameters<GetOtpParams>) -> String {
         let mut vault = self.vault().await;
@@ -317,17 +318,19 @@ impl KdbxServer {
 
         // Resolve a config (otpauth, KeePass native, then legacy) through
         // the shared resolver, the same one the read views use for has_otp, so
-        // the capability flag and this computation cannot drift. The config
-        // holds the secret; it stays in this scope and never crosses out.
-        let config = match crate::engine::totp::resolve_for_entry(&entry) {
-            Some(c) => c,
-            None => return responses::err(&ErrorCode::NoOtpConfigured.into()),
+        // the capability flag and this computation cannot drift. A malformed
+        // configuration is OTP_INVALID, never "no OTP". The config holds the
+        // secret; it stays in this scope and never crosses out.
+        let config = match otp::resolve(&entry) {
+            Ok(Some(c)) => c,
+            Ok(None) => return responses::err(&ErrorCode::NoOtpConfigured.into()),
+            Err(e) => return responses::err(&e),
         };
 
         // A requested time is clamped to now plus or minus one period, so only
         // the previous, current, or next code can ever cross out.
-        let time_unix = config.evaluation_time(params.time_unix, crate::engine::totp::unix_now());
-        let code = config.compute_at(time_unix);
+        let time_unix = config.evaluation_time(params.time_unix, otp::unix_now());
+        let code = config.code_at(time_unix);
         let target_uuid = entry.id().uuid().to_string();
 
         // The event records the access and both times, never the code or the
@@ -340,9 +343,9 @@ impl KdbxServer {
         });
 
         responses::ok(serde_json::json!({
-            "code": code.code.expose(),
-            "valid_for_seconds": code.valid_for_seconds,
-            "period_seconds": code.period_seconds,
+            "code": code.code(),
+            "valid_for_seconds": code.valid_for_seconds(),
+            "period_seconds": code.period_seconds(),
             "time_unix": time_unix,
         }))
     }

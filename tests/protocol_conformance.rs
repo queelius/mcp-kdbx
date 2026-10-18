@@ -650,6 +650,59 @@ fn error_no_otp_configured() {
 }
 
 #[test]
+fn error_otp_invalid() {
+    // A configured but malformed TOTP source is a typed error, never "no
+    // OTP": the agent learns the entry has OTP and why it cannot be used.
+    let (_dir, mut server) = unlocked_writable("flat.kdbx");
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/Bank", "field_name": "otp", "value": "otpauth://totp/x?secret=!!!" }),
+    );
+    let err = server.call_error("kdbx_get_otp", json!({ "path": "/Bank" }));
+    assert_eq!(err["code"], json!("OTP_INVALID"));
+    assert_eq!(err["details"]["source"], json!("uri"));
+    assert_eq!(err["details"]["reason"], json!("invalid_secret"));
+    // has_otp is true only for a configuration that resolves.
+    let bank = server.call_ok("kdbx_get_entry", json!({ "path": "/Bank" }));
+    assert_eq!(bank["has_otp"], json!(false));
+    // A typed reason that carries a field names it.
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/Email", "field_name": "TOTP Settings", "value": "30;6" }),
+    );
+    let err = server.call_error("kdbx_get_otp", json!({ "path": "/Email" }));
+    assert_eq!(err["code"], json!("OTP_INVALID"));
+    assert_eq!(err["details"]["source"], json!("legacy"));
+    assert_eq!(
+        err["details"]["reason"],
+        json!({ "missing_field": "TOTP Seed" })
+    );
+}
+
+#[test]
+fn steam_totp_codes_are_supported() {
+    let (_dir, mut server) = unlocked_writable("flat.kdbx");
+    server.call_ok(
+        "kdbx_update_field",
+        json!({
+            "path": "/Wifi",
+            "field_name": "otp",
+            "value": "otpauth://totp/Steam:me?secret=JBSWY3DPEHPK3PXP&encoder=steam",
+        }),
+    );
+    let wifi = server.call_ok("kdbx_get_entry", json!({ "path": "/Wifi" }));
+    assert_eq!(wifi["has_otp"], json!(true));
+    let otp = server.call_ok("kdbx_get_otp", json!({ "path": "/Wifi" }));
+    let code = otp["code"].as_str().unwrap();
+    assert_eq!(code.chars().count(), 5, "Steam codes are five characters");
+    assert!(
+        code.chars()
+            .all(|c| "23456789BCDFGHJKMNPQRTVWXY".contains(c)),
+        "{code} uses the Steam alphabet"
+    );
+}
+
+#[test]
 fn error_writes_disabled() {
     // Writes not enabled: add_entry is refused before touching the vault.
     let mut server = unlocked("flat.kdbx");

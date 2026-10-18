@@ -610,7 +610,7 @@ fn map_added_entry(working: &Database, after: &View, uuid: uuid::Uuid) -> Option
     // Route has_otp through the same resolver the read views use
     // (src/adapter/views.rs), so kdbx_diff_pending and kdbx_list_entries agree on
     // whether an entry has a usable TOTP source.
-    let has_otp = crate::engine::totp::resolve_for_entry(&entry_ref).is_some();
+    let has_otp = crate::engine::otp::has_otp(&entry_ref);
 
     Some(AddedEntry {
         path,
@@ -1933,7 +1933,7 @@ mod tests {
         // The modern-otp case is covered by diff_added_entry_with_otp_sets_has_otp.
         // This pins the legacy "TOTP Seed" + "TOTP Settings" pair so the diff's
         // has_otp agrees with the read views, which also route through
-        // totp::resolve_for_entry.
+        // engine::otp::has_otp.
         let canonical = build_db();
         let mut working = canonical.clone();
         let input = EntryInput {

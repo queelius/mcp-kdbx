@@ -16,7 +16,8 @@
 //!   atomic replace the save path uses.
 //! - `unlock`: master-password source resolution (input, env, command).
 //! - `audit`: the JSONL audit-log events and sha256 reveal hashing.
-//! - `totp`: otpauth URI parsing and TOTP code computation.
+//! - `otp`: TOTP for a live entry through kdbx-core's `otp` (typed
+//!   `OTP_INVALID` for a malformed configuration).
 //! - `search`: substring entry search across configurable fields.
 //! - `secret`: `Secret<T>`, the redacting, zeroizing wrapper for secret fields.
 //! - `stage`: working-copy write operations, the diff-kdbx stage diff, and the
@@ -31,10 +32,10 @@ pub mod audit;
 pub mod config;
 pub mod error;
 pub mod orphan;
+pub mod otp;
 pub mod search;
 pub mod secret;
 pub mod stage;
-pub mod totp;
 pub mod unlock;
 pub mod vault;
 pub mod vault_file;

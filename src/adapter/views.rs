@@ -162,9 +162,9 @@ fn has_attachments(entry: &keepass::db::EntryRef<'_>) -> bool {
 
 /// Whether the entry has a usable TOTP source. Uses the same resolver as
 /// `kdbx_get_otp`, so the `has_otp` flag is true exactly when a code could be
-/// produced, from any source `totp::resolve_for_entry` knows.
+/// produced (a malformed configuration is false).
 fn has_otp(entry: &keepass::db::EntryRef<'_>) -> bool {
-    crate::engine::totp::resolve_for_entry(entry).is_some()
+    crate::engine::otp::has_otp(entry)
 }
 
 /// Format an optional KDBX timestamp as `YYYY-MM-DDTHH:MM:SSZ`, or null.

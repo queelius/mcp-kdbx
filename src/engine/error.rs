@@ -48,6 +48,12 @@ pub enum ErrorCode {
     /// corrupt header), so reporting it reveals nothing about the password.
     /// `details.reason` names which. A wrong key stays `AUTH_FAILED`.
     VaultUnreadable,
+    /// The entry has a TOTP configuration, but no source of it is usable (a
+    /// secret that does not decode, a zero period, an unknown algorithm or
+    /// encoder, a missing half of the legacy pair). `details.source` and
+    /// `details.reason` are kdbx-core's typed forms. Distinct from
+    /// `NO_OTP_CONFIGURED`, which means no source is present at all.
+    OtpInvalid,
 }
 
 impl ErrorCode {
@@ -74,6 +80,7 @@ impl ErrorCode {
             ErrorCode::InvalidInput => "INVALID_INPUT",
             ErrorCode::PathInvalid => "PATH_INVALID",
             ErrorCode::VaultUnreadable => "VAULT_UNREADABLE",
+            ErrorCode::OtpInvalid => "OTP_INVALID",
         }
     }
 
@@ -110,6 +117,9 @@ impl ErrorCode {
             }
             ErrorCode::VaultUnreadable => {
                 "The vault file is not a readable KDBX database (see details.reason)."
+            }
+            ErrorCode::OtpInvalid => {
+                "The entry's TOTP configuration is malformed (see details.source and details.reason)."
             }
         }
     }
@@ -230,6 +240,7 @@ mod tests {
         (ErrorCode::InvalidInput, "INVALID_INPUT"),
         (ErrorCode::PathInvalid, "PATH_INVALID"),
         (ErrorCode::VaultUnreadable, "VAULT_UNREADABLE"),
+        (ErrorCode::OtpInvalid, "OTP_INVALID"),
     ];
 
     #[test]

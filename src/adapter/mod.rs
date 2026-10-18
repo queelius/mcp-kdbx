@@ -247,7 +247,8 @@ impl ServerHandler for KdbxServer {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::{config::Config, stage, totp::TotpConfig};
+    use crate::engine::{config::Config, stage};
+    use kdbx_core::otp::TotpConfig;
 
     /// A value that must never appear in any Debug rendering below.
     const MARK: &str = "SECRET-MARK-7f3a";
@@ -295,11 +296,11 @@ mod tests {
             }],
         };
         assert_redacted("EntryInput", format!("{entry:?}"));
-        let totp = TotpConfig::parse("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP").unwrap();
+        let totp = TotpConfig::from_uri("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP").unwrap();
         let rendered = format!("{totp:?}");
         assert!(rendered.contains("<redacted>"), "TotpConfig: {rendered}");
-        let code = totp.compute_at(59);
-        assert!(!format!("{code:?}").contains(code.code.expose().as_str()));
+        let code = totp.code_at(59);
+        assert!(!format!("{code:?}").contains(code.code()));
         let config = Config {
             password: Some(MARK.to_string().into()),
             unlock_cmd: Some(MARK.to_string().into()),
