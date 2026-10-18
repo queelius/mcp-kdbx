@@ -341,6 +341,9 @@ output: { ok: true, data: { discarded: true, num_dropped: number } }
 | `VAULT_FILE_MODIFIED` | mtime changed since unlock |
 | `ENTRY_TITLE_INVALID` | Title is empty or contains literal `/` |
 | `FIELD_NAME_INVALID` | Field name is empty or has reserved characters |
+| `INVALID_INPUT` | A supplied value is malformed in a way no other code names (see implementation notes) |
+| `PATH_INVALID` | A path is malformed: no leading `/`, an empty `//` segment, a dangling `\` escape, or a `:0` ordinal (implementation notes, 2026-10-18) |
+| `VAULT_UNREADABLE` | The vault file fails before any key check: `details.reason` is `not_kdbx`, `unsupported_version`, `truncated`, or `corrupt_header` (implementation notes, 2026-10-18) |
 
 ## Versioning
 
@@ -1279,3 +1282,16 @@ integration tests assert them.
   not consumed; `null` once reported). All three reports share one shape:
   `{ lock_reason, pending_discarded_count, pending_discarded_summary }`. A
   failed unlock leaves the summary in place.
+- **Error codes: `PATH_INVALID` and `VAULT_UNREADABLE`.** A malformed path
+  (no leading `/`, `//`, a dangling `\`, `:0`) returned `GROUP_NOT_FOUND`,
+  even from entry tools; it is now `PATH_INVALID`, and the not-found codes
+  mean a well-formed path matched nothing. Every `Database::open` failure was
+  `AUTH_FAILED`; failures found before any key is derived or checked are now
+  `VAULT_UNREADABLE` with `details.reason`: `not_kdbx` (no KeePass
+  signature), `unsupported_version` (KeePass 2 pre-release or an unknown KDBX
+  major version), `truncated` (shorter than the version header), or
+  `corrupt_header` (the outer header does not parse or fails its sha256
+  check). Naming these reveals nothing about the password. A wrong key, and
+  every failure that can only arise after decryption with some key (a block
+  HMAC or XML error), stays `AUTH_FAILED`; `VAULT_UNREADABLE` emits no
+  `auth_failed` audit event.

@@ -80,6 +80,54 @@ pub struct LockInfo {
     pub summary: Vec<String>,
 }
 
+/// Why a vault file could not be read, for the `VAULT_UNREADABLE` error. Every
+/// reason is found before any key is checked, so naming it reveals nothing
+/// about the password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadableReason {
+    /// The file does not start with the KeePass signature.
+    NotKdbx,
+    /// A KeePass file of a version keepass cannot open (KeePass 2 pre-release,
+    /// or an unknown KDBX major version).
+    UnsupportedVersion,
+    /// The file ends before its version header does.
+    Truncated,
+    /// The outer header does not parse or fails its sha256 integrity check.
+    CorruptHeader,
+}
+
+/// Classify a keepass open failure. Errors raised while reading the version
+/// signature and the outer header (all before the key is derived and checked)
+/// become `VAULT_UNREADABLE` with an [`UnreadableReason`]. Everything else
+/// (a wrong key, and any error that can only be reached after decryption with
+/// some key) stays `AUTH_FAILED`, the conservative answer: it never tells a
+/// wrong-key attempt apart from anything else.
+fn open_error(e: &keepass::error::DatabaseOpenError) -> CoreError {
+    use keepass::error::{
+        DatabaseFormatError as Fmt, DatabaseOpenError as Open, DatabaseVersionParseError as Ver,
+        Kdbx3OpenError, Kdbx4OpenError,
+    };
+    let reason = match e {
+        Open::VersionParse(Ver::InvalidKDBXIdentifier) => Some(UnreadableReason::NotKdbx),
+        Open::VersionParse(Ver::InvalidKDBXVersion { .. }) | Open::UnsupportedVersion => {
+            Some(UnreadableReason::UnsupportedVersion)
+        }
+        Open::VersionParse(Ver::UnexpectedEof) => Some(UnreadableReason::Truncated),
+        Open::Format(Fmt::Kdbx4(Kdbx4OpenError::OuterHeader(_)))
+        | Open::Format(Fmt::Kdbx4(Kdbx4OpenError::HeaderHashMismatch))
+        | Open::Format(Fmt::Kdbx3(Kdbx3OpenError::OuterHeader(_))) => {
+            Some(UnreadableReason::CorruptHeader)
+        }
+        _ => None,
+    };
+    match reason {
+        Some(reason) => CoreError::new(ErrorCode::VaultUnreadable)
+            .with_details(serde_json::json!({ "reason": reason })),
+        None => CoreError::new(ErrorCode::AuthFailed),
+    }
+}
+
 /// The two states a vault can be in.
 ///
 /// `Locked` carries no secrets. `Unlocked` owns everything that must be zeroed
@@ -198,7 +246,7 @@ impl Vault {
         }
 
         let canonical_db = keepass::Database::open(&mut std::io::Cursor::new(&bytes), key.clone())
-            .map_err(|_| CoreError::new(ErrorCode::AuthFailed))?;
+            .map_err(|e| open_error(&e))?;
 
         let working_db = canonical_db.clone();
 
@@ -598,6 +646,52 @@ mod tests {
             .expect_err("wrong password should fail");
         assert_eq!(err.code_enum(), ErrorCode::AuthFailed);
         assert!(!vault.is_unlocked());
+    }
+
+    /// Unlock a vault whose file holds `bytes`, returning the error.
+    fn unlock_bytes(bytes: &[u8], password: &str) -> CoreError {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+        let mut vault = Vault::new(tmp.path().to_path_buf());
+        let err = vault.unlock(password, None).expect_err("must fail");
+        assert!(!vault.is_unlocked());
+        err
+    }
+
+    fn fixture_bytes() -> Vec<u8> {
+        let (_tmp, path) = write_fixture();
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn unreadable_vault_files_are_distinguished_from_a_wrong_key() {
+        // Each of these fails before any key is checked, so naming the reason
+        // reveals nothing about the password. A wrong key stays AUTH_FAILED.
+        let reason = |e: &CoreError| e.details().unwrap()["reason"].clone();
+
+        let err = unlock_bytes(b"this is not a keepass file at all", TEST_PASSWORD);
+        assert_eq!(err.code_enum(), ErrorCode::VaultUnreadable);
+        assert_eq!(reason(&err), serde_json::json!("not_kdbx"));
+
+        let err = unlock_bytes(b"\x03\xd9", TEST_PASSWORD);
+        assert_eq!(err.code_enum(), ErrorCode::VaultUnreadable);
+        assert_eq!(reason(&err), serde_json::json!("truncated"));
+
+        let mut unsupported = fixture_bytes();
+        unsupported[10] = 9; // major version 9
+        let err = unlock_bytes(&unsupported, TEST_PASSWORD);
+        assert_eq!(err.code_enum(), ErrorCode::VaultUnreadable);
+        assert_eq!(reason(&err), serde_json::json!("unsupported_version"));
+
+        let mut corrupt = fixture_bytes();
+        corrupt[40] ^= 0xff; // inside the outer header
+        let err = unlock_bytes(&corrupt, TEST_PASSWORD);
+        assert_eq!(err.code_enum(), ErrorCode::VaultUnreadable);
+        assert_eq!(reason(&err), serde_json::json!("corrupt_header"));
+
+        let err = unlock_bytes(&fixture_bytes(), "the-wrong-password");
+        assert_eq!(err.code_enum(), ErrorCode::AuthFailed);
     }
 
     #[test]

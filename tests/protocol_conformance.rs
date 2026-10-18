@@ -449,6 +449,34 @@ fn error_auth_failed() {
 }
 
 #[test]
+fn error_vault_unreadable() {
+    // A file that is not a KDBX database fails before any key is checked:
+    // VAULT_UNREADABLE with a reason, not AUTH_FAILED.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("not-a-vault.kdbx");
+    std::fs::write(&path, b"plain text, not a keepass database").unwrap();
+    let mut server = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    let err = server.call_error("kdbx_unlock", json!({ "password": FIXTURE_PASSWORD }));
+    assert_eq!(err["code"], json!("VAULT_UNREADABLE"));
+    assert_eq!(err["details"]["reason"], json!("not_kdbx"));
+}
+
+#[test]
+fn error_path_invalid() {
+    let mut server = unlocked("flat.kdbx");
+    // A missing leading slash is a malformed path, from entry and group tools
+    // alike, not a not-found.
+    assert_eq!(
+        server.call_error_code("kdbx_get_entry", json!({ "path": "Bank" })),
+        "PATH_INVALID"
+    );
+    assert_eq!(
+        server.call_error_code("kdbx_list_entries", json!({ "group_path": "Web//x" })),
+        "PATH_INVALID"
+    );
+}
+
+#[test]
 fn error_unlock_source_missing() {
     let path = fixture_path("flat.kdbx");
     // No password argument and no KDBX_PASSWORD configured.

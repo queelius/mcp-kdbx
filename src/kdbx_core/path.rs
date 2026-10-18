@@ -78,18 +78,17 @@ pub enum Resolved {
 impl VaultPath {
     /// Parse a path string per spec section 1.
     ///
-    /// Returns `GROUP_NOT_FOUND`-free parse errors as `FIELD_NAME_INVALID` is
-    /// not appropriate here; malformed paths use `GroupNotFound` with a message,
-    /// matching how resolution reports "nothing resolves". A path that does not
-    /// start with `/`, that contains a dangling backslash escape, or that
-    /// carries a malformed `:N` ordinal is rejected.
+    /// A malformed path is `PATH_INVALID` (distinct from the not-found codes,
+    /// which mean a well-formed path matched nothing): one that does not start
+    /// with `/`, that contains an empty `//` segment or a dangling backslash
+    /// escape, or that carries a malformed `:N` ordinal.
     ///
     /// The leading empty segment (from the rooting `/`) is discarded. A trailing
     /// slash sets `is_group` and is otherwise dropped. The bare root `/` parses
     /// to zero segments with `is_group = true`.
     pub fn parse(input: &str) -> CoreResult<VaultPath> {
         if !input.starts_with('/') {
-            return Err(CoreError::new(ErrorCode::GroupNotFound)
+            return Err(CoreError::new(ErrorCode::PathInvalid)
                 .with_message("path must start with '/'")
                 .with_details(serde_json::json!({ "path": input })));
         }
@@ -127,7 +126,7 @@ impl VaultPath {
             }
         }
         if escaped {
-            return Err(CoreError::new(ErrorCode::GroupNotFound)
+            return Err(CoreError::new(ErrorCode::PathInvalid)
                 .with_message("path ends with a dangling '\\' escape")
                 .with_details(serde_json::json!({ "path": input })));
         }
@@ -147,7 +146,7 @@ impl VaultPath {
         // not normally empty, so reject it as malformed rather than silently
         // searching for an empty name.
         if raw_segments.iter().any(String::is_empty) {
-            return Err(CoreError::new(ErrorCode::GroupNotFound)
+            return Err(CoreError::new(ErrorCode::PathInvalid)
                 .with_message("path contains an empty segment ('//')")
                 .with_details(serde_json::json!({ "path": input })));
         }
@@ -399,12 +398,12 @@ impl Segment {
     fn parse(raw: &str, full_path: &str) -> CoreResult<Segment> {
         if let Some((name, ord_str)) = split_ordinal_suffix(raw) {
             let ordinal: usize = ord_str.parse().map_err(|_| {
-                CoreError::new(ErrorCode::GroupNotFound)
+                CoreError::new(ErrorCode::PathInvalid)
                     .with_message("malformed ':N' ordinal suffix")
                     .with_details(serde_json::json!({ "path": full_path, "segment": raw }))
             })?;
             if ordinal == 0 {
-                return Err(CoreError::new(ErrorCode::GroupNotFound)
+                return Err(CoreError::new(ErrorCode::PathInvalid)
                     .with_message("ordinal ':N' is 1-based; ':0' is not valid")
                     .with_details(serde_json::json!({ "path": full_path, "segment": raw })));
             }
@@ -817,31 +816,31 @@ mod tests {
     #[test]
     fn missing_leading_slash_is_rejected() {
         let err = VaultPath::parse("Web/Banking").expect_err("no leading slash");
-        assert_eq!(err.code_enum(), ErrorCode::GroupNotFound);
+        assert_eq!(err.code_enum(), ErrorCode::PathInvalid);
     }
 
     #[test]
     fn empty_string_is_rejected() {
         let err = VaultPath::parse("").expect_err("empty");
-        assert_eq!(err.code_enum(), ErrorCode::GroupNotFound);
+        assert_eq!(err.code_enum(), ErrorCode::PathInvalid);
     }
 
     #[test]
     fn double_slash_is_rejected() {
         let err = VaultPath::parse("/Web//Banking").expect_err("double slash");
-        assert_eq!(err.code_enum(), ErrorCode::GroupNotFound);
+        assert_eq!(err.code_enum(), ErrorCode::PathInvalid);
     }
 
     #[test]
     fn dangling_backslash_is_rejected() {
         let err = VaultPath::parse("/Web/a\\").expect_err("dangling escape");
-        assert_eq!(err.code_enum(), ErrorCode::GroupNotFound);
+        assert_eq!(err.code_enum(), ErrorCode::PathInvalid);
     }
 
     #[test]
     fn zero_ordinal_is_rejected() {
         let err = VaultPath::parse("/Web/MyBank:0").expect_err("zero ordinal");
-        assert_eq!(err.code_enum(), ErrorCode::GroupNotFound);
+        assert_eq!(err.code_enum(), ErrorCode::PathInvalid);
     }
 
     // NFC normalization, isolated from a database.
