@@ -812,6 +812,8 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 | `reveal_protected` | info | target_path, target_uuid, field_name, sha256 |
 | `download_attachment` | info | target_path, target_uuid, attachment_name, size_bytes, sha256 |
 | `get_otp` | info | target_path, target_uuid (no code logged) |
+| `unlock_failed` | warn | unlock_source, reason (added 2026-10-18: `VAULT_UNREADABLE`) |
+| `writer_lock_unavailable` | warn | reason (added 2026-10-18: save without the writer lock) |
 | `tool_call` | debug | tool, params (sensitive fields redacted), duration_ms, error_code |
 | `mcp_message` | trace | direction, full JSON-RPC payload |
 
@@ -1346,7 +1348,13 @@ integration tests assert them.
   to the same strings as before; a unit test pins the exact JSONL line of
   every event. The one value change: `save_failed.failure_step` now names the
   real step (`lock`, `reread`, `serialize`, `write_temp`, `rename`) instead of
-  always `"write"`.
+  always `"write"`. Two value shapes widened earlier in this batch and are
+  pinned too: `target_path` (on `write_staged`, the reveal events,
+  `download_attachment`, and `get_otp`) is `null` for a record with no
+  addressable path, and `stage_discarded.summary` (like
+  `pending_discarded_summary`) lists a UUID instead of a path for such a
+  record. `download_attachment` also carries `target_uuid`, and `get_otp`
+  carries `requested_time_unix` and `time_unix`.
 - **History is kept in KeePass order and within the vault's limits.**
   keepass 0.12's `History::add_entry` (used by `edit_tracking`) inserts each
   new snapshot at index 0, while its XML parse and write keep file order and
