@@ -440,7 +440,7 @@ mod tests {
             ),
             (
                 AuditEvent::VaultLocked {
-                    reason: "idle".to_string(),
+                    reason: "idle_timeout".to_string(),
                     pending_discarded_count: 0,
                 },
                 "vault_locked",
@@ -466,7 +466,7 @@ mod tests {
             ),
             (
                 AuditEvent::StageDiscarded {
-                    reason: "idle_lock".to_string(),
+                    reason: "manual".to_string(),
                     num_dropped: 2,
                     summary: vec!["/Web/GitHub".to_string(), "/Web/GitLab".to_string()],
                 },
@@ -540,6 +540,39 @@ mod tests {
                 Level::Info,
             ),
         ]
+    }
+
+    /// The exact JSONL line each event renders to, pinned. The audit log is a
+    /// durable on-disk format that operators grep and parse; any change to a
+    /// key, a value spelling, or a type here is a format break and must be
+    /// deliberate.
+    const PINNED_ENVELOPES: &[&str] = &[
+        r#"{"details":{"idle_timeout_seconds":900,"server_version":"0.1.0","vault_path":"/vault.kdbx","writes_allowed":false},"event":"server_started","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"file_mtime":"2026-05-08T10:00:00Z","unlock_source":"env"},"event":"vault_unlocked","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"pending_discarded_count":0,"reason":"idle_timeout"},"event":"vault_locked","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"error_code":"AUTH_FAILED","source":"cmd"},"event":"auth_failed","level":"error","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"field_name":"Password","target_path":"/Web/GitHub","target_uuid":"abcd","tool":"kdbx_update_field"},"event":"write_staged","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"num_dropped":2,"reason":"manual","summary":["/Web/GitHub","/Web/GitLab"]},"event":"stage_discarded","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"after_mtime":"2026-05-08T10:01:00Z","before_mtime":"2026-05-08T10:00:00Z","num_changes":1},"event":"save_committed","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"before_mtime":"2026-05-08T10:00:00Z","conflict_mtime":"2026-05-08T10:00:30Z","pending_changes":1},"event":"save_refused","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"error_message":"disk full","failure_step":"rename","pending_changes":1},"event":"save_failed","level":"error","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_password","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"field_name":"RecoveryKey","sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_protected","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"attachment_name":"key.pem","sha256":"deadbeef","size_bytes":2048,"target_path":"/Web/GitHub"},"event":"download_attachment","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"requested_time_unix":null,"target_path":"/Web/GitHub","target_uuid":"abcd","time_unix":1700000000},"event":"get_otp","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+    ];
+
+    #[test]
+    fn envelopes_render_to_the_pinned_jsonl() {
+        let events = all_events();
+        assert_eq!(events.len(), PINNED_ENVELOPES.len());
+        for ((event, name, _), pinned) in events.iter().zip(PINNED_ENVELOPES) {
+            assert_eq!(
+                event.envelope("2026-01-01T00:00:00Z", 42).to_string(),
+                *pinned,
+                "{name} drifted from the pinned audit format"
+            );
+        }
     }
 
     #[test]
