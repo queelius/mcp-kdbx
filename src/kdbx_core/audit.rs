@@ -187,6 +187,7 @@ pub enum AuditEvent {
     /// attachment was taken without storing its content.
     DownloadAttachment {
         target_path: Option<String>,
+        target_uuid: String,
         attachment_name: String,
         size_bytes: u64,
         sha256: String,
@@ -345,11 +346,13 @@ impl AuditEvent {
             }),
             AuditEvent::DownloadAttachment {
                 target_path,
+                target_uuid,
                 attachment_name,
                 size_bytes,
                 sha256,
             } => json!({
                 "target_path": target_path,
+                "target_uuid": target_uuid,
                 "attachment_name": attachment_name,
                 "size_bytes": size_bytes,
                 "sha256": sha256,
@@ -565,6 +568,7 @@ mod tests {
             (
                 AuditEvent::DownloadAttachment {
                     target_path: Some("/Web/GitHub".to_string()),
+                    target_uuid: "abcd".to_string(),
                     attachment_name: "key.pem".to_string(),
                     size_bytes: 2048,
                     sha256: "deadbeef".to_string(),
@@ -601,7 +605,7 @@ mod tests {
         r#"{"details":{"error_message":"disk full","failure_step":"rename","pending_changes":1},"event":"save_failed","level":"error","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_password","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"field_name":"RecoveryKey","sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_protected","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
-        r#"{"details":{"attachment_name":"key.pem","sha256":"deadbeef","size_bytes":2048,"target_path":"/Web/GitHub"},"event":"download_attachment","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"attachment_name":"key.pem","sha256":"deadbeef","size_bytes":2048,"target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"download_attachment","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"requested_time_unix":null,"target_path":"/Web/GitHub","target_uuid":"abcd","time_unix":1700000000},"event":"get_otp","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
     ];
 

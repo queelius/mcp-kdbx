@@ -810,7 +810,7 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 | `save_failed` | error | failure_step, error_message, pending_changes |
 | `reveal_password` | info | target_path, target_uuid, sha256 |
 | `reveal_protected` | info | target_path, target_uuid, field_name, sha256 |
-| `download_attachment` | info | target_path, attachment_name, size_bytes, sha256 |
+| `download_attachment` | info | target_path, target_uuid, attachment_name, size_bytes, sha256 |
 | `get_otp` | info | target_path, target_uuid (no code logged) |
 | `tool_call` | debug | tool, params (sensitive fields redacted), duration_ms, error_code |
 | `mcp_message` | trace | direction, full JSON-RPC payload |

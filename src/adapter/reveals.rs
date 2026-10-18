@@ -253,6 +253,7 @@ impl KdbxServer {
 
         self.emit(AuditEvent::DownloadAttachment {
             target_path,
+            target_uuid: entry.id().uuid().to_string(),
             attachment_name: params.name.clone(),
             size_bytes: size_bytes as u64,
             sha256: content_sha256.clone(),

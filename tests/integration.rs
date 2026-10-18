@@ -502,3 +502,36 @@ fn untitled_entry_never_aliases_a_same_named_entry() {
     let root_pw = server.call_ok("kdbx_reveal_password", json!({ "path": "/Email" }));
     assert_eq!(root_pw["password"], json!("root-email-secret"));
 }
+
+/// Every reveal-class audit event identifies its entry by UUID, because the
+/// path can be null (an untitled entry has no non-aliasing path). An
+/// attachment download that recorded only the path would be unattributable.
+#[test]
+fn download_attachment_audit_records_the_entry_uuid() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let vault = fixture_path("with_attachments.kdbx");
+
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", vault.to_str().unwrap()),
+        ("KDBX_LOG_FILE", log_path.to_str().unwrap()),
+    ]);
+    server.unlock_with_fixture_password();
+    let entry = server.call_ok("kdbx_get_entry", json!({ "path": "/Document A" }));
+    let uuid = entry["uuid"]
+        .as_str()
+        .expect("entry view has a uuid")
+        .to_owned();
+    server.call_ok(
+        "kdbx_download_attachment",
+        json!({ "entry_path": "/Document A", "name": "notes.txt" }),
+    );
+
+    let events = read_audit_lines(&log_path);
+    let download = events
+        .iter()
+        .find(|e| e["event"] == json!("download_attachment"))
+        .expect("download_attachment event present");
+    assert_eq!(download["details"]["target_uuid"], json!(uuid));
+    assert_eq!(download["details"]["target_path"], json!("/Document A"));
+}
