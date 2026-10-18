@@ -7,23 +7,25 @@
 //! here. Protected fields are reported by name with a `protected: true` flag;
 //! revealing a value is a separate, consent-gated tool.
 //!
-//! Protection is read from each field's stored flag, not assumed from its name.
-//! A standard field (UserName, URL, Notes) that the user marked protected is
-//! emitted as `null` under its own key and flagged `protected: true` in
-//! `standard_field_names`, exactly as a protected custom field is flagged in
-//! `custom_field_names`. Which values may be emitted is decided by
-//! [`metadata_value`], the rule search shares. Title is the one exception: it is
-//! the entry's address in a path, so it is shown even when protected.
+//! Which values may be emitted is decided by kdbx-core's one secret predicate,
+//! `kdbx_core::visibility::is_secret` (protected, or a Password; never the
+//! Title), the rule search and the stage diff share. A standard field
+//! (UserName, URL, Notes) that the user marked protected is emitted as `null`
+//! under its own key and flagged `protected: true` in `standard_field_names`,
+//! exactly as a protected custom field is flagged in `custom_field_names`.
+//! Title is the one exception: it is the entry's address in a path, so it is
+//! shown even when protected.
 //!
 //! Each builder takes the database and a record id and returns `None` when the
 //! id does not resolve, which the calling tool maps to `ENTRY_NOT_FOUND` or
 //! `GROUP_NOT_FOUND`.
 
 use crate::engine::view::View;
-use crate::engine::visibility::{STANDARD_FIELDS, is_standard_field, metadata_value};
 use chrono::NaiveDateTime;
+use kdbx_core::fields::StandardField;
+use kdbx_core::visibility::is_secret;
 use keepass::Database;
-use keepass::db::{EntryId, GroupId, fields};
+use keepass::db::{EntryId, GroupId};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::SystemTime;
@@ -35,7 +37,7 @@ const NOTES_PREVIEW_CHARS: usize = 200;
 /// `kdbx_find_entry` element shape). Metadata only.
 pub fn entry_summary(db: &Database, view: &View, entry_id: EntryId) -> Option<Value> {
     let entry = db.entry(entry_id)?;
-    let notes_preview = metadata_value(&entry, fields::NOTES).map(|n| {
+    let notes_preview = metadata_value(&entry, StandardField::Notes).map(|n| {
         let preview: String = n.chars().take(NOTES_PREVIEW_CHARS).collect();
         preview
     });
@@ -43,8 +45,8 @@ pub fn entry_summary(db: &Database, view: &View, entry_id: EntryId) -> Option<Va
         "title": entry.get_title().unwrap_or(""),
         "path": view.path_string(entry_id.uuid()),
         "uuid": entry.id().uuid().to_string(),
-        "username": metadata_value(&entry, fields::USERNAME),
-        "url": metadata_value(&entry, fields::URL),
+        "username": metadata_value(&entry, StandardField::UserName),
+        "url": metadata_value(&entry, StandardField::Url),
         "notes_preview": notes_preview,
         "standard_field_names": standard_field_names(&entry),
         "custom_field_names": custom_field_names(&entry),
@@ -63,9 +65,9 @@ pub fn entry_detail(db: &Database, view: &View, entry_id: EntryId) -> Option<Val
         "title": entry.get_title().unwrap_or(""),
         "path": view.path_string(entry_id.uuid()),
         "uuid": entry.id().uuid().to_string(),
-        "username": metadata_value(&entry, fields::USERNAME),
-        "url": metadata_value(&entry, fields::URL),
-        "notes": metadata_value(&entry, fields::NOTES),
+        "username": metadata_value(&entry, StandardField::UserName),
+        "url": metadata_value(&entry, StandardField::Url),
+        "notes": metadata_value(&entry, StandardField::Notes),
         "standard_field_names": standard_field_names(&entry),
         "custom_field_names": custom_field_names(&entry),
         "has_attachments": has_attachments(&entry),
@@ -115,9 +117,10 @@ pub fn attachment_list(db: &Database, entry_id: EntryId) -> Option<Value> {
 /// value is withheld here and must be read with a reveal tool
 /// (`kdbx_reveal_password` for Password, `kdbx_reveal_protected` otherwise).
 fn standard_field_names(entry: &keepass::db::EntryRef<'_>) -> Vec<Value> {
-    STANDARD_FIELDS
+    StandardField::ALL
         .iter()
-        .filter_map(|name| entry.fields.get(*name).map(|value| field_flag(name, value)))
+        .map(|f| f.kdbx_name())
+        .filter_map(|name| entry.fields.get(name).map(|value| field_flag(name, value)))
         .collect()
 }
 
@@ -126,12 +129,25 @@ fn custom_field_names(entry: &keepass::db::EntryRef<'_>) -> Vec<Value> {
     let mut fields: Vec<Value> = entry
         .fields
         .iter()
-        .filter(|(name, _)| !is_standard_field(name))
+        .filter(|(name, _)| StandardField::from_kdbx_name(name).is_none())
         .map(|(name, value)| field_flag(name, value))
         .collect();
     // Stable order so list output is deterministic across the HashMap iteration.
     fields.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     fields
+}
+
+/// The value of the standard field `field` when it may be exposed as
+/// metadata: present and not a secret per kdbx-core's
+/// `visibility::is_secret`. `None` for an absent field and for any secret,
+/// whose value is reachable only through a consent-gated reveal tool.
+fn metadata_value<'a>(
+    entry: &'a keepass::db::EntryRef<'_>,
+    field: StandardField,
+) -> Option<&'a str> {
+    let name = field.kdbx_name();
+    let value = entry.fields.get(name)?;
+    (!is_secret(name, value.is_protected())).then(|| value.get().as_str())
 }
 
 /// The `{name, protected}` record both field lists use.
@@ -389,6 +405,29 @@ mod tests {
                 "path still built from the title: {v}"
             );
             assert_eq!(standard_field(&v, "Title")["protected"], json!(true));
+        }
+    }
+
+    #[test]
+    fn an_unprotected_password_never_reaches_a_view() {
+        // kdbx-core's is_secret: the Password is a secret whatever its flag.
+        let mut db = Database::new();
+        let id = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| {
+                e.set_unprotected(fields::TITLE, "Open");
+                e.set_unprotected(fields::PASSWORD, "flag-off-secret");
+            })
+            .id();
+        let view = View::capture_ephemeral(&db);
+        for v in [
+            entry_summary(&db, &view, id).unwrap(),
+            entry_detail(&db, &view, id).unwrap(),
+        ] {
+            assert!(!v.to_string().contains("flag-off-secret"), "{v}");
+            // The field list reports the stored flag as metadata.
+            assert_eq!(standard_field(&v, "Password")["protected"], json!(false));
         }
     }
 

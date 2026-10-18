@@ -595,6 +595,40 @@ fn error_field_not_protected() {
 }
 
 #[test]
+fn an_unprotected_password_is_still_a_secret() {
+    // kdbx-core's one secret predicate: a Password is a secret whatever its
+    // protection flag. Turning the flag off must not move it into bulk reads,
+    // search, or the stage diff, and kdbx_reveal_protected treats it as a
+    // secret too.
+    let (_dir, mut server) = unlocked_writable("flat.kdbx");
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/Bank", "field_name": "Password", "value": "plain-pw-0x51", "protected": false }),
+    );
+    let bulk = [
+        server.call_ok("kdbx_list_entries", json!({ "group_path": "/" })),
+        server.call_ok("kdbx_get_entry", json!({ "path": "/Bank" })),
+        server.call_ok("kdbx_diff_pending", json!({})),
+    ];
+    for out in &bulk {
+        assert!(
+            !out.to_string().contains("plain-pw-0x51"),
+            "an unprotected Password leaked into a bulk read: {out}"
+        );
+    }
+    let found = server.call_ok(
+        "kdbx_find_entry",
+        json!({ "query": "plain-pw", "fields": ["title", "username", "url", "notes"] }),
+    );
+    assert_eq!(found["matched_count"], json!(0));
+    let revealed = server.call_ok(
+        "kdbx_reveal_protected",
+        json!({ "path": "/Bank", "field_name": "Password" }),
+    );
+    assert_eq!(revealed["value"], json!("plain-pw-0x51"));
+}
+
+#[test]
 fn error_attachment_not_found() {
     let mut server = unlocked("with_attachments.kdbx");
     assert_eq!(

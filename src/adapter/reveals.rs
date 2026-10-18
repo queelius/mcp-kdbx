@@ -18,6 +18,8 @@ use crate::adapter::{KdbxServer, canonical_entry_path, locate_entry, responses};
 use crate::engine::audit::{AuditEvent, hash_revealed};
 use crate::engine::error::{CoreError, ErrorCode};
 use base64::Engine;
+use kdbx_core::fields::StandardField;
+use kdbx_core::visibility::is_secret;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
 
@@ -121,7 +123,7 @@ impl KdbxServer {
 
         // Read the value into an owned String before emitting and returning, so
         // we do not hold a borrow into the db across the audit emit.
-        let password = match entry.get("Password") {
+        let password = match entry.get(StandardField::Password.kdbx_name()) {
             Some(v) => v.to_string(),
             None => {
                 return responses::err(
@@ -145,7 +147,7 @@ impl KdbxServer {
     /// refused with `FIELD_NOT_PROTECTED`; the agent should read it with a list
     /// or get tool instead. Consent-gated; logs a sha256 of the value.
     #[tool(
-        description = "Reveal the value of a named protected field on an entry. Refuses non-protected fields with FIELD_NOT_PROTECTED (read those with a list or get tool instead). Records an audit event with a sha256 of the value, never the value. Requires an unlocked vault."
+        description = "Reveal the value of a named secret field on an entry (a protected field, or the Password). Refuses fields that are not secret with FIELD_NOT_PROTECTED (read those with a list or get tool instead). Records an audit event with a sha256 of the value, never the value. Requires an unlocked vault."
     )]
     async fn kdbx_reveal_protected(
         &self,
@@ -184,7 +186,11 @@ impl KdbxServer {
                 );
             }
         };
-        if !field.is_protected() {
+        // One secret predicate (kdbx-core): a field is revealable exactly when
+        // the bulk reads withhold it, so a Password whose protection flag is
+        // off is still a secret, and a protected Title (shown as the address)
+        // is not.
+        if !is_secret(&params.field_name, field.is_protected()) {
             return responses::err(
                 &CoreError::new(ErrorCode::FieldNotProtected)
                     .with_details(serde_json::json!({ "field_name": params.field_name })),

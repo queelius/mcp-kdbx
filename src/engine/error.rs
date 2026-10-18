@@ -92,7 +92,7 @@ impl ErrorCode {
             ErrorCode::EntryNotFound => "No entry resolves at that path.",
             ErrorCode::FieldNotFound => "The entry has no field by that name.",
             ErrorCode::FieldNotProtected => {
-                "That field is not protected; read it with a list or get tool instead of a reveal."
+                "That field is not a secret (not protected, and not the Password); read it with a list or get tool instead of a reveal."
             }
             ErrorCode::AttachmentNotFound => "The entry has no attachment by that name.",
             ErrorCode::NoOtpConfigured => "The entry has no TOTP configuration.",

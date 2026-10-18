@@ -35,9 +35,11 @@ use crate::engine::vault_file::{
 };
 use crate::engine::view::{View, ephemeral_key};
 use diff_kdbx::{Change, DiffOptions, NodeStatus, Property, PropertyChange, Shown};
+use kdbx_core::fields::StandardField;
 use kdbx_core::model::Value as SnapValue;
+use kdbx_core::visibility::is_address;
 use keepass::Database;
-use keepass::db::{EntryId, Value, fields};
+use keepass::db::{EntryId, Value};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -275,7 +277,7 @@ fn validate_field_name(name: &str) -> CoreResult<()> {
 /// write passes, so no path can store a title that `validate_title` refuses.
 fn validate_field_write(name: &str, value: &str) -> CoreResult<()> {
     validate_field_name(name)?;
-    if name == fields::TITLE {
+    if is_address(name) {
         validate_title(value)?;
     }
     Ok(())
@@ -305,7 +307,7 @@ pub fn add_entry(
     for f in &input.fields {
         // The title parameter is the one way to set Title on a new entry; a
         // Title key in the fields map would silently override it.
-        if f.name == fields::TITLE {
+        if is_address(&f.name) {
             return Err(CoreError::new(ErrorCode::FieldNameInvalid)
                 .with_message("set the title with the title parameter, not in fields")
                 .with_details(serde_json::json!({ "name": f.name })));
@@ -338,7 +340,7 @@ pub fn add_entry(
     let new_id = group_mut
         .add_entry()
         .edit(|e| {
-            e.set_unprotected(fields::TITLE, title);
+            e.set_unprotected(StandardField::Title.kdbx_name(), title);
             for (name, value, protected) in field_specs {
                 let v = if protected {
                     Value::protected(value)
@@ -809,6 +811,7 @@ mod tests {
     use super::*;
     use crate::engine::vault::Vault;
     use kdbx_core::path::VaultPath;
+    use keepass::db::fields;
     use keepass::{Database, DatabaseKey};
     use std::io::Write;
     use std::path::PathBuf;

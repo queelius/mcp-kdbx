@@ -22,8 +22,9 @@
 //! - `stage`: working-copy write operations, the diff-kdbx stage diff, and the
 //!   atomic save (Phase 2).
 //! - `orphan`: startup cleanup of leftover `*.tmp.*` save files (Phase 2).
-//! - `visibility`: the one rule for which field values may cross out as
-//!   metadata (unprotected, or the Title address), shared by views and search.
+//! - Visibility and the field schema are kdbx-core's (`kdbx_core::visibility`,
+//!   `kdbx_core::fields`): one secret predicate shared with every ecosystem
+//!   member.
 
 pub mod address;
 pub mod audit;
@@ -38,4 +39,3 @@ pub mod unlock;
 pub mod vault;
 pub mod vault_file;
 pub mod view;
-pub mod visibility;
