@@ -275,6 +275,38 @@ fn manual_lock_discards_stage_and_first_locked_call_reports_it() {
 }
 
 #[test]
+fn unlock_and_status_report_what_the_last_lock_discarded() {
+    let (_dir, _path, mut server) = writable("flat.kdbx", &[]);
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/GitHub", "field_name": "URL", "value": "https://dropped.example" }),
+    );
+    server.call_ok("kdbx_lock", json!({}));
+
+    // Status reports the discard and does not consume it.
+    for _ in 0..2 {
+        let status = server.call_ok("kdbx_status", json!({}));
+        assert_eq!(status["last_lock"]["lock_reason"], json!("manual"));
+        assert_eq!(status["last_lock"]["pending_discarded_count"], json!(1));
+        assert_eq!(
+            status["last_lock"]["pending_discarded_summary"],
+            json!(["/GitHub"])
+        );
+    }
+
+    // An agent whose first real call is the unlock still learns of it.
+    let unlocked = server.call_ok("kdbx_unlock", json!({ "password": FIXTURE_PASSWORD }));
+    assert_eq!(
+        unlocked["previous_lock"]["pending_discarded_count"],
+        json!(1)
+    );
+
+    // Reported once: afterwards it is gone.
+    let status = server.call_ok("kdbx_status", json!({}));
+    assert_eq!(status["last_lock"], Value::Null);
+}
+
+#[test]
 fn external_modification_refuses_save_with_conflict() {
     let (_dir, path, mut server) = writable("flat.kdbx", &[]);
 

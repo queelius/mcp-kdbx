@@ -1271,3 +1271,11 @@ integration tests assert them.
   output is decoded as strict UTF-8: non-UTF-8 output is `AUTH_FAILED` with
   `details.reason: "unlock_cmd_output_not_utf8"` (a lossy decode used to
   substitute U+FFFD and try a password the command never printed).
+- **A lock's discard summary is never lost.** Section 2 attaches the summary
+  to the first `VAULT_LOCKED` after a lock, but an agent's first call after an
+  idle lock is often `kdbx_unlock`, which used to clear it silently. Now
+  `kdbx_unlock`'s output gains `previous_lock` (the summary, consumed, or
+  `null`), and `kdbx_status` gains `last_lock` (the same object, peeked and
+  not consumed; `null` once reported). All three reports share one shape:
+  `{ lock_reason, pending_discarded_count, pending_discarded_summary }`. A
+  failed unlock leaves the summary in place.

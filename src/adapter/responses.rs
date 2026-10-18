@@ -31,12 +31,8 @@ use serde_json::json;
 /// single place that shape is built, so every tool reports it the same way.
 pub fn locked_error(last_lock: Option<LockInfo>) -> CoreError {
     let base = CoreError::new(ErrorCode::VaultLocked);
-    match last_lock {
-        Some(info) => base.with_details(json!({
-            "lock_reason": info.reason,
-            "pending_discarded_count": info.pending_discarded_count,
-            "pending_discarded_summary": info.summary,
-        })),
+    match last_lock.and_then(|info| serde_json::to_value(info).ok()) {
+        Some(details) => base.with_details(details),
         None => base,
     }
 }

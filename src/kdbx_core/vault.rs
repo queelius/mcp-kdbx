@@ -62,15 +62,21 @@ impl LockReason {
 /// string; `pending_discarded_count` is the number of added plus modified
 /// entries that were dropped; `summary` labels them (vault path, or UUID for a
 /// record with no addressable path, see `DiffPending::entry_labels`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// It serializes to the wire shape every report uses (the `VAULT_LOCKED`
+/// details, `kdbx_status.last_lock`, `kdbx_unlock.previous_lock`):
+/// `{ lock_reason, pending_discarded_count, pending_discarded_summary }`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LockInfo {
     /// The lock reason as a stable label: `"manual"`, `"idle_timeout"`, or
     /// `"shutdown"`.
+    #[serde(rename = "lock_reason")]
     pub reason: String,
     /// How many staged entries (added plus modified) the lock discarded.
     pub pending_discarded_count: usize,
     /// The discarded added and modified entries: each one's vault path, or its
     /// UUID when it has no addressable path.
+    #[serde(rename = "pending_discarded_summary")]
     pub summary: Vec<String>,
 }
 
@@ -120,8 +126,8 @@ pub struct Vault {
     /// The current lock state.
     state: VaultState,
     /// What the most recent lock discarded, if any, and not yet reported. Set
-    /// by [`lock`](Self::lock) when there was staged work, cleared by a
-    /// successful [`unlock`](Self::unlock) and by [`take_last_lock`](Self::take_last_lock).
+    /// by [`lock`](Self::lock), handed back (and cleared) by a successful
+    /// [`unlock`](Self::unlock) and by [`take_last_lock`](Self::take_last_lock).
     last_lock: Option<LockInfo>,
 }
 
@@ -153,11 +159,21 @@ impl Vault {
     ///
     /// Calling this while already unlocked is [`ErrorCode::VaultAlreadyUnlocked`].
     ///
+    /// On success, returns what the most recent lock discarded, if it was not
+    /// yet reported, and consumes it: `kdbx_unlock` reports it in its
+    /// response, so an agent whose first call after an idle lock is the unlock
+    /// still learns its staged changes were dropped. A failed unlock leaves it
+    /// in place.
+    ///
     /// This method only resolves a key from the `password` (and `keyfile`)
     /// arguments it is given. Resolving the password from env vars or a
     /// shell-out command is the unlock module's job (Task 7); it calls this with
     /// the resolved password.
-    pub fn unlock(&mut self, password: &str, keyfile: Option<&[u8]>) -> CoreResult<()> {
+    pub fn unlock(
+        &mut self,
+        password: &str,
+        keyfile: Option<&[u8]>,
+    ) -> CoreResult<Option<LockInfo>> {
         if self.is_unlocked() {
             return Err(ErrorCode::VaultAlreadyUnlocked.into());
         }
@@ -194,12 +210,10 @@ impl Vault {
             file_baseline,
         };
 
-        // A fresh session has no prior discard to report. Clear any LockInfo
-        // left over from an earlier lock so the next VAULT_LOCKED (if it ever
-        // comes) reflects this session, not a stale one.
-        self.last_lock = None;
-
-        Ok(())
+        // Hand back the prior lock's discard summary (consuming it): the caller
+        // reports it, and the next VAULT_LOCKED, if any, then reflects this
+        // session rather than a stale one.
+        Ok(self.last_lock.take())
     }
 
     /// Move from `Unlocked` back to `Locked`, returning the count of pending
@@ -268,6 +282,13 @@ impl Vault {
     /// (no lock since the last unlock, or it was already taken).
     pub fn take_last_lock(&mut self) -> Option<LockInfo> {
         self.last_lock.take()
+    }
+
+    /// Peek at the most recent lock's discard summary without consuming it.
+    /// `kdbx_status` reports it this way, so asking for status never hides
+    /// the summary from the next `VAULT_LOCKED` or unlock.
+    pub fn last_lock(&self) -> Option<&LockInfo> {
+        self.last_lock.as_ref()
     }
 
     /// True when the vault is unlocked.
@@ -824,17 +845,47 @@ mod tests {
     }
 
     #[test]
-    fn unlock_clears_prior_last_lock() {
+    fn unlock_hands_back_the_prior_lock_info_once() {
+        // An agent whose first call after an idle lock is kdbx_unlock must
+        // still learn what the lock discarded: unlock returns it (and consumes
+        // it, since the caller now reports it).
         let (_tmp, path) = write_fixture();
         let mut vault = Vault::new(path);
-        vault.unlock(TEST_PASSWORD, None).expect("first unlock");
+        assert_eq!(
+            vault.unlock(TEST_PASSWORD, None).expect("first unlock"),
+            None
+        );
+        stage_one_change(&mut vault);
+        vault.lock(LockReason::IdleTimeout);
+
+        // Peeking (what kdbx_status does) does not consume it.
+        assert_eq!(
+            vault.last_lock().map(|l| l.pending_discarded_count),
+            Some(1)
+        );
+        assert_eq!(
+            vault.last_lock().map(|l| l.pending_discarded_count),
+            Some(1)
+        );
+
+        let prior = vault
+            .unlock(TEST_PASSWORD, None)
+            .expect("second unlock")
+            .expect("the discard is reported");
+        assert_eq!(prior.reason, "idle_timeout");
+        assert_eq!(prior.pending_discarded_count, 1);
+        assert!(vault.last_lock().is_none(), "consumed by the unlock");
+    }
+
+    #[test]
+    fn failed_unlock_keeps_the_prior_lock_info() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
         stage_one_change(&mut vault);
         vault.lock(LockReason::Manual);
-
-        // A fresh unlock clears the stashed discard: a new session has nothing
-        // prior to report.
-        vault.unlock(TEST_PASSWORD, None).expect("second unlock");
-        assert!(vault.take_last_lock().is_none());
+        vault.unlock("wrong", None).expect_err("wrong password");
+        assert!(vault.last_lock().is_some(), "still there to report");
     }
 
     #[test]

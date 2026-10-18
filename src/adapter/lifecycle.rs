@@ -37,7 +37,7 @@ impl KdbxServer {
     /// Lifecycle: report vault and server status. Available locked or not, and
     /// it counts as activity, so it doubles as an idle-timer keep-alive.
     #[tool(
-        description = "Report vault and server status: locked state, vault name and path, idle-timeout remaining, pending changes, whether writes are allowed, and version info."
+        description = "Report vault and server status: locked state, vault name and path, idle-timeout remaining, pending changes, whether writes are allowed, last_lock (what the most recent lock discarded, until reported), and version info."
     )]
     async fn kdbx_status(&self) -> String {
         let vault = self.vault().await;
@@ -72,6 +72,9 @@ impl KdbxServer {
             "idle_timeout_remaining_seconds": idle_remaining,
             "has_pending_changes": has_pending,
             "writes_allowed": self.config.allow_writes,
+            // What the most recent lock discarded, until an unlock or a
+            // VAULT_LOCKED error reports it. Peeked, not consumed.
+            "last_lock": vault.last_lock(),
             "server_version": env!("CARGO_PKG_VERSION"),
             "keepass_rs_version": KEEPASS_RS_VERSION,
         }))
@@ -135,7 +138,7 @@ impl KdbxServer {
         // worker (see kdbx_save_pending for the same pattern).
         let unlocked = tokio::task::block_in_place(|| vault.unlock(&password, keyfile.as_deref()));
         match unlocked {
-            Ok(()) => {
+            Ok(previous_lock) => {
                 let file_mtime = vault
                     .mtime_at_unlock()
                     .ok()
@@ -149,10 +152,13 @@ impl KdbxServer {
                     .working_db()
                     .ok()
                     .and_then(|db| db.meta.database_name.clone());
+                // previous_lock: what the lock before this unlock discarded,
+                // when no earlier call reported it (null otherwise).
                 responses::ok(serde_json::json!({
                     "vault_name": vault_name,
                     "locked": false,
                     "has_pending_changes": false,
+                    "previous_lock": previous_lock,
                 }))
             }
             Err(e) => {
