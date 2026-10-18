@@ -23,8 +23,9 @@ use std::time::{Duration, Instant};
 /// supplied, never the value.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UnlockParams {
-    /// The master password. When omitted, the server resolves it from
-    /// `KDBX_PASSWORD` or `KDBX_UNLOCK_CMD`.
+    /// The master password, for scripted use only. Omit it: the server
+    /// resolves the password from `KDBX_PASSWORD` or `KDBX_UNLOCK_CMD`. Never
+    /// ask a user to paste the master password into a conversation.
     #[serde(default)]
     pub password: Option<Secret<String>>,
     /// An optional keyfile for two-factor unlock, base64-encoded.
@@ -83,7 +84,7 @@ impl KdbxServer {
     /// Lifecycle: unlock the vault. Resolves the password from the tool input,
     /// `KDBX_PASSWORD`, or `KDBX_UNLOCK_CMD`, in that order.
     #[tool(
-        description = "Unlock the vault so its contents can be read. Provide the master password, or rely on the server's configured password source. An optional base64 keyfile is accepted for two-factor unlock."
+        description = "Unlock the vault so its contents can be read. Call it with no arguments: the server reads the master password from its configured source (KDBX_PASSWORD or KDBX_UNLOCK_CMD, for example a password manager command). Do not ask the user to type the master password into the chat; if no source is configured the call returns UNLOCK_SOURCE_MISSING, and the user should configure one. The password and keyfile_bytes arguments exist for scripted use. If a previous lock discarded staged changes, previous_lock reports them."
     )]
     async fn kdbx_unlock(&self, Parameters(params): Parameters<UnlockParams>) -> String {
         let mut vault = self.vault().await;

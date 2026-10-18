@@ -154,6 +154,25 @@ impl KdbxServer {
     }
 }
 
+/// The server instructions sent at initialize: what the server is, the path
+/// grammar every path parameter uses, and how to unlock without putting the
+/// master password in the conversation. The grammar lives here once rather than
+/// in every tool description.
+const SERVER_INSTRUCTIONS: &str = "mcp-kdbx exposes a single KeePass KDBX vault. \
+Read groups and entries and find by title, username, or url with the list and find tools; \
+protected fields and attachments require a separate consent-gated reveal. Writes (when \
+enabled) are staged in memory and committed atomically with kdbx_save_pending.\n\n\
+Paths: every path has a leading '/' (the root group is '/'), and '/' separates group names \
+from the entry title, as in /Web/Banking/MyBank. Inside a name, write a literal '/' as \\/, \
+a literal backslash as \\\\, and a literal ':' before digits as \\:. When siblings share a \
+name, ':N' picks the Nth (1-based), as in /Web/MyBank:2. A trailing '/' names a group, never \
+an entry. Copy paths verbatim from tool output; ordinals can shift between sessions, so \
+for a stable reference pass an entry's uuid (every read returns it) instead of its path. \
+An entry whose path is null has no addressable path: use its uuid.\n\n\
+Unlocking: call kdbx_unlock with no arguments; the server reads the master password from \
+its configured KDBX_PASSWORD or KDBX_UNLOCK_CMD. Do not ask the user to type the master \
+password into the chat.";
+
 /// Locate the entry an entry-targeting tool names, by vault path or by UUID
 /// (exactly one; see [`EntryAddress::from_parts`]). `path_param` is the tool's
 /// path parameter name (`path` or `entry_path`), echoed in the error message.
@@ -225,12 +244,7 @@ fn verbosity(level: &str) -> u8 {
 impl ServerHandler for KdbxServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "mcp-kdbx exposes a single KeePass KDBX vault. Read groups and entries and find \
-                 by title or url with the list and find tools; protected fields and attachments \
-                 require a separate consent-gated reveal. Writes (when enabled) are staged in \
-                 memory and committed atomically with kdbx_save_pending.",
-            );
+            .with_instructions(SERVER_INSTRUCTIONS);
         // Report mcp-kdbx as the server, not rmcp's default implementation name.
         // Implementation::from_build_env expands env!("CARGO_CRATE_NAME") inside
         // the rmcp crate, so it would report "rmcp" and rmcp's version, not ours.

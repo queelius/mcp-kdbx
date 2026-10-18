@@ -1313,3 +1313,12 @@ integration tests assert them.
   through to the next. Base32 secrets are normalized before decoding
   (whitespace removed, uppercased, `=` padding dropped), so lowercase, grouped,
   or padded secrets now work.
+- **Agent guidance.** The server instructions (sent at initialize) now state
+  the path grammar once: leading `/`, `\/` and `\\` escapes, `\:` before
+  digits, `:N` ordinals, a trailing `/` naming a group, and uuid addressing
+  for stable references or null paths. The `PATH_INVALID` message repeats the
+  grammar for hosts that do not surface instructions. `kdbx_unlock`'s
+  description no longer invites the agent to collect the master password: it
+  says to call the tool with no arguments (the server reads `KDBX_PASSWORD` or
+  `KDBX_UNLOCK_CMD`) and not to ask the user to type the password into the
+  chat; the `password` argument is documented as for scripted use.

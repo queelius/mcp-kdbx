@@ -210,6 +210,35 @@ fn server_identifies_as_mcp_kdbx() {
     );
 }
 
+#[test]
+fn instructions_teach_the_path_grammar_and_unlock_avoids_chat_passwords() {
+    let path = fixture_path("empty.kdbx");
+    let result = McpServer::initialize_result(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    let instructions = result["instructions"].as_str().unwrap();
+    for needle in ["leading '/'", "\\/", ":N", "uuid"] {
+        assert!(
+            instructions.contains(needle),
+            "instructions should explain {needle}: {instructions}"
+        );
+    }
+
+    let mut server = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    let tools = server.list_tools();
+    let unlock = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == json!("kdbx_unlock"))
+        .unwrap()
+        .clone();
+    let description = unlock["description"].as_str().unwrap();
+    assert!(description.contains("KDBX_PASSWORD") && description.contains("KDBX_UNLOCK_CMD"));
+    assert!(
+        description.contains("Do not ask the user"),
+        "kdbx_unlock must steer agents away from asking for the password in chat: {description}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. Happy-path envelope shapes (every tool)
 // ---------------------------------------------------------------------------
