@@ -210,6 +210,8 @@ fn protected_standard_fields_are_hidden_from_reads_and_search_but_revealable() {
 #[test]
 fn stage_save_reopen_persists_changes() {
     let (_dir, path, mut server) = writable("flat.kdbx", &[]);
+    let modified_before =
+        server.call_ok("kdbx_get_entry", json!({ "path": "/GitHub" }))["modified_at"].clone();
 
     // Stage a field change and a brand-new entry, then commit.
     server.call_ok(
@@ -231,6 +233,8 @@ fn stage_save_reopen_persists_changes() {
 
     let github = reopened.call_ok("kdbx_get_entry", json!({ "path": "/GitHub" }));
     assert_eq!(github["url"], json!("https://changed.example"));
+    // The edit bumped the entry's modification time (tracked edit).
+    assert_ne!(github["modified_at"], modified_before);
 
     let persisted = reopened.call_ok("kdbx_get_entry", json!({ "path": "/Persisted" }));
     assert_eq!(persisted["title"], json!("Persisted"));

@@ -239,6 +239,11 @@ fn validate_field_name(name: &str) -> CoreResult<()> {
 /// the title and every field name, then creates the entry: sets Title, then
 /// each field (protected or not), then links each attachment under its name.
 /// Returns the new entry's id.
+///
+/// keepass stamps a new entry's creation, modification, and access times with
+/// the current time. The entry is built with a plain `edit`, not
+/// `edit_tracking`: a history snapshot of the blank, just-created entry would
+/// be noise.
 pub fn add_entry(
     working: &mut Database,
     group_path: &VaultPath,
@@ -301,6 +306,10 @@ pub fn add_entry(
 /// `protected = None` preserves an existing field's protection state (and
 /// defaults to unprotected for a new field); `Some(b)` forces it. An empty
 /// value is allowed and clears the field (the Password-regenerate workflow).
+///
+/// A real change snapshots the previous entry state into the entry's history
+/// and updates its modification time (KeePass edit semantics). Setting a field
+/// to the value and protection it already has is a no-op.
 /// Propagates `ENTRY_NOT_FOUND` when the target does not resolve to an entry,
 /// and validates the field name.
 pub fn update_field(
@@ -317,31 +326,37 @@ pub fn update_field(
     // Decide the protection state before taking the mutable borrow: when the
     // caller did not force it, read the current field's state (false when the
     // field is new).
+    let current = working
+        .entry(entry_id)
+        .and_then(|er| er.fields.get(field_name).cloned());
     let resolved_protected = match protected {
         Some(b) => b,
-        None => working
-            .entry(entry_id)
-            .and_then(|er| er.fields.get(field_name).map(|v| v.is_protected()))
-            .unwrap_or(false),
+        None => current.as_ref().map(|v| v.is_protected()).unwrap_or(false),
+    };
+    let new_value = if resolved_protected {
+        Value::protected(value.to_string())
+    } else {
+        Value::unprotected(value.to_string())
     };
 
-    let name = field_name.to_string();
-    let value_owned = value.to_string();
+    // Setting a field to exactly what it already holds changes nothing: skip
+    // it, so it neither snapshots history nor makes the stage dirty.
+    if current.as_ref() == Some(&new_value) {
+        return Ok(entry_id);
+    }
 
+    let name = field_name.to_string();
     let mut entry_mut = working.entry_mut(entry_id).ok_or_else(|| {
         CoreError::new(ErrorCode::EntryNotFound)
             .with_message("entry disappeared between resolve and write")
             .with_details(serde_json::json!({ "uuid": entry_id.uuid().to_string() }))
     })?;
 
-    entry_mut.edit(|e| {
-        let v = if resolved_protected {
-            Value::protected(value_owned)
-        } else {
-            Value::unprotected(value_owned)
-        };
-        e.set(name, v);
-    });
+    // edit_tracking snapshots the pre-edit entry into its history when the
+    // tracker drops, and EntryTrack::set bumps LastModificationTime, matching
+    // what KeePass and KeePassXC do on an edit. (Plain `edit` did neither, so
+    // the old value was lost from history on save.)
+    entry_mut.edit_tracking(|e| e.set(name, new_value));
 
     Ok(entry_id)
 }
@@ -946,6 +961,78 @@ mod tests {
         update_field(&mut db, &addr("/Existing"), "URL", "", None).expect("clear");
         let id = path("/Existing").resolve_entry(&db).expect("resolve");
         assert_eq!(db.entry(id).unwrap().get("URL"), Some(""));
+    }
+
+    /// Backdate every timestamp of the entry at `p` so a modification made
+    /// now is visible at KDBX's one-second precision.
+    fn backdate(db: &mut Database, p: &str) {
+        let id = path(p).resolve_entry(db).unwrap();
+        let old = chrono::DateTime::from_timestamp(1_600_000_000, 0)
+            .unwrap()
+            .naive_utc();
+        let mut e = db.entry_mut(id).unwrap();
+        e.times.creation = Some(old);
+        e.times.last_modification = Some(old);
+    }
+
+    #[test]
+    fn update_field_snapshots_history_and_bumps_modification_time() {
+        let mut db = build_db();
+        backdate(&mut db, "/Existing");
+        let id = path("/Existing").resolve_entry(&db).unwrap();
+        let (created, modified) = {
+            let e = db.entry(id).unwrap();
+            assert!(e.history.is_none() || e.history.as_ref().unwrap().get_entries().is_empty());
+            (e.times.creation, e.times.last_modification)
+        };
+
+        update_field(&mut db, &addr("/Existing"), "Password", "new-secret", None).unwrap();
+
+        let e = db.entry(id).unwrap();
+        let history = e.history.as_ref().expect("history recorded");
+        assert_eq!(history.get_entries().len(), 1, "one snapshot per edit");
+        // The snapshot holds the pre-edit value, as KeePass does.
+        assert_eq!(
+            history.get_entries()[0].get(fields::PASSWORD),
+            Some("old-secret")
+        );
+        assert!(
+            e.times.last_modification > modified,
+            "modification time bumped"
+        );
+        assert_eq!(e.times.creation, created, "creation time untouched");
+    }
+
+    #[test]
+    fn update_field_with_identical_value_is_a_no_op() {
+        // Re-setting the same value and protection must not grow history or
+        // make the stage dirty.
+        let canonical = build_db();
+        let mut working = canonical.clone();
+        update_field(
+            &mut working,
+            &addr("/Existing"),
+            "URL",
+            "https://old.example.com",
+            None,
+        )
+        .unwrap();
+        assert_eq!(working, canonical);
+    }
+
+    #[test]
+    fn add_entry_sets_creation_and_modification_times_without_history() {
+        let mut db = build_db();
+        let id = add_entry(&mut db, &path("/"), &simple_input("Timed")).unwrap();
+        let e = db.entry(id).unwrap();
+        assert!(e.times.creation.is_some());
+        assert!(e.times.last_modification.is_some());
+        assert!(
+            e.history
+                .as_ref()
+                .is_none_or(|h| h.get_entries().is_empty()),
+            "a brand-new entry has no history snapshot of its blank state"
+        );
     }
 
     #[test]

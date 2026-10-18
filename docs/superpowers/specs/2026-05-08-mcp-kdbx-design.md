@@ -1216,3 +1216,12 @@ integration tests assert them.
   - The unlock KDF and the save run under `tokio::task::block_in_place`, so
     they no longer stall the async worker the idle timer shares.
   - MSRV is now 1.89 (`File::try_lock`); no new dependency.
+- **`kdbx_update_field` keeps KeePass edit semantics.** A real change now
+  snapshots the pre-edit entry into the entry's history and updates its
+  `LastModificationTime` (keepass `edit_tracking`), as KeePass and KeePassXC
+  do; before, the old value vanished from history on save and `modified_at`
+  never moved. Setting a field to the value and protection it already holds is
+  a no-op (no history snapshot, no pending change). History is not surfaced by
+  any tool, and the stage diff ignores history growth. `kdbx_add_entry` keeps
+  a plain edit: keepass stamps the new entry's creation and modification
+  times, and a snapshot of the blank entry would be noise.
