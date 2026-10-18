@@ -17,6 +17,8 @@
 //! - `stage`: working-copy write operations, the diff-kdbx stage diff, and the
 //!   atomic save (Phase 2).
 //! - `orphan`: startup cleanup of leftover `*.tmp.*` save files (Phase 2).
+//! - `visibility`: the one rule for which field values may cross out as
+//!   metadata (unprotected, or the Title address), shared by views and search.
 
 pub mod audit;
 pub mod config;
@@ -28,3 +30,4 @@ pub mod stage;
 pub mod totp;
 pub mod unlock;
 pub mod vault;
+pub mod visibility;

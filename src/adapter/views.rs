@@ -7,22 +7,26 @@
 //! here. Protected fields are reported by name with a `protected: true` flag;
 //! revealing a value is a separate, consent-gated tool.
 //!
+//! Protection is read from each field's stored flag, not assumed from its name.
+//! A standard field (UserName, URL, Notes) that the user marked protected is
+//! emitted as `null` under its own key and flagged `protected: true` in
+//! `standard_field_names`, exactly as a protected custom field is flagged in
+//! `custom_field_names`. Which values may be emitted is decided by
+//! [`metadata_value`], the rule search shares. Title is the one exception: it is
+//! the entry's address in a path, so it is shown even when protected.
+//!
 //! Each builder takes the database and a record id and returns `None` when the
 //! id does not resolve, which the calling tool maps to `ENTRY_NOT_FOUND` or
 //! `GROUP_NOT_FOUND`.
 
 use crate::kdbx_core::path::{vault_path_to_entry, vault_path_to_group};
+use crate::kdbx_core::visibility::{STANDARD_FIELDS, is_standard_field, metadata_value};
 use chrono::NaiveDateTime;
 use keepass::Database;
-use keepass::db::{EntryId, GroupId};
+use keepass::db::{EntryId, GroupId, fields};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::SystemTime;
-
-/// The KDBX-canonical field names. These are surfaced through their own keys
-/// (username, url, notes) or are implicitly protected (password) and a title;
-/// everything else is a custom field listed in `custom_field_names`.
-const STANDARD_FIELDS: &[&str] = &["Title", "UserName", "Password", "URL", "Notes"];
 
 /// The longer of an entry's notes shown in a list view (spec: first 200 chars).
 const NOTES_PREVIEW_CHARS: usize = 200;
@@ -31,8 +35,7 @@ const NOTES_PREVIEW_CHARS: usize = 200;
 /// `kdbx_find_entry` element shape). Metadata only.
 pub fn entry_summary(db: &Database, entry_id: EntryId) -> Option<Value> {
     let entry = db.entry(entry_id)?;
-    let notes = entry.get("Notes");
-    let notes_preview = notes.map(|n| {
+    let notes_preview = metadata_value(&entry, fields::NOTES).map(|n| {
         let preview: String = n.chars().take(NOTES_PREVIEW_CHARS).collect();
         preview
     });
@@ -40,9 +43,10 @@ pub fn entry_summary(db: &Database, entry_id: EntryId) -> Option<Value> {
         "title": entry.get_title().unwrap_or(""),
         "path": entry_path(db, entry_id),
         "uuid": entry.id().uuid().to_string(),
-        "username": entry.get("UserName"),
-        "url": entry.get("URL"),
+        "username": metadata_value(&entry, fields::USERNAME),
+        "url": metadata_value(&entry, fields::URL),
         "notes_preview": notes_preview,
+        "standard_field_names": standard_field_names(&entry),
         "custom_field_names": custom_field_names(&entry),
         "has_attachments": has_attachments(&entry),
         "has_otp": has_otp(&entry),
@@ -59,9 +63,10 @@ pub fn entry_detail(db: &Database, entry_id: EntryId) -> Option<Value> {
         "title": entry.get_title().unwrap_or(""),
         "path": entry_path(db, entry_id),
         "uuid": entry.id().uuid().to_string(),
-        "username": entry.get("UserName"),
-        "url": entry.get("URL"),
-        "notes": entry.get("Notes"),
+        "username": metadata_value(&entry, fields::USERNAME),
+        "url": metadata_value(&entry, fields::URL),
+        "notes": metadata_value(&entry, fields::NOTES),
+        "standard_field_names": standard_field_names(&entry),
         "custom_field_names": custom_field_names(&entry),
         "has_attachments": has_attachments(&entry),
         "has_otp": has_otp(&entry),
@@ -103,17 +108,35 @@ pub fn attachment_list(db: &Database, entry_id: EntryId) -> Option<Value> {
     Some(json!({ "attachments": attachments }))
 }
 
+/// The standard fields present on an entry, each with its protected flag, in
+/// canonical order (Title, UserName, Password, URL, Notes). The same
+/// `{name, protected}` shape as [`custom_field_names`]: together the two lists
+/// inventory every field, and a `protected: true` record tells the agent the
+/// value is withheld here and must be read with a reveal tool
+/// (`kdbx_reveal_password` for Password, `kdbx_reveal_protected` otherwise).
+fn standard_field_names(entry: &keepass::db::EntryRef<'_>) -> Vec<Value> {
+    STANDARD_FIELDS
+        .iter()
+        .filter_map(|name| entry.fields.get(*name).map(|value| field_flag(name, value)))
+        .collect()
+}
+
 /// The custom (non-standard) fields of an entry, each with its protected flag.
 fn custom_field_names(entry: &keepass::db::EntryRef<'_>) -> Vec<Value> {
     let mut fields: Vec<Value> = entry
         .fields
         .iter()
-        .filter(|(name, _)| !STANDARD_FIELDS.contains(&name.as_str()))
-        .map(|(name, value)| json!({ "name": name.clone(), "protected": value.is_protected() }))
+        .filter(|(name, _)| !is_standard_field(name))
+        .map(|(name, value)| field_flag(name, value))
         .collect();
     // Stable order so list output is deterministic across the HashMap iteration.
     fields.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     fields
+}
+
+/// The `{name, protected}` record both field lists use.
+fn field_flag(name: &str, value: &keepass::db::Value<String>) -> Value {
+    json!({ "name": name, "protected": value.is_protected() })
 }
 
 /// Whether the entry references any attachment.
@@ -234,6 +257,155 @@ mod tests {
         assert!(v.get("modified_at").is_some());
         assert!(v.get("accessed_at").is_some());
         assert!(!v.to_string().contains("hunter2"));
+    }
+
+    /// Build a database with one entry whose UserName, URL, and Notes are all
+    /// marked protected (KeePassXC's per-attribute "Protect" toggle, or KeePass
+    /// 2's "protect in memory" option), plus a protected Password.
+    fn db_with_protected_standard_fields() -> (Database, EntryId) {
+        let mut db = Database::new();
+        let entry_id = {
+            let mut root = db.root_mut();
+            let mut e = root.add_entry();
+            let id = e.id();
+            e.edit(|e| {
+                e.set_unprotected(fields::TITLE, "Covert");
+                e.set_protected(fields::USERNAME, "secret-user");
+                e.set_protected(fields::URL, "https://secret.example");
+                e.set_protected(fields::NOTES, "secret notes body");
+                e.set_protected(fields::PASSWORD, "hunter2");
+            });
+            id
+        };
+        (db, entry_id)
+    }
+
+    /// The `{name, protected}` record for `name` in a view's
+    /// `standard_field_names` list, or panic when it is absent.
+    fn standard_field<'a>(view: &'a Value, name: &str) -> &'a Value {
+        view["standard_field_names"]
+            .as_array()
+            .expect("standard_field_names is an array")
+            .iter()
+            .find(|f| f["name"] == json!(name))
+            .unwrap_or_else(|| panic!("{name} missing from standard_field_names: {view}"))
+    }
+
+    /// No secret value of the protected-standard-fields entry appears anywhere
+    /// in `view`.
+    fn assert_no_protected_value_leaks(view: &Value) {
+        let serialized = view.to_string();
+        for secret in [
+            "secret-user",
+            "https://secret.example",
+            "secret notes body",
+            "hunter2",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "protected value {secret:?} leaked into view: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_summary_nulls_and_marks_protected_standard_fields() {
+        let (db, id) = db_with_protected_standard_fields();
+        let v = entry_summary(&db, id).expect("entry exists");
+        assert_eq!(v["username"], Value::Null);
+        assert_eq!(v["url"], Value::Null);
+        assert_eq!(v["notes_preview"], Value::Null);
+        for name in ["UserName", "URL", "Notes", "Password"] {
+            assert_eq!(standard_field(&v, name)["protected"], json!(true));
+        }
+        // Title is the address; it stays visible.
+        assert_eq!(v["title"], json!("Covert"));
+        assert_eq!(standard_field(&v, "Title")["protected"], json!(false));
+        assert_no_protected_value_leaks(&v);
+    }
+
+    #[test]
+    fn entry_detail_nulls_and_marks_protected_standard_fields() {
+        let (db, id) = db_with_protected_standard_fields();
+        let v = entry_detail(&db, id).expect("entry exists");
+        assert_eq!(v["username"], Value::Null);
+        assert_eq!(v["url"], Value::Null);
+        assert_eq!(v["notes"], Value::Null);
+        for name in ["UserName", "URL", "Notes", "Password"] {
+            assert_eq!(standard_field(&v, name)["protected"], json!(true));
+        }
+        assert_no_protected_value_leaks(&v);
+    }
+
+    #[test]
+    fn unprotected_standard_fields_are_unchanged_and_listed_unprotected() {
+        let (db, id, _) = db_with_entry();
+        for v in [
+            entry_summary(&db, id).expect("entry exists"),
+            entry_detail(&db, id).expect("entry exists"),
+        ] {
+            assert_eq!(v["username"], json!("alice"));
+            assert_eq!(v["url"], json!("https://bank.example"));
+            for name in ["Title", "UserName", "URL", "Notes"] {
+                assert_eq!(standard_field(&v, name)["protected"], json!(false));
+            }
+            assert_eq!(standard_field(&v, "Password")["protected"], json!(true));
+            // Canonical order, present fields only, and no customs mixed in.
+            let names: Vec<&str> = v["standard_field_names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["Title", "UserName", "Password", "URL", "Notes"]);
+        }
+        let summary = entry_summary(&db, id).unwrap();
+        assert_eq!(summary["notes_preview"], json!("a note"));
+        let detail = entry_detail(&db, id).unwrap();
+        assert_eq!(detail["notes"], json!("a note"));
+    }
+
+    #[test]
+    fn absent_standard_fields_are_null_and_unlisted() {
+        let mut db = Database::new();
+        let id = {
+            let mut root = db.root_mut();
+            let mut e = root.add_entry();
+            let id = e.id();
+            e.edit(|e| e.set_unprotected(fields::TITLE, "Bare"));
+            id
+        };
+        let v = entry_summary(&db, id).expect("entry exists");
+        assert_eq!(v["username"], Value::Null);
+        assert_eq!(v["url"], Value::Null);
+        assert_eq!(v["notes_preview"], Value::Null);
+        assert_eq!(
+            v["standard_field_names"],
+            json!([{ "name": "Title", "protected": false }])
+        );
+    }
+
+    #[test]
+    fn protected_title_stays_visible_as_the_entry_address() {
+        let mut db = Database::new();
+        let id = {
+            let mut root = db.root_mut();
+            let mut e = root.add_entry();
+            let id = e.id();
+            e.edit(|e| e.set_protected(fields::TITLE, "Addressed"));
+            id
+        };
+        for v in [
+            entry_summary(&db, id).unwrap(),
+            entry_detail(&db, id).unwrap(),
+        ] {
+            assert_eq!(v["title"], json!("Addressed"));
+            assert!(
+                v["path"].as_str().unwrap().ends_with("/Addressed"),
+                "path still built from the title: {v}"
+            );
+            assert_eq!(standard_field(&v, "Title")["protected"], json!(true));
+        }
     }
 
     #[test]
