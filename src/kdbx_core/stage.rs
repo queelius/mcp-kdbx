@@ -192,7 +192,27 @@ pub struct SaveOutcome {
 // Validation (spec section 3).
 // ---------------------------------------------------------------------------
 
-/// Validate an entry title: length 1..=4096, no ASCII control characters.
+/// The first character of `s` that is invisible or reorders text: a Unicode
+/// control character (General_Category Cc, which covers ASCII controls, DEL,
+/// and the C1 range) or a format character (Cf: bidi overrides and isolates,
+/// zero-width space and joiners, the byte-order mark, and so on). Such a
+/// character makes a title or field name display as something it is not.
+/// Returns the character and its code point label (`U+202E`) for the error.
+fn first_invisible_char(s: &str) -> Option<String> {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    s.chars()
+        .find(|c| {
+            matches!(
+                c.general_category(),
+                GeneralCategory::Control | GeneralCategory::Format
+            )
+        })
+        .map(|c| format!("U+{:04X}", c as u32))
+}
+
+/// Validate an entry title: length 1..=4096, no control (Cc) or format (Cf)
+/// characters. Every write to the Title field goes through here: the `title`
+/// of `add_entry`, and `update_field` on `Title`.
 fn validate_title(title: &str) -> CoreResult<()> {
     let len = title.chars().count();
     if !(1..=4096).contains(&len) {
@@ -200,15 +220,16 @@ fn validate_title(title: &str) -> CoreResult<()> {
             .with_message("title length must be between 1 and 4096 characters")
             .with_details(serde_json::json!({ "length": len })));
     }
-    if title.chars().any(|c| (c as u32) < 0x20) {
+    if let Some(code_point) = first_invisible_char(title) {
         return Err(CoreError::new(ErrorCode::EntryTitleInvalid)
-            .with_message("title must not contain ASCII control characters"));
+            .with_message("title must not contain control or format characters")
+            .with_details(serde_json::json!({ "code_point": code_point })));
     }
     Ok(())
 }
 
-/// Validate a field name: length 1..=256, no ASCII control characters, no
-/// leading or trailing whitespace.
+/// Validate a field name: length 1..=256, no control (Cc) or format (Cf)
+/// characters, no leading or trailing whitespace.
 fn validate_field_name(name: &str) -> CoreResult<()> {
     let len = name.chars().count();
     if !(1..=256).contains(&len) {
@@ -216,15 +237,26 @@ fn validate_field_name(name: &str) -> CoreResult<()> {
             .with_message("field name length must be between 1 and 256 characters")
             .with_details(serde_json::json!({ "name": name, "length": len })));
     }
-    if name.chars().any(|c| (c as u32) < 0x20) {
+    if let Some(code_point) = first_invisible_char(name) {
         return Err(CoreError::new(ErrorCode::FieldNameInvalid)
-            .with_message("field name must not contain ASCII control characters")
-            .with_details(serde_json::json!({ "name": name })));
+            .with_message("field name must not contain control or format characters")
+            .with_details(serde_json::json!({ "code_point": code_point })));
     }
     if name != name.trim() {
         return Err(CoreError::new(ErrorCode::FieldNameInvalid)
             .with_message("field name must not have leading or trailing whitespace")
             .with_details(serde_json::json!({ "name": name })));
+    }
+    Ok(())
+}
+
+/// Validate a write of `value` to field `name`: the name itself, and, when the
+/// field is the Title, the value as a title. This is the one gate every field
+/// write passes, so no path can store a title that `validate_title` refuses.
+fn validate_field_write(name: &str, value: &str) -> CoreResult<()> {
+    validate_field_name(name)?;
+    if name == fields::TITLE {
+        validate_title(value)?;
     }
     Ok(())
 }
@@ -251,7 +283,14 @@ pub fn add_entry(
 ) -> CoreResult<EntryId> {
     validate_title(&input.title)?;
     for f in &input.fields {
-        validate_field_name(&f.name)?;
+        // The title parameter is the one way to set Title on a new entry; a
+        // Title key in the fields map would silently override it.
+        if f.name == fields::TITLE {
+            return Err(CoreError::new(ErrorCode::FieldNameInvalid)
+                .with_message("set the title with the title parameter, not in fields")
+                .with_details(serde_json::json!({ "name": f.name })));
+        }
+        validate_field_write(&f.name, &f.value)?;
     }
 
     let group_id = group_path.resolve_group(working)?;
@@ -319,7 +358,7 @@ pub fn update_field(
     value: &str,
     protected: Option<bool>,
 ) -> CoreResult<EntryId> {
-    validate_field_name(field_name)?;
+    validate_field_write(field_name, value)?;
 
     let entry_id = target.resolve(working)?;
 
@@ -860,6 +899,66 @@ mod tests {
         let err = add_entry(&mut db, &path("/"), &simple_input("bad\u{0007}title"))
             .expect_err("control char title");
         assert_eq!(err.code_enum(), ErrorCode::EntryTitleInvalid);
+    }
+
+    #[test]
+    fn titles_and_field_names_reject_unicode_control_and_format_chars() {
+        // Cc beyond ASCII (DEL, a C1 control) and Cf (a bidi override, a
+        // zero-width space, a byte-order mark) are invisible or reorder text,
+        // so a title that looks like "GitHub" could name something else.
+        for bad in [
+            "Git\u{7f}Hub",
+            "Git\u{85}Hub",
+            "\u{202e}buHtiG",
+            "Git\u{200b}Hub",
+            "\u{feff}GitHub",
+        ] {
+            assert_eq!(
+                validate_title(bad).unwrap_err().code_enum(),
+                ErrorCode::EntryTitleInvalid,
+                "title {bad:?}"
+            );
+            assert_eq!(
+                validate_field_name(bad).unwrap_err().code_enum(),
+                ErrorCode::FieldNameInvalid,
+                "field name {bad:?}"
+            );
+        }
+        // Visible Unicode, including combining marks and spaces, stays valid.
+        for good in ["Caf\u{e9}", "Cafe\u{301}", "日本語 ☕", "a/b"] {
+            validate_title(good).expect(good);
+        }
+    }
+
+    #[test]
+    fn add_entry_refuses_a_title_in_the_fields_map() {
+        // The fields map must not be a second, unvalidated way to set Title.
+        let mut db = build_db();
+        let input = EntryInput {
+            title: "Valid".to_string(),
+            fields: vec![FieldInput {
+                name: fields::TITLE.to_string(),
+                value: String::new(),
+                protected: false,
+            }],
+            attachments: Vec::new(),
+        };
+        let err = add_entry(&mut db, &path("/"), &input).expect_err("Title in fields");
+        assert_eq!(err.code_enum(), ErrorCode::FieldNameInvalid);
+        assert!(path("/Valid").resolve_entry(&db).is_err(), "nothing staged");
+    }
+
+    #[test]
+    fn update_field_on_title_is_validated_as_a_title() {
+        let mut db = build_db();
+        for bad in ["", "Git\u{7}Hub", "\u{202e}x"] {
+            let err = update_field(&mut db, &addr("/Existing"), fields::TITLE, bad, None)
+                .expect_err("invalid title via update_field");
+            assert_eq!(err.code_enum(), ErrorCode::EntryTitleInvalid, "{bad:?}");
+        }
+        // A valid rename works and the entry is reachable at its new path.
+        update_field(&mut db, &addr("/Existing"), fields::TITLE, "Renamed", None).unwrap();
+        assert!(path("/Renamed").resolve_entry(&db).is_ok());
     }
 
     #[test]

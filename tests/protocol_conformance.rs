@@ -545,6 +545,39 @@ fn error_entry_title_invalid() {
 }
 
 #[test]
+fn error_entry_title_invalid_on_every_title_write() {
+    let (_dir, mut server) = unlocked_writable("flat.kdbx");
+    // A right-to-left override in a title, via add_entry.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_add_entry",
+            json!({ "group_path": "/", "title": "\u{202e}buHtiG" })
+        ),
+        "ENTRY_TITLE_INVALID"
+    );
+    // update_field on Title is validated as a title, not just as a field name.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_update_field",
+            json!({ "path": "/GitHub", "field_name": "Title", "value": "" })
+        ),
+        "ENTRY_TITLE_INVALID"
+    );
+    // The fields map cannot carry a second, unvalidated Title.
+    assert_eq!(
+        server.call_error_code(
+            "kdbx_add_entry",
+            json!({
+                "group_path": "/",
+                "title": "Valid",
+                "fields": { "Title": { "value": "", "protected": false } },
+            })
+        ),
+        "FIELD_NAME_INVALID"
+    );
+}
+
+#[test]
 fn error_field_name_invalid() {
     let (_dir, mut server) = unlocked_writable("flat.kdbx");
     // A field name with leading whitespace fails validation.

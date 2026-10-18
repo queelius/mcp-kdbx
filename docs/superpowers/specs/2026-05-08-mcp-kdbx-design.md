@@ -1225,3 +1225,14 @@ integration tests assert them.
   any tool, and the stage diff ignores history growth. `kdbx_add_entry` keeps
   a plain edit: keepass stamps the new entry's creation and modification
   times, and a snapshot of the blank entry would be noise.
+- **Title and field-name validation has no bypass, and rejects invisible
+  characters.** Section 3's "No ASCII control characters" becomes "no Unicode
+  control (General_Category Cc: ASCII controls, DEL, the C1 range) or format
+  (Cf: bidi overrides and isolates, zero-width space and joiners, BOM)
+  characters", for both titles and field names; the error details carry the
+  offending `code_point` (for example `"U+202E"`). Every write to `Title` is
+  validated as a title: `kdbx_update_field` with `field_name: "Title"` (an
+  empty or invisible-character title is `ENTRY_TITLE_INVALID`), and a `Title`
+  key in `kdbx_add_entry`'s `fields` map is refused with `FIELD_NAME_INVALID`
+  (the `title` parameter is the one way to set it). Known cost: an emoji ZWJ
+  sequence (U+200D is Cf) cannot appear in a title or field name.
