@@ -153,8 +153,32 @@ pub enum FieldChangeOut {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttachmentChangeOut {
     pub name: String,
-    /// One of "added", "removed", "modified".
-    pub change: String,
+    pub change: AttachmentChange,
+}
+
+/// What happened to an attachment, derived from which sides of the change
+/// hold it. Serializes as `"added"`, `"removed"` or `"modified"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentChange {
+    /// Only the working side has it.
+    Added,
+    /// Only the canonical side has it.
+    Removed,
+    /// Both sides have it, with different content or protection.
+    Modified,
+}
+
+impl AttachmentChange {
+    /// The kind of a change whose before and after sides are present as
+    /// given (a property change always has at least one side).
+    fn of(before: bool, after: bool) -> Self {
+        match (before, after) {
+            (false, _) => AttachmentChange::Added,
+            (_, false) => AttachmentChange::Removed,
+            _ => AttachmentChange::Modified,
+        }
+    }
 }
 
 impl DiffPending {
@@ -557,12 +581,15 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
                     added.push(entry);
                 }
             }
+            // `moved_from` is not mapped: no v0.1 tool moves an entry, so a
+            // stage cannot hold a move.
             NodeStatus::Modified { changes, .. } => {
                 if let Some(entry) = map_modified_entry(&after, node.uuid, changes) {
                     modified.push(entry);
                 }
             }
-            // No delete tool in v0.1, so `removed` stays empty.
+            // No delete tool in v0.1, so `removed` stays empty. The wildcard
+            // also covers statuses a later diff-kdbx adds (`#[non_exhaustive]`).
             _ => {}
         }
     }
@@ -648,17 +675,10 @@ fn map_modified_entry(
                     pc.after.as_ref(),
                 ));
             }
-            Property::Attachment(name) => {
-                let change = match (&pc.before, &pc.after) {
-                    (None, _) => "added",
-                    (_, None) => "removed",
-                    _ => "modified",
-                };
-                attachment_out.push(AttachmentChangeOut {
-                    name: name.clone(),
-                    change: change.to_string(),
-                });
-            }
+            Property::Attachment(name) => attachment_out.push(AttachmentChangeOut {
+                name: name.clone(),
+                change: AttachmentChange::of(pc.before.is_some(), pc.after.is_some()),
+            }),
             _ => {}
         }
     }
@@ -1479,6 +1499,124 @@ mod tests {
             }
             FieldChangeOut::Plain { .. } => panic!("Password must be redacted, not shown"),
         }
+    }
+
+    /// A database whose entry "Covert" has a protected UserName and a
+    /// protected custom field, the reviewer's case for the snapshot diff.
+    fn covert_db() -> Database {
+        let mut db = Database::new();
+        db.root_mut().add_entry().edit(|e| {
+            e.set_unprotected(fields::TITLE, "Covert");
+            e.set_protected(fields::USERNAME, "old-user-0x7a");
+            e.set_protected("Recovery", "old-recovery-0x7b");
+        });
+        db
+    }
+
+    #[test]
+    fn diff_protected_username_and_custom_field_are_modified_without_values() {
+        let canonical = covert_db();
+        let mut working = canonical.clone();
+        for (name, value) in [
+            ("UserName", "new-user-0x7c"),
+            ("Recovery", "new-recovery-0x7d"),
+        ] {
+            update_field(&mut working, &addr("/Covert"), name, value, None).unwrap();
+        }
+        let d = diff_pending(&canonical, &working);
+        assert_eq!(d.summary.num_modified, 1);
+        let m = &d.modified[0];
+        let mut names: Vec<&str> = m.field_changes.iter().map(|f| f.field_name()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Recovery", "UserName"]);
+        for fc in &m.field_changes {
+            assert!(
+                matches!(
+                    fc,
+                    FieldChangeOut::Redacted {
+                        changed: true,
+                        protected: true,
+                        ..
+                    }
+                ),
+                "{fc:?} must be a redacted modification"
+            );
+        }
+        let wire = serde_json::to_string(&d).unwrap();
+        for value in [
+            "old-user-0x7a",
+            "old-recovery-0x7b",
+            "new-user-0x7c",
+            "new-recovery-0x7d",
+        ] {
+            assert!(!wire.contains(value), "{value} leaked into {wire}");
+        }
+    }
+
+    #[test]
+    fn diff_reports_attachment_changes_by_kind_without_content() {
+        let canonical = build_db();
+        let mut working = canonical.clone();
+        let id = resolve(&working, "/Existing").unwrap();
+        working.entry_mut(id).unwrap().edit(|e| {
+            e.add_attachment("key.pem", Value::protected(b"attached-bytes-0x5e".to_vec()));
+        });
+        let d = diff_pending(&canonical, &working);
+        let m = &d.modified[0];
+        assert_eq!(
+            m.attachment_changes,
+            [AttachmentChangeOut {
+                name: "key.pem".to_string(),
+                change: AttachmentChange::Added,
+            }]
+        );
+        let wire = serde_json::to_value(&d).unwrap();
+        assert_eq!(
+            wire["modified"][0]["attachment_changes"],
+            serde_json::json!([{ "name": "key.pem", "change": "added" }])
+        );
+        assert!(!wire.to_string().contains("attached-bytes"));
+        assert_eq!(AttachmentChange::of(true, false), AttachmentChange::Removed);
+        assert_eq!(AttachmentChange::of(true, true), AttachmentChange::Modified);
+    }
+
+    #[test]
+    fn diff_never_carries_fingerprints() {
+        // The stage diff seals under a random per-call key, so a fingerprint
+        // would mean nothing to the agent: none may cross out, in any form.
+        let canonical = covert_db();
+        let mut working = canonical.clone();
+        update_field(&mut working, &addr("/Covert"), "UserName", "x", None).unwrap();
+        update_field(&mut working, &addr("/Covert"), "Recovery", "y", Some(false)).unwrap();
+        let wire = serde_json::to_value(diff_pending(&canonical, &working)).unwrap();
+        for fc in wire["modified"][0]["field_changes"].as_array().unwrap() {
+            let keys: Vec<&str> = fc.as_object().unwrap().keys().map(String::as_str).collect();
+            match fc["protected"].as_bool().unwrap() {
+                true => assert_eq!(keys, ["changed", "field_name", "protected"], "{fc}"),
+                false => assert_eq!(keys, ["after", "before", "field_name", "protected"], "{fc}"),
+            }
+        }
+        // Turning protection off reveals the new value only: the old one was
+        // a secret, so the change is redacted.
+        let recovery = &wire["modified"][0]["field_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["field_name"] == "Recovery")
+            .unwrap()
+            .clone();
+        assert_eq!(recovery["protected"], serde_json::json!(true));
+        let hex_run = |s: &str| {
+            s.as_bytes()
+                .windows(8)
+                .any(|w| w.iter().all(u8::is_ascii_hexdigit))
+        };
+        // Record UUIDs are the only hex a diff may carry.
+        let text = working
+            .iter_all_entries()
+            .map(|e| e.id().uuid().hyphenated().to_string())
+            .fold(wire.to_string(), |text, uuid| text.replace(&uuid, ""));
+        assert!(!hex_run(&text), "a fingerprint-like hex run in {text}");
     }
 
     #[test]
