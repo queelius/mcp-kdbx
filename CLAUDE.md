@@ -18,7 +18,7 @@ The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kd
 
 Phase 1 (tasks 1 to 9), the `engine` foundation: `error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`.
 
-Phase 2 (tasks 10, 12, 13), stage-then-commit: `stage` (working-copy writes, the diff-kdbx stage diff with protected-field redaction, the atomic save) and `orphan` (startup temp-file cleanup). `diff-kdbx` is a path dependency.
+Phase 2 (tasks 10, 12, 13), stage-then-commit: `stage` (working-copy writes, the diff-kdbx stage diff with protected-field redaction, the atomic save) and `orphan` (startup temp-file cleanup). `diff-kdbx` is a library dependency (crates.io 0.1).
 
 Phase 3 (tasks 14 to 18), the MCP adapter over `rmcp` 1.7.0, all in `src/adapter/`: `responses` (the `{ ok, data } | { ok, error }` text envelope), `mod` (the `KdbxServer` handler, shared state, level-filtered audit emission, the writes gate, and the idle-timer task), `views` (read-shape builders), and the four tool groups `lifecycle` / `reads` / `reveals` / `writes`. `main.rs` reads config, opens the audit file, cleans orphans, announces start, spawns the idle timer, and serves stdio. Consent-gating, `KDBX_ALLOW_WRITES` enforcement, and sha256-not-plaintext audit are all wired and validated end to end (zero plaintext leak confirmed by smoke test).
 
@@ -34,9 +34,11 @@ Review fix batch (2026-10-18, branch `fix/review-batch`): paths can no longer al
 
 Two error codes are not reachable from a black-box protocol test and stay covered by `engine` unit tests: `VAULT_NOT_FOUND` (the config layer refuses to start without a readable vault path) and `WRITE_FAILED` (needs a mid-save filesystem failure).
 
-Phase 5 (tasks 23 to 26): `.github/workflows/ci.yml` (rust-test, protocol-conformance, and source-audit jobs; checks out the sibling `kdbx-core` and `diff-kdbx` so the path deps resolve), `scripts/ci-audit.sh` (source-invariant grep checks, A to G since the kdbx-core adoption), `docs/operations.md` (config, secret managers, audit log, posture), and the README polish (status, quick start, CI badge). The CI gate runs `cargo fmt --check`, `cargo test --all-features`, and `cargo clippy --all-targets --all-features -- -D warnings` (the `--all-features` is needed to lint the `cli`-gated `gen-fixtures` helper).
+Phase 5 (tasks 23 to 26): `.github/workflows/ci.yml` (rust-test, protocol-conformance, and source-audit jobs; kdbx-core and diff-kdbx come from crates.io), `scripts/ci-audit.sh` (source-invariant grep checks, A to G since the kdbx-core adoption), `docs/operations.md` (config, secret managers, audit log, posture), and the README polish (status, quick start, CI badge). The CI gate runs `cargo fmt --check`, `cargo test --all-features`, and `cargo clippy --all-targets --all-features -- -D warnings` (the `--all-features` is needed to lint the `cli`-gated `gen-fixtures` helper).
 
-Remaining for release (not plan tasks): create `queelius/kdbx-core` on GitHub and push diff-kdbx's snapshot API, then pin both sibling checkouts in `.github/workflows/ci.yml` to commit SHAs (the TODOs there); push; run the `docs/manual-testing.md` smoke against a real host; then switch the `kdbx-core` and `diff-kdbx` path dependencies to crates.io versions and publish.
+Dependencies: `kdbx-core` 0.1.0 and `diff-kdbx` 0.1.0 from crates.io (both published 2026-10-19). For co-development, use an untracked `.cargo/config.toml` `[patch.crates-io]` (README, Quick start). Remaining for release: run the `docs/manual-testing.md` smoke against a real host, then publish.
+
+Known dependency advisories (checked against OSV 2026-10-19), accepted for now: `rmcp` 1.7.0 has four advisories, all in its HTTP transport and OAuth client, which this crate does not build (features `server`, `macros`, `transport-io` only); the fixes are in rmcp 2.x, a major bump. `quick-xml` 0.40.1 (RUSTSEC-2026-0194, -0195: parser DoS) comes through keepass 0.12.9, the last 0.12 release, which requires `^0.40`; the XML is inside the authenticated, decrypted vault, so exploiting it needs the vault key. It clears when the writers move off keepass 0.12 (upstream #373).
 
 ## Position in the ecosystem
 
@@ -52,8 +54,8 @@ Remaining for release (not plan tasks): create `queelius/kdbx-core` on GitHub an
 
 - `~/github/kdbx/CLAUDE.md`: ecosystem-level conventions for all `*-kdbx` repos.
 - `~/github/kdbx/web-kdbx/`: the most mature sibling. Its spec/plan pair (`2026-04-29-web-kdbx-design.md` + `2026-04-29-web-kdbx.md`, plus `2026-05-06-web-kdbx-l1-storage-design.md` + `2026-05-06-web-kdbx-l1.md`) is the canonical example of the workflow.
-- `~/github/kdbx/kdbx-core/`: path dependency; its spec (`docs/superpowers/specs/2026-10-18-kdbx-core-design.md`, section 9 wins) and CLAUDE.md define the shared rules. Do not re-implement any of them here; report gaps upstream.
-- `~/github/kdbx/diff-kdbx/`: path dependency (see Cargo.toml) used by `engine::stage` for the `kdbx_diff_pending` semantic diff. Read its CLAUDE.md to understand its public Rust API (`compute`, `ChangeSet`; `#[non_exhaustive]` everywhere, so match with wildcard arms).
+- `~/github/kdbx/kdbx-core/`: crates.io dependency (0.1); its spec (`docs/superpowers/specs/2026-10-18-kdbx-core-design.md`, section 9 wins) and CLAUDE.md define the shared rules. Do not re-implement any of them here; report gaps upstream.
+- `~/github/kdbx/diff-kdbx/`: crates.io dependency (0.1, library only) used by `engine::stage` for the `kdbx_diff_pending` semantic diff. Read its CLAUDE.md to understand its public Rust API (`compute`, `ChangeSet`; `#[non_exhaustive]` everywhere, so match with wildcard arms).
 - `~/github/bugfixes/track1-issues/keepass-rs/`: local fork used for upstream contributions.
 
 ## Architectural decisions (settled in the v0.1 spec)

@@ -17,46 +17,15 @@ jobs:
   rust-test:
     name: build, test, clippy, fmt
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: mcp-kdbx
     steps:
-      # kdbx-core and diff-kdbx are path dependencies (../kdbx-core,
-      # ../diff-kdbx). Lay the three repos out as siblings under the workspace
-      # so the path deps resolve, until both crates are published to crates.io
-      # and Cargo.toml switches to versions.
-      #
-      # TODO(before the first push of adopt/kdbx-core): pin both sibling
-      # checkouts with `ref: <commit SHA>`. queelius/kdbx-core does not exist
-      # on GitHub yet (the owner approves creating it), and diff-kdbx's
-      # snapshot API lives on its unpushed redesign/snapshot branch, so a
-      # default-branch checkout of diff-kdbx builds the old API and fails.
-      # Pin each to the SHA of the commit mcp-kdbx was built against, not to
-      # a branch name.
       - name: Check out mcp-kdbx
-        uses: actions/checkout@v4
-        with:
-          path: mcp-kdbx
-      - name: Check out kdbx-core (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: queelius/kdbx-core
-          path: kdbx-core
-          # TODO: ref: <kdbx-core commit SHA> (see the note above)
-      - name: Check out diff-kdbx (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: queelius/diff-kdbx
-          path: diff-kdbx
-          # TODO: ref: <diff-kdbx commit SHA with the snapshot API>
+        uses: actions/checkout@v5
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: mcp-kdbx
       - name: Format check
         run: cargo fmt --check
       - name: Build
@@ -72,33 +41,13 @@ jobs:
     name: protocol conformance
     runs-on: ubuntu-latest
     needs: rust-test
-    defaults:
-      run:
-        working-directory: mcp-kdbx
     steps:
-      # Same sibling layout as rust-test (and the same TODO: pin both refs).
       - name: Check out mcp-kdbx
-        uses: actions/checkout@v4
-        with:
-          path: mcp-kdbx
-      - name: Check out kdbx-core (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: queelius/kdbx-core
-          path: kdbx-core
-          # TODO: ref: <kdbx-core commit SHA> (see the note in rust-test)
-      - name: Check out diff-kdbx (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: queelius/diff-kdbx
-          path: diff-kdbx
-          # TODO: ref: <diff-kdbx commit SHA with the snapshot API>
+        uses: actions/checkout@v5
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: mcp-kdbx
       - name: Run the protocol-conformance suite against the real binary
         run: cargo test --test protocol_conformance --verbose
 
@@ -106,8 +55,8 @@ jobs:
     name: source security audit
     runs-on: ubuntu-latest
     steps:
-      # The audit is a source grep; it needs no build and no sibling repo.
+      # The audit is a source grep; it needs no build.
       - name: Check out mcp-kdbx
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Run the source security audit
         run: bash scripts/ci-audit.sh

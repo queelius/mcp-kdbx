@@ -1400,8 +1400,8 @@ audit and threat model, amended as follows.
 
 - **Dependencies.** `kdbx-core` (feature `keepass-0_12`, default `kdf`) and
   the rebuilt `diff-kdbx` library (a pure function of two kdbx-core
-  snapshots, no keepass type in its API), both path dependencies until
-  published. keepass floor 0.12.9. The internal module `kdbx_core` is now
+  snapshots, no keepass type in its API), both from crates.io (0.1.0,
+  published 2026-10-19). keepass floor 0.12.9. The internal module `kdbx_core` is now
   `engine`, so `kdbx_core::` always means the shared crate. `totp-lite`,
   `base32` and `url` are gone.
 - **Snapshots and the view.** `engine::view::View` is a kdbx-core snapshot

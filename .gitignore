@@ -7,3 +7,5 @@
 .vscode/
 *.swp
 *~
+# Local [patch.crates-io] overrides for co-development (see README)
+/.cargo/config.toml

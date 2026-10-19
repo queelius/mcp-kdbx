@@ -23,14 +23,13 @@ keepass = { version = "0.12.9", features = ["serialization", "save_kdbx4"] }
 # field schema, keyed fingerprints, TOTP). keepass-0_12 adds snapshot capture
 # from this crate's keepass version; the default `kdf` feature adds the
 # Argon2id-derived fingerprint key the audit log uses. When mcp-kdbx bumps
-# keepass, it switches this feature, not diff-kdbx. Path dependency until
-# kdbx-core is published.
-kdbx-core = { path = "../kdbx-core", features = ["keepass-0_12"] }
+# keepass, it switches this feature, not diff-kdbx.
+kdbx-core = { version = "0.1.0", features = ["keepass-0_12"] }
 # Sibling ecosystem member, used as a library (no `cli`) for the semantic
 # stage diff (kdbx_diff_pending). Its API is a pure function of two kdbx-core
 # snapshots and names no keepass type, so it no longer constrains this crate's
-# keepass version. Path dependency until diff-kdbx is published.
-diff-kdbx = { path = "../diff-kdbx" }
+# keepass version.
+diff-kdbx = "0.1.0"
 # The OS random number generator, for the one-off fingerprint key each stage
 # diff uses (already in the tree through uuid).
 getrandom = "0.4"
@@ -53,7 +52,7 @@ sha2 = "0.10"
 base64 = "0.22"
 zeroize = "1"
 thiserror = "2"
-anyhow = "1"
+anyhow = "1.0.103"
 # Audit log emission.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

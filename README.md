@@ -52,14 +52,24 @@ per-release smoke checklist, see
 
 ## Quick start
 
-Build from source (Rust 1.89+, edition 2024). `kdbx-core` and `diff-kdbx`
-are currently path dependencies, so check out the sibling repos first:
+Build from source (Rust 1.89+, edition 2024):
 
 ```sh
-git clone https://github.com/queelius/kdbx-core ../kdbx-core
-git clone https://github.com/queelius/diff-kdbx ../diff-kdbx
+git clone https://github.com/queelius/mcp-kdbx
+cd mcp-kdbx
 cargo build --release   # produces target/release/mcp-kdbx
 ```
+
+To build against unpublished changes in `kdbx-core` or `diff-kdbx`, check them out next to
+this repository and add an untracked `.cargo/config.toml` (ignored by git):
+
+```toml
+[patch.crates-io]
+kdbx-core = { path = "../kdbx-core" }
+diff-kdbx = { path = "../diff-kdbx" }
+```
+
+CI never sees the patch, so it always builds what crates.io users get.
 
 Register with an MCP host, for example Claude Code:
 
