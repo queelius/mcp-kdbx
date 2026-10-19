@@ -458,6 +458,19 @@ fn write_and_stage_tools_happy_path() {
         .map(|a| a["path"].as_str().unwrap())
         .collect();
     assert!(added_paths.contains(&"/NewService"));
+    // A shown field change carries both flags and the values.
+    assert_eq!(
+        diff["modified"][0]["field_changes"],
+        json!([{
+            "field_name": "URL",
+            "secret": false,
+            "protected": false,
+            "protection_changed": false,
+            "value_changed": true,
+            "before": "https://github.com",
+            "after": "https://github.example",
+        }])
+    );
 
     // save_pending commits the stage and reports the change count.
     let saved = server.call_ok("kdbx_save_pending", json!({}));

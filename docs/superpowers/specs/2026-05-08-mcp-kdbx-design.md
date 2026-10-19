@@ -200,8 +200,8 @@ output: {
       username: string | null,                            // null if absent or protected
       url: string | null,                                 // null if absent or protected
       notes_preview: string | null,                       // first 200 chars; null if absent or protected
-      standard_field_names: { name: string, protected: boolean }[],  // present standard fields, canonical order
-      custom_field_names: { name: string, protected: boolean }[],
+      standard_field_names: { name: string, protected: boolean, secret: boolean }[],  // present standard fields, canonical order
+      custom_field_names: { name: string, protected: boolean, secret: boolean }[],     // protected: stored flag; secret: value withheld (kdbx-core adoption)
       has_attachments: boolean,
       has_otp: boolean,
       modified_at: string                                 // ISO 8601
@@ -224,8 +224,8 @@ output: {
   ok: true,
   data: {
     title, path, uuid, username, url, notes,              // notes full, not preview; null if absent or protected
-    standard_field_names: { name: string, protected: boolean }[],
-    custom_field_names: { name: string, protected: boolean }[],
+    standard_field_names: { name: string, protected: boolean, secret: boolean }[],
+    custom_field_names: { name: string, protected: boolean, secret: boolean }[],
     has_attachments: boolean,
     has_otp: boolean,
     created_at: string,
@@ -301,8 +301,10 @@ output: {
     modified: [{
       path, uuid, title,
       field_changes: [
-        { field_name, before, after, protected: false } |
-        { field_name, changed: true, protected: true }    // protected fields redacted
+        // Since the kdbx-core adoption. secret: values withheld (kdbx-core's
+        // is_secret on either side); protected: the stored flag after the
+        // change (before, if removed). before/after present iff !secret.
+        { field_name, secret, protected, protection_changed, value_changed, before?, after? }
       ],
       attachment_changes: [{ name, change: "added" | "removed" | "modified" }]
     }],
@@ -618,8 +620,7 @@ If steps 4-7 fail: temp file unlinked, no changes to vault, working_db preserved
     "modified": [{
       "path", "uuid", "title",
       "field_changes": [
-        { "field_name", "before", "after", "protected": false } |
-        { "field_name", "changed": true, "protected": true }
+        { "field_name", "secret", "protected", "protection_changed", "value_changed", "before"?, "after"? }
       ],
       "attachment_changes": [{ "name", "change": "added" | "removed" | "modified" }]
     }],
@@ -629,7 +630,9 @@ If steps 4-7 fail: temp file unlinked, no changes to vault, working_db preserved
 }
 ```
 
-**Protected-field redaction:** for `protected: true` fields, `before` and `after` are NOT included; only `{ field_name, changed: true, protected: true }`. Bulk diff queries don't reveal secrets even when secrets have changed.
+**Secret-field redaction:** for `secret: true` changes, `before` and `after` are NOT included; only the flags. Bulk diff queries don't reveal secrets even when secrets have changed. (Since the kdbx-core adoption the redaction keys on `secret`, kdbx-core's `is_secret`: protected, or a Password, never the Title. `protected` is now the stored KDBX flag, the same meaning as in the read views, so an unprotected Password's change is `secret: true, protected: false` and a protected Title's is shown. The original shape, `{ field_name, before, after, protected: false } | { field_name, changed: true, protected: true }`, used `protected` to mean "redacted".)
+
+**What changed:** `value_changed` and `protection_changed` (at least one is true). A protection toggle on an unchanged value is `protection_changed: true, value_changed: false`. Values are compared as fingerprints under the diff's one per-call key, so a sealed side and a plain side holding the same text compare equal without either being shown.
 
 **Stable ordering:** entries within each list sorted by `(group_path, title)`.
 
@@ -1441,11 +1444,14 @@ audit and threat model, amended as follows.
   `period` or `digits` in a URI, and unknown algorithms or encoders, are
   rejected rather than defaulted.
 - **Stage diff.** `kdbx_diff_pending` captures canonical and working under
-  one random key per call and calls `diff_kdbx::compute`; the response shape
-  is unchanged. A field change shows values only when both sides are plain
-  (a sealed side means a secret), so protected UserName or custom-field
-  changes are `modified` with no value, and no fingerprint ever reaches the
-  agent. `moved_from` is not mapped (no tool moves an entry); attachment
+  one random key per call and calls `diff_kdbx::compute`. Field changes
+  carry `secret` (values withheld) and `protected` (the stored flag), plus
+  `value_changed` and `protection_changed`, replacing the two-shape
+  `protected`-means-redacted form; the read views' field records gain the
+  same `secret` flag beside `protected`. Protected UserName or custom-field
+  changes are withheld, a protection toggle on an unchanged Title is a
+  protection change with its value shown, and no fingerprint ever reaches
+  the agent. `moved_from` is not mapped (no tool moves an entry); attachment
   change kinds are typed (same `added`/`removed`/`modified` wire).
 - **Fingerprints: two keys.** A random per-session key (OS RNG, drawn at
   unlock, wiped on lock) seals the view and keys every fingerprint a tool

@@ -35,8 +35,9 @@ use crate::engine::vault_file::{
 use crate::engine::view::{View, ephemeral_key};
 use diff_kdbx::{Change, DiffOptions, NodeStatus, Property, PropertyChange, Shown};
 use kdbx_core::fields::StandardField;
+use kdbx_core::fingerprint::{Domain, FingerprintKey};
 use kdbx_core::model::Value as SnapValue;
-use kdbx_core::visibility::is_address;
+use kdbx_core::visibility::{is_address, is_secret};
 use keepass::Database;
 use keepass::db::{EntryId, GroupId, Value};
 use serde::{Deserialize, Serialize};
@@ -120,32 +121,38 @@ pub struct ModifiedEntry {
     pub attachment_changes: Vec<AttachmentChangeOut>,
 }
 
-/// One field change in a modified entry, in one of two shapes.
+/// One field change in a modified entry.
 ///
-/// `#[serde(untagged)]` makes serde pick the shape by which fields are present,
-/// so this serializes to exactly the two spec forms:
-/// - non-protected: `{ "field_name", "before", "after", "protected": false }`
-/// - protected:     `{ "field_name", "changed": true, "protected": true }`
+/// Two flags, named for what they mean:
+/// - `secret`: the values are withheld. True when either side is a secret by
+///   kdbx-core's `is_secret` (protected, or a Password; never the Title), so
+///   an unprotected Password's change is withheld and a protected Title's is
+///   shown. `before` and `after` are present exactly when it is false.
+/// - `protected`: the stored KDBX protection flag, after the change (before,
+///   for a removed field). The same meaning as `protected` in the read views'
+///   `standard_field_names` and `custom_field_names`, which carry `secret`
+///   too.
 ///
-/// The protected form carries no before/after, so a protected value never
-/// appears in a bulk diff even when it changed.
+/// `value_changed` and `protection_changed` say what changed; at least one
+/// is true. A protection toggle on an unchanged value (a protected Title made
+/// unprotected, say) is `protection_changed: true, value_changed: false`.
+/// Sealed values are compared by fingerprint, under the diff's one per-call
+/// key, so equal secrets compare equal without being held.
+///
+/// Wire shape (keys absent, not null, when not applicable):
+/// `{ field_name, secret, protected, protection_changed, value_changed,
+///   before?, after? }`, with JSON `null` for an absent side of a shown change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub enum FieldChangeOut {
-    /// A non-protected field: the before and after values are shown. An absent
-    /// side (a field added or removed) is JSON `null`.
-    Plain {
-        field_name: String,
-        before: serde_json::Value,
-        after: serde_json::Value,
-        protected: bool,
-    },
-    /// A protected field: only the fact that it changed, never the value.
-    Redacted {
-        field_name: String,
-        changed: bool,
-        protected: bool,
-    },
+pub struct FieldChangeOut {
+    pub field_name: String,
+    pub secret: bool,
+    pub protected: bool,
+    pub protection_changed: bool,
+    pub value_changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<serde_json::Value>,
 }
 
 /// An attachment change in a modified entry.
@@ -622,7 +629,7 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
             // `moved_from` is not mapped: no v0.1 tool moves an entry, so a
             // stage cannot hold a move.
             NodeStatus::Modified { changes, .. } => {
-                if let Some(entry) = map_modified_entry(&after, node.uuid, changes) {
+                if let Some(entry) = map_modified_entry(&after, &key, node.uuid, changes) {
                     modified.push(entry);
                 }
             }
@@ -683,6 +690,7 @@ fn map_added_entry(after: &View, uuid: uuid::Uuid) -> Option<AddedEntry> {
 /// v0.1 diff surface.
 fn map_modified_entry(
     after: &View,
+    key: &FingerprintKey,
     uuid: uuid::Uuid,
     changes: &[PropertyChange],
 ) -> Option<ModifiedEntry> {
@@ -697,6 +705,7 @@ fn map_modified_entry(
         match &pc.property {
             Property::Field(name) => {
                 field_out.push(map_field_change(
+                    key,
                     name.as_str(),
                     pc.before.as_ref(),
                     pc.after.as_ref(),
@@ -719,36 +728,97 @@ fn map_modified_entry(
     })
 }
 
-/// Map one field change. When either side is sealed (a secret: protected, or a
-/// Password), only the fact of the change is reported; otherwise the plain
-/// before and after values are, with `null` for an absent side.
-fn map_field_change(name: &str, before: Option<&Shown>, after: Option<&Shown>) -> FieldChangeOut {
-    match (plain_side(before), plain_side(after)) {
-        (Some(before), Some(after)) => FieldChangeOut::Plain {
-            field_name: name.to_string(),
-            before,
-            after,
-            protected: false,
-        },
-        _ => FieldChangeOut::Redacted {
-            field_name: name.to_string(),
-            changed: true,
-            protected: true,
-        },
+/// One present side of a field change: its stored protection flag and its
+/// value.
+struct Side<'a> {
+    protected: bool,
+    value: &'a SnapValue,
+}
+
+/// Read one side of a field change: `Ok(None)` for an absent side, `Err(())`
+/// for a kind of value this version does not know (then treated as secret).
+fn side(shown: Option<&Shown>) -> Result<Option<Side<'_>>, ()> {
+    match shown {
+        None => Ok(None),
+        Some(Shown::Field {
+            protected, value, ..
+        }) => Ok(Some(Side {
+            protected: *protected,
+            value,
+        })),
+        Some(_) => Err(()),
     }
 }
 
-/// One side of a field change as JSON: `Some(null)` for an absent side,
-/// `Some(string)` for a plain value, and `None` for anything that may not be
-/// shown (a sealed value, or a value kind this version does not know).
-fn plain_side(side: Option<&Shown>) -> Option<serde_json::Value> {
-    match side {
-        None => Some(serde_json::Value::Null),
-        Some(Shown::Field {
-            value: SnapValue::Plain(text),
-            ..
-        }) => Some(serde_json::Value::String(text.clone())),
-        Some(_) => None,
+/// Map one field change (see [`FieldChangeOut`] for the flags). `key` is the
+/// one key both sides were captured under: values are compared as
+/// fingerprints under it, so a sealed side and a plain side holding the same
+/// text (protection turned off without a value change) compare equal.
+fn map_field_change(
+    key: &FingerprintKey,
+    name: &str,
+    before: Option<&Shown>,
+    after: Option<&Shown>,
+) -> FieldChangeOut {
+    let (before, after) = match (side(before), side(after)) {
+        (Ok(before), Ok(after)) => (before, after),
+        // An unknown kind of value: report only that the field changed.
+        _ => {
+            return FieldChangeOut {
+                field_name: name.to_string(),
+                secret: true,
+                protected: true,
+                protection_changed: false,
+                value_changed: true,
+                before: None,
+                after: None,
+            };
+        }
+    };
+    let is_secret_side = |side: &Option<Side<'_>>| {
+        side.as_ref().is_some_and(|s| {
+            is_secret(name, s.protected) || !matches!(s.value, SnapValue::Plain(_))
+        })
+    };
+    let secret = is_secret_side(&before) || is_secret_side(&after);
+    let protected = after
+        .as_ref()
+        .or(before.as_ref())
+        .is_some_and(|s| s.protected);
+    let protection_changed =
+        matches!((&before, &after), (Some(b), Some(a)) if b.protected != a.protected);
+    let fingerprint = |value: &SnapValue| match value {
+        SnapValue::Sealed(fp) => Some(*fp),
+        SnapValue::Plain(text) => Some(key.fingerprint(Domain::Field, text.as_bytes())),
+        _ => None,
+    };
+    let value_changed = match (&before, &after) {
+        (Some(b), Some(a)) => match (fingerprint(b.value), fingerprint(a.value)) {
+            (Some(b), Some(a)) => b != a,
+            // An unknown kind of value: assume it changed.
+            _ => true,
+        },
+        _ => true,
+    };
+    let shown = |side: &Option<Side<'_>>| match side {
+        None => serde_json::Value::Null,
+        Some(s) => s.value.as_plain().map_or(serde_json::Value::Null, |t| {
+            serde_json::Value::String(t.to_string())
+        }),
+    };
+    let (before_out, after_out) = if secret {
+        (None, None)
+    } else {
+        (Some(shown(&before)), Some(shown(&after)))
+    };
+    FieldChangeOut {
+        field_name: name.to_string(),
+        secret,
+        protected,
+        protection_changed,
+        value_changed,
+        before: before_out,
+        after: after_out,
     }
 }
 
@@ -1502,25 +1572,24 @@ mod tests {
         let m = &d.modified[0];
         assert_eq!(m.title, "Existing");
         assert_eq!(m.path.as_deref(), Some("/Existing"));
-        // The URL field change must carry before/after, protected false.
+        // The URL field change carries before/after: not a secret.
         let fc = m
             .field_changes
             .iter()
-            .find(|f| f.field_name() == "URL")
+            .find(|f| f.field_name == "URL")
             .expect("URL field change present");
-        match fc {
-            FieldChangeOut::Plain {
-                before,
-                after,
-                protected,
-                ..
-            } => {
-                assert!(!*protected);
-                assert_eq!(before, &serde_json::json!("https://old.example.com"));
-                assert_eq!(after, &serde_json::json!("https://new.example.com"));
+        assert_eq!(
+            fc,
+            &FieldChangeOut {
+                field_name: "URL".to_string(),
+                secret: false,
+                protected: false,
+                protection_changed: false,
+                value_changed: true,
+                before: Some(serde_json::json!("https://old.example.com")),
+                after: Some(serde_json::json!("https://new.example.com")),
             }
-            FieldChangeOut::Redacted { .. } => panic!("URL is not protected"),
-        }
+        );
     }
 
     #[test]
@@ -1541,17 +1610,14 @@ mod tests {
         let fc = m
             .field_changes
             .iter()
-            .find(|f| f.field_name() == "Password")
+            .find(|f| f.field_name == "Password")
             .expect("Password field change present");
-        match fc {
-            FieldChangeOut::Redacted {
-                changed, protected, ..
-            } => {
-                assert!(*changed);
-                assert!(*protected);
-            }
-            FieldChangeOut::Plain { .. } => panic!("Password must be redacted, not shown"),
-        }
+        assert!(fc.secret && fc.protected && fc.value_changed && !fc.protection_changed);
+        assert_eq!(
+            (&fc.before, &fc.after),
+            (&None, &None),
+            "Password must be withheld"
+        );
     }
 
     /// A database whose entry "Covert" has a protected UserName and a
@@ -1579,20 +1645,17 @@ mod tests {
         let d = diff_pending(&canonical, &working);
         assert_eq!(d.summary.num_modified, 1);
         let m = &d.modified[0];
-        let mut names: Vec<&str> = m.field_changes.iter().map(|f| f.field_name()).collect();
+        let mut names: Vec<&str> = m
+            .field_changes
+            .iter()
+            .map(|f| f.field_name.as_str())
+            .collect();
         names.sort_unstable();
         assert_eq!(names, ["Recovery", "UserName"]);
         for fc in &m.field_changes {
             assert!(
-                matches!(
-                    fc,
-                    FieldChangeOut::Redacted {
-                        changed: true,
-                        protected: true,
-                        ..
-                    }
-                ),
-                "{fc:?} must be a redacted modification"
+                fc.secret && fc.protected && fc.value_changed && fc.before.is_none(),
+                "{fc:?} must be a withheld modification"
             );
         }
         let wire = serde_json::to_string(&d).unwrap();
@@ -1644,13 +1707,25 @@ mod tests {
         let wire = serde_json::to_value(diff_pending(&canonical, &working)).unwrap();
         for fc in wire["modified"][0]["field_changes"].as_array().unwrap() {
             let keys: Vec<&str> = fc.as_object().unwrap().keys().map(String::as_str).collect();
-            match fc["protected"].as_bool().unwrap() {
-                true => assert_eq!(keys, ["changed", "field_name", "protected"], "{fc}"),
-                false => assert_eq!(keys, ["after", "before", "field_name", "protected"], "{fc}"),
+            let flags = [
+                "field_name",
+                "protected",
+                "protection_changed",
+                "secret",
+                "value_changed",
+            ];
+            match fc["secret"].as_bool().unwrap() {
+                true => assert_eq!(keys, flags, "{fc}"),
+                false => {
+                    let mut shown = vec!["after", "before"];
+                    shown.extend(flags);
+                    assert_eq!(keys, shown, "{fc}")
+                }
             }
         }
-        // Turning protection off reveals the new value only: the old one was
-        // a secret, so the change is redacted.
+        // Turning protection off does not reveal the new value: the old one
+        // was a secret, so the change is withheld. `protected` is the stored
+        // flag after the change.
         let recovery = &wire["modified"][0]["field_changes"]
             .as_array()
             .unwrap()
@@ -1658,7 +1733,9 @@ mod tests {
             .find(|f| f["field_name"] == "Recovery")
             .unwrap()
             .clone();
-        assert_eq!(recovery["protected"], serde_json::json!(true));
+        assert_eq!(recovery["secret"], serde_json::json!(true));
+        assert_eq!(recovery["protected"], serde_json::json!(false));
+        assert_eq!(recovery["protection_changed"], serde_json::json!(true));
         let hex_run = |s: &str| {
             s.as_bytes()
                 .windows(8)
@@ -1701,28 +1778,18 @@ mod tests {
         let fc = m
             .field_changes
             .iter()
-            .find(|f| f.field_name() == "ApiKey")
+            .find(|f| f.field_name == "ApiKey")
             .expect("ApiKey field change present");
 
-        // It must be the redacted form: changed and protected, no value.
-        match fc {
-            FieldChangeOut::Redacted {
-                changed, protected, ..
-            } => {
-                assert!(*changed);
-                assert!(*protected);
-            }
-            FieldChangeOut::Plain { .. } => {
-                panic!("a newly-added protected field must be redacted, not shown")
-            }
-        }
+        // It must be withheld: a secret, protected, value changed, no value.
+        assert!(fc.secret && fc.protected && fc.value_changed);
 
-        // Serialize the field change and assert the redacted JSON shape: the
-        // object has protected and changed true and carries no before/after.
+        // Serialize the field change and assert the withheld JSON shape: no
+        // before/after key at all.
         let fc_json = serde_json::to_value(fc).expect("serialize field change");
         let obj = fc_json.as_object().expect("field change is an object");
-        assert_eq!(obj.get("protected"), Some(&serde_json::json!(true)));
-        assert_eq!(obj.get("changed"), Some(&serde_json::json!(true)));
+        assert_eq!(obj.get("secret"), Some(&serde_json::json!(true)));
+        assert_eq!(obj.get("value_changed"), Some(&serde_json::json!(true)));
         assert!(!obj.contains_key("before"), "no before on a redacted add");
         assert!(!obj.contains_key("after"), "no after on a redacted add");
 
@@ -1737,46 +1804,49 @@ mod tests {
 
     #[test]
     fn diff_field_change_json_shapes_match_spec() {
-        // Non-protected: { field_name, before, after, protected: false }.
-        let plain = FieldChangeOut::Plain {
+        // Shown: every flag, plus before and after (null for an absent side).
+        let shown = FieldChangeOut {
             field_name: "URL".to_string(),
-            before: serde_json::json!("a"),
-            after: serde_json::json!("b"),
+            secret: false,
             protected: false,
+            protection_changed: false,
+            value_changed: true,
+            before: Some(serde_json::Value::Null),
+            after: Some(serde_json::json!("b")),
         };
-        let plain_json = serde_json::to_value(&plain).expect("serialize plain");
         assert_eq!(
-            plain_json,
+            serde_json::to_value(&shown).unwrap(),
             serde_json::json!({
                 "field_name": "URL",
-                "before": "a",
-                "after": "b",
-                "protected": false
+                "secret": false,
+                "protected": false,
+                "protection_changed": false,
+                "value_changed": true,
+                "before": null,
+                "after": "b"
             })
         );
 
-        // Protected: { field_name, changed: true, protected: true }. No before
-        // or after key at all.
-        let redacted = FieldChangeOut::Redacted {
+        // Withheld: the flags only, no before or after key at all.
+        let withheld = FieldChangeOut {
             field_name: "Password".to_string(),
-            changed: true,
+            secret: true,
             protected: true,
+            protection_changed: false,
+            value_changed: true,
+            before: None,
+            after: None,
         };
-        let redacted_json = serde_json::to_value(&redacted).expect("serialize redacted");
         assert_eq!(
-            redacted_json,
+            serde_json::to_value(&withheld).unwrap(),
             serde_json::json!({
                 "field_name": "Password",
-                "changed": true,
-                "protected": true
+                "secret": true,
+                "protected": true,
+                "protection_changed": false,
+                "value_changed": true
             })
         );
-        let obj = redacted_json.as_object().expect("object");
-        assert!(
-            !obj.contains_key("before"),
-            "no before on a redacted change"
-        );
-        assert!(!obj.contains_key("after"), "no after on a redacted change");
     }
 
     #[test]
@@ -2156,13 +2226,71 @@ mod tests {
         );
     }
 
-    // A small test-only helper on the output type, to keep assertions readable.
-    impl FieldChangeOut {
-        fn field_name(&self) -> &str {
-            match self {
-                FieldChangeOut::Plain { field_name, .. } => field_name,
-                FieldChangeOut::Redacted { field_name, .. } => field_name,
+    #[test]
+    fn a_protection_toggle_on_an_unchanged_title_is_a_protection_change() {
+        let mut canonical = Database::new();
+        canonical.root_mut().add_entry().edit(|e| {
+            e.set_protected(fields::TITLE, "Shielded");
+            e.set_unprotected(fields::PASSWORD, "plain-flag-pw-0x3c");
+        });
+        let mut working = canonical.clone();
+        update_field(
+            &mut working,
+            &addr("/Shielded"),
+            fields::TITLE,
+            "Shielded",
+            Some(false),
+        )
+        .unwrap();
+        update_field(
+            &mut working,
+            &addr("/Shielded"),
+            fields::PASSWORD,
+            "plain-flag-pw-0x3d",
+            None,
+        )
+        .unwrap();
+        let d = diff_pending(&canonical, &working);
+        let changes = &d.modified[0].field_changes;
+        let title = changes.iter().find(|f| f.field_name == "Title").unwrap();
+        // The Title is never a secret, so its value is shown; only its
+        // protection changed.
+        assert_eq!(
+            title,
+            &FieldChangeOut {
+                field_name: "Title".to_string(),
+                secret: false,
+                protected: false,
+                protection_changed: true,
+                value_changed: false,
+                before: Some(serde_json::json!("Shielded")),
+                after: Some(serde_json::json!("Shielded")),
             }
-        }
+        );
+        // An unprotected Password is a secret: withheld, its stored flag false.
+        let password = changes.iter().find(|f| f.field_name == "Password").unwrap();
+        assert!(password.secret && !password.protected && password.value_changed);
+        assert!(password.before.is_none() && password.after.is_none());
+        assert!(!serde_json::to_string(&d).unwrap().contains("plain-flag-pw"));
+    }
+
+    #[test]
+    fn unprotecting_a_secret_without_changing_it_is_a_protection_change_only() {
+        let canonical = covert_db();
+        let mut working = canonical.clone();
+        update_field(
+            &mut working,
+            &addr("/Covert"),
+            "Recovery",
+            "old-recovery-0x7b",
+            Some(false),
+        )
+        .unwrap();
+        let d = diff_pending(&canonical, &working);
+        let fc = &d.modified[0].field_changes[0];
+        assert_eq!(fc.field_name, "Recovery");
+        // The sealed before and the plain after hold the same text: they
+        // compare equal by fingerprint, and the value stays withheld.
+        assert!(fc.secret && fc.protection_changed && !fc.value_changed && !fc.protected);
     }
 }

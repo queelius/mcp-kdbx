@@ -283,7 +283,7 @@ impl KdbxServer {
     /// This is a read of the stage, so it emits no audit event. Protected field
     /// values are redacted.
     #[tool(
-        description = "Show the pending changes staged in memory: added and modified entries with a per-field diff. Requires writes to be enabled and the vault unlocked. Protected field values are never shown, only that they changed. This does not write anything."
+        description = "Show the pending changes staged in memory: added and modified entries with a per-field diff. Requires writes to be enabled and the vault unlocked. Each field change reports secret (values withheld: a protected field or any Password), protected (the stored flag), value_changed and protection_changed; before and after appear only when secret is false. This does not write anything."
     )]
     async fn kdbx_diff_pending(&self) -> String {
         if !self.writes_allowed() {

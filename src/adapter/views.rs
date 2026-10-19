@@ -4,8 +4,9 @@
 //! `kdbx_list_entries`, `kdbx_get_entry`, `kdbx_find_entry`, and
 //! `kdbx_list_attachments` (spec section 1). They are metadata-only: no
 //! protected value, no attachment bytes, and no OTP code ever crosses through
-//! here. Protected fields are reported by name with a `protected: true` flag;
-//! revealing a value is a separate, consent-gated tool.
+//! here. Every field is reported by name with two flags, `protected` (the
+//! stored KDBX flag) and `secret` (the value is withheld); revealing a value
+//! is a separate, consent-gated tool.
 //!
 //! Every builder reads a [`View`]: the vault's kdbx-core snapshot of the
 //! working db, captured under fingerprint sealing, plus its path index and
@@ -15,14 +16,15 @@
 //! do emit go through `kdbx_core::visibility::metadata_value`, the rule search
 //! shares. A standard field (UserName, URL, Notes) that the user marked
 //! protected is emitted as `null` under its own key and flagged
-//! `protected: true` in `standard_field_names`, exactly as a protected custom
-//! field is flagged in `custom_field_names`. Title is the one exception: it
-//! is the entry's address in a path, so it is shown even when protected.
+//! `protected: true, secret: true` in `standard_field_names`, exactly as a
+//! protected custom field is flagged in `custom_field_names`. Title is the one
+//! exception: it is the entry's address in a path, so it is shown even when
+//! protected (`protected: true, secret: false`).
 
 use crate::engine::view::View;
 use kdbx_core::fields::StandardField;
 use kdbx_core::model::{Entry, Field, Group, Timestamp};
-use kdbx_core::visibility::metadata_value;
+use kdbx_core::visibility::{is_secret, metadata_value};
 use serde_json::{Value, json};
 use std::time::SystemTime;
 
@@ -115,7 +117,7 @@ fn visible(entry: &Entry, field: StandardField) -> Option<&str> {
 /// The standard fields present on an entry, each with its protected flag, in
 /// canonical order (Title, UserName, Password, URL, Notes). The same
 /// `{name, protected}` shape as [`custom_field_names`]: together the two lists
-/// inventory every field, and a `protected: true` record tells the agent the
+/// inventory every field, and a `secret: true` record tells the agent the
 /// value is withheld here and must be read with a reveal tool
 /// (`kdbx_reveal_password` for Password, `kdbx_reveal_protected` otherwise).
 fn standard_field_names(entry: &Entry) -> Vec<Value> {
@@ -140,9 +142,18 @@ fn custom_field_names(entry: &Entry) -> Vec<Value> {
         .collect()
 }
 
-/// The `{name, protected}` record both field lists use.
+/// The `{name, protected, secret}` record both field lists use: `protected`
+/// is the stored KDBX flag, `secret` is kdbx-core's `is_secret` (protected,
+/// or a Password; never the Title), true exactly when the value is withheld
+/// here and must be read with a reveal tool. They differ for an unprotected
+/// Password (secret, not protected) and a protected Title (protected, shown).
+/// The stage diff's field changes carry the same two flags.
 fn field_flag(name: &str, field: &Field) -> Value {
-    json!({ "name": name, "protected": field.protected })
+    json!({
+        "name": name,
+        "protected": field.protected,
+        "secret": is_secret(name, field.protected),
+    })
 }
 
 /// Format an optional KDBX timestamp as `YYYY-MM-DDTHH:MM:SSZ`, or null.
@@ -370,7 +381,7 @@ mod tests {
         assert_eq!(v["notes_preview"], Value::Null);
         assert_eq!(
             v["standard_field_names"],
-            json!([{ "name": "Title", "protected": false }])
+            json!([{ "name": "Title", "protected": false, "secret": false }])
         );
     }
 
@@ -391,6 +402,7 @@ mod tests {
                 "path still built from the title: {v}"
             );
             assert_eq!(standard_field(&v, "Title")["protected"], json!(true));
+            assert_eq!(standard_field(&v, "Title")["secret"], json!(false));
         }
     }
 
@@ -408,8 +420,10 @@ mod tests {
             .id();
         for v in [summary(&db, id).unwrap(), detail(&db, id).unwrap()] {
             assert!(!v.to_string().contains("flag-off-secret"), "{v}");
-            // The field list reports the stored flag as metadata.
+            // The field list reports the stored flag as metadata, and that
+            // the value is a secret all the same.
             assert_eq!(standard_field(&v, "Password")["protected"], json!(false));
+            assert_eq!(standard_field(&v, "Password")["secret"], json!(true));
         }
     }
 

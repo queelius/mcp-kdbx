@@ -117,7 +117,7 @@ impl KdbxServer {
 
     /// Read: list the direct entries of a group.
     #[tool(
-        description = "List the direct entries of a group. Provide group_path or the group's uuid. Returns each entry's title, path, uuid, username, url, a notes preview, standard and custom field names with protected flags, attachment and otp flags, and the modified timestamp. Metadata only: no passwords or protected values. A username, url, or notes field marked protected is returned as null and flagged protected in standard_field_names; read it with kdbx_reveal_protected."
+        description = "List the direct entries of a group. Provide group_path or the group's uuid. Returns each entry's title, path, uuid, username, url, a notes preview, standard and custom field names (each with protected, the stored flag, and secret, true when the value is withheld), attachment and otp flags, and the modified timestamp. Metadata only: no secret values. A username, url, or notes field marked protected is returned as null and flagged secret in standard_field_names; read it with kdbx_reveal_protected."
     )]
     async fn kdbx_list_entries(&self, Parameters(params): Parameters<ListEntriesParams>) -> String {
         let mut vault = self.vault().await;
@@ -178,7 +178,7 @@ impl KdbxServer {
 
     /// Read: fetch the full detail view of one entry.
     #[tool(
-        description = "Fetch the full detail of an entry. Provide path. Returns title, path, uuid, username, url, full notes, standard and custom field names with protected flags, attachment and otp flags, and the created, modified, and accessed timestamps. No password, protected values, or attachment bytes. A username, url, or notes field marked protected is returned as null and flagged protected in standard_field_names; read it with kdbx_reveal_protected."
+        description = "Fetch the full detail of an entry. Provide path. Returns title, path, uuid, username, url, full notes, standard and custom field names (each with protected, the stored flag, and secret, true when the value is withheld), attachment and otp flags, and the created, modified, and accessed timestamps. No secret values or attachment bytes. A username, url, or notes field marked protected is returned as null and flagged secret in standard_field_names; read it with kdbx_reveal_protected."
     )]
     async fn kdbx_get_entry(&self, Parameters(params): Parameters<GetEntryParams>) -> String {
         let mut vault = self.vault().await;
