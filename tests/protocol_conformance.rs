@@ -1035,3 +1035,60 @@ fn roundtrip_integer_range_edges_for_otp_time_are_clamped() {
         );
     }
 }
+
+/// Listings come back in record-UUID order (kdbx-core's keepass 0.12 capture
+/// sorts children by UUID, since keepass 0.12 loses document order), the
+/// same on every call and across a re-unlock, instead of hash-set order.
+#[test]
+fn listings_are_in_uuid_order() {
+    let uuids = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["uuid"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let sorted = |v: &[String]| {
+        let mut s = v.to_vec();
+        s.sort();
+        s
+    };
+
+    let mut flat = unlocked("flat.kdbx");
+    let entries =
+        uuids(&flat.call_ok("kdbx_list_entries", json!({ "group_path": "/" }))["entries"]);
+    assert!(entries.len() >= 5, "{entries:?}");
+    assert_eq!(
+        entries,
+        sorted(&entries),
+        "entries are listed in uuid order"
+    );
+    flat.call_ok("kdbx_lock", json!({}));
+    flat.unlock_with_fixture_password();
+    let again = uuids(&flat.call_ok("kdbx_list_entries", json!({ "group_path": "/" }))["entries"]);
+    assert_eq!(again, entries, "the order survives a re-unlock");
+
+    // No committed fixture has sibling groups: build one with six.
+    let mut db = keepass::Database::new();
+    for name in ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"] {
+        db.root_mut().add_group().name = name.to_string();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("siblings.kdbx");
+    let mut bytes = Vec::new();
+    db.save(
+        &mut bytes,
+        keepass::DatabaseKey::new().with_password(FIXTURE_PASSWORD),
+    )
+    .unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let mut siblings = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    siblings.unlock_with_fixture_password();
+    let groups = uuids(&siblings.call_ok("kdbx_list_groups", json!({}))["groups"]);
+    assert_eq!(groups.len(), 6, "{groups:?}");
+    assert_eq!(groups, sorted(&groups), "groups are listed in uuid order");
+    siblings.call_ok("kdbx_lock", json!({}));
+    siblings.unlock_with_fixture_password();
+    let again = uuids(&siblings.call_ok("kdbx_list_groups", json!({}))["groups"]);
+    assert_eq!(again, groups, "the order survives a re-unlock");
+}
