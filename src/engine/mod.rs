@@ -15,7 +15,8 @@
 //! - `vault_file`: the file on disk: content fingerprint, writer lock, and the
 //!   atomic replace the save path uses.
 //! - `unlock`: master-password source resolution (input, env, command).
-//! - `audit`: the JSONL audit-log events and sha256 reveal hashing.
+//! - `audit`: the JSONL audit-log events, with keyed fingerprints of revealed
+//!   values.
 //! - `otp`: TOTP for a live entry through kdbx-core's `otp` (typed
 //!   `OTP_INVALID` for a malformed configuration).
 //! - `search`: substring entry search across configurable fields.

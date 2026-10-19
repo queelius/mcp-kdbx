@@ -5,7 +5,8 @@
 //! reach:
 //!
 //! - the audit log file: an unlock and a reveal are recorded, and the revealed
-//!   value never appears in plaintext (only its domain-separated sha256),
+//!   value never appears in plaintext (only its keyed fingerprint, which a
+//!   verifier holding the vault can reproduce and nobody else can),
 //! - the stage-then-commit cycle persists across a reopen,
 //! - a manual lock discards the stage and the first locked call reports what was
 //!   dropped,
@@ -18,8 +19,9 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use mcp_kdbx::engine::audit::hash_revealed;
+use kdbx_core::fingerprint::Domain;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// Spawn against a writable temp copy of a fixture, with the given extra env,
 /// and unlock. Returns the tempdir guard (which must outlive the server), the
@@ -72,16 +74,34 @@ fn audit_log_records_unlock_and_reveal_without_plaintext() {
     assert_eq!(unlocked["details"]["unlock_source"], json!("input"));
     assert_eq!(unlocked["level"], json!("info"));
 
-    // The reveal was recorded with the domain-separated sha256, never the value.
+    // The unlock recorded what a verifier needs to rebuild the audit key:
+    // the derivation parameters (never below the 64 MiB x 3 floor) and the
+    // salt (the root group UUID).
+    assert!(
+        unlocked["details"]["fingerprint_params"]
+            .as_str()
+            .unwrap()
+            .starts_with("argon2id$v=19$m=")
+    );
+    assert!(unlocked["details"]["fingerprint_salt"].is_string());
+
+    // The reveal was recorded with the keyed fingerprint, never the value, and
+    // a verifier holding the vault reproduces it from the log.
     let reveal = events
         .iter()
         .find(|e| e["event"] == json!("reveal_password"))
         .expect("reveal_password event present");
     assert_eq!(reveal["details"]["target_path"], json!("/Bank"));
+    assert!(reveal["details"].get("sha256").is_none());
     assert_eq!(
-        reveal["details"]["sha256"],
-        json!(hash_revealed("bank-secret-456")),
-        "reveal event must log the domain-separated hash of the value"
+        reveal["details"]["fingerprint_domain"],
+        json!("kdbx-core/field/v1")
+    );
+    let key = audit_key_from_log(&events);
+    assert_eq!(
+        reveal["details"]["fingerprint"],
+        json!(fingerprint_hex(&key, Domain::Field, b"bank-secret-456")),
+        "reveal event must log the keyed fingerprint of the value"
     );
 
     // The security invariant: neither the revealed value nor the master password
@@ -97,10 +117,67 @@ fn audit_log_records_unlock_and_reveal_without_plaintext() {
     );
 }
 
+/// The reviewer recovered the fixture PIN from the old unkeyed audit hash in
+/// under 10,000 tries. With a keyed fingerprint, hashing every candidate
+/// without the key matches nothing: the logged value differs from every
+/// unkeyed digest of every 4-digit PIN, including the real one, while the
+/// verifier holding the vault still reproduces it.
+#[test]
+fn the_fixture_pin_cannot_be_recovered_from_the_log_without_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let vault = fixture_path("flat.kdbx");
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", vault.to_str().unwrap()),
+        ("KDBX_LOG_FILE", log_path.to_str().unwrap()),
+    ]);
+    server.unlock_with_fixture_password();
+    let pin = server.call_ok(
+        "kdbx_reveal_protected",
+        json!({ "path": "/Bank", "field_name": "PIN" }),
+    );
+    assert_eq!(pin["value"], json!("4321"));
+
+    let events = read_audit_lines(&log_path);
+    let reveal = events
+        .iter()
+        .find(|e| e["event"] == json!("reveal_protected"))
+        .expect("reveal_protected event present");
+    let logged = reveal["details"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(logged.len(), 64);
+
+    let hex = |digest: &[u8]| -> String { digest.iter().map(|b| format!("{b:02x}")).collect() };
+    for n in 0..10_000u32 {
+        let candidate = format!("{n:04}");
+        let plain = hex(&Sha256::digest(candidate.as_bytes()));
+        let old_scheme = hex(&Sha256::new()
+            .chain_update(b"kdbx-reveal-v1\0")
+            .chain_update(candidate.as_bytes())
+            .finalize());
+        let domain_only = hex(&Sha256::new()
+            .chain_update(Domain::Field.label().as_bytes())
+            .chain_update(candidate.as_bytes())
+            .finalize());
+        for unkeyed in [plain, old_scheme, domain_only] {
+            assert_ne!(
+                logged, unkeyed,
+                "candidate {candidate} matched without the key"
+            );
+        }
+    }
+
+    let key = audit_key_from_log(&events);
+    assert_eq!(logged, fingerprint_hex(&key, Domain::Field, b"4321"));
+}
+
 /// A protected standard field (KeePassXC's per-attribute "Protect" toggle on
 /// UserName or Notes) must behave like any other protected value: bulk reads
 /// return it as null and mark it protected, search never matches it, and the
-/// only way out is `kdbx_reveal_protected`, which audits a sha256 of the value.
+/// only way out is `kdbx_reveal_protected`, which audits a keyed fingerprint of
+/// the value.
 #[test]
 fn protected_standard_fields_are_hidden_from_reads_and_search_but_revealable() {
     let dir = tempfile::tempdir().unwrap();
@@ -183,8 +260,9 @@ fn protected_standard_fields_are_hidden_from_reads_and_search_but_revealable() {
     );
     assert_eq!(notes["value"], json!("primary dev account"));
 
-    // Each reveal is audited with the domain-separated hash, never the value.
+    // Each reveal is audited with the keyed fingerprint, never the value.
     let events = read_audit_lines(&log_path);
+    let key = audit_key_from_log(&events);
     for (field, value) in [("UserName", "octocat"), ("Notes", "primary dev account")] {
         let reveal = events
             .iter()
@@ -194,7 +272,10 @@ fn protected_standard_fields_are_hidden_from_reads_and_search_but_revealable() {
             })
             .unwrap_or_else(|| panic!("reveal_protected event for {field} present"));
         assert_eq!(reveal["details"]["target_path"], json!("/GitHub"));
-        assert_eq!(reveal["details"]["sha256"], json!(hash_revealed(value)));
+        assert_eq!(
+            reveal["details"]["fingerprint"],
+            json!(fingerprint_hex(&key, Domain::Field, value.as_bytes()))
+        );
     }
     let raw = std::fs::read_to_string(&log_path).unwrap();
     assert!(

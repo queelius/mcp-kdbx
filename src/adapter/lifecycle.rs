@@ -145,9 +145,15 @@ impl KdbxServer {
                     .ok()
                     .map(format_system_time)
                     .unwrap_or_default();
+                let (fingerprint_params, fingerprint_salt) = match vault.fingerprint_derivation() {
+                    Ok(derivation) => derivation,
+                    Err(e) => return responses::err(&e),
+                };
                 self.emit(AuditEvent::VaultUnlocked {
                     unlock_source: source,
                     file_mtime,
+                    fingerprint_params,
+                    fingerprint_salt,
                 });
                 let vault_name = vault
                     .working_db()

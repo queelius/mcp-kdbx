@@ -4,22 +4,24 @@
 //! These are the consent-gated tools (spec section 1, "Reveals"). Each one
 //! crosses a secret out of the vault, so each requires an unlocked vault and
 //! emits exactly one info-level audit event on success. The security invariant
-//! is that the event carries a sha256 of the revealed value, never the value
-//! itself: string secrets hash via [`hash_revealed`] (the domain-separated
-//! reveal hash), and an attachment's content sha256 is a plain digest used as a
-//! fingerprint. The TOTP secret never leaves the process; only the computed code
-//! crosses out, and the `get_otp` event logs no code and no secret.
+//! is that the event carries a keyed fingerprint of the revealed value, never
+//! the value itself: `Vault::fingerprint` computes it under the session's audit
+//! key (derived at unlock), in kdbx-core's field domain for string secrets and
+//! its attachment domain for attachment bytes. The TOTP secret never leaves the
+//! process; only the computed code crosses out, and the `get_otp` event logs no
+//! code and no secret.
 //!
 //! Each tool reads the value into an owned `String` (or `Vec<u8>`) before
 //! emitting and returning, so the audit emit and the response do not borrow the
 //! vault guard.
 
 use crate::adapter::{KdbxServer, canonical_entry_path, locate_entry, responses};
-use crate::engine::audit::{AuditEvent, hash_revealed};
+use crate::engine::audit::AuditEvent;
 use crate::engine::error::{CoreError, ErrorCode};
 use crate::engine::otp;
 use base64::Engine;
 use kdbx_core::fields::StandardField;
+use kdbx_core::fingerprint::Domain;
 use kdbx_core::visibility::is_secret;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
@@ -92,10 +94,10 @@ pub struct GetOtpParams {
 
 #[tool_router(router = reveals_router, vis = "pub(crate)")]
 impl KdbxServer {
-    /// Reveal: return an entry's `Password` field. Consent-gated; logs a sha256
-    /// of the value, never the value.
+    /// Reveal: return an entry's `Password` field. Consent-gated; logs a keyed
+    /// fingerprint of the value, never the value.
     #[tool(
-        description = "Reveal the Password field of an entry. This is a consent-gated secret access: it returns the plaintext password and records an audit event with a sha256 of the value (never the value itself). Requires an unlocked vault."
+        description = "Reveal the Password field of an entry. This is a consent-gated secret access: it returns the plaintext password and records an audit event with a keyed fingerprint of the value (never the value itself). Requires an unlocked vault."
     )]
     async fn kdbx_reveal_password(
         &self,
@@ -134,11 +136,15 @@ impl KdbxServer {
             }
         };
         let target_uuid = entry.id().uuid().to_string();
+        let fingerprint = match vault.fingerprint(Domain::Field, password.as_bytes()) {
+            Ok(fp) => fp,
+            Err(e) => return responses::err(&e),
+        };
 
         self.emit(AuditEvent::RevealPassword {
             target_path,
             target_uuid,
-            sha256: hash_revealed(&password),
+            fingerprint,
         });
 
         responses::ok(serde_json::json!({ "password": password }))
@@ -146,9 +152,9 @@ impl KdbxServer {
 
     /// Reveal: return a named protected field's value. A non-protected field is
     /// refused with `FIELD_NOT_PROTECTED`; the agent should read it with a list
-    /// or get tool instead. Consent-gated; logs a sha256 of the value.
+    /// or get tool instead. Consent-gated; logs a keyed fingerprint of the value.
     #[tool(
-        description = "Reveal the value of a named secret field on an entry (a protected field, or the Password). Refuses fields that are not secret with FIELD_NOT_PROTECTED (read those with a list or get tool instead). Records an audit event with a sha256 of the value, never the value. Requires an unlocked vault."
+        description = "Reveal the value of a named secret field on an entry (a protected field, or the Password). Refuses fields that are not secret with FIELD_NOT_PROTECTED (read those with a list or get tool instead). Records an audit event with a keyed fingerprint of the value, never the value. Requires an unlocked vault."
     )]
     async fn kdbx_reveal_protected(
         &self,
@@ -199,22 +205,25 @@ impl KdbxServer {
         }
         let value = field.get().to_string();
         let target_uuid = entry.id().uuid().to_string();
+        let fingerprint = match vault.fingerprint(Domain::Field, value.as_bytes()) {
+            Ok(fp) => fp,
+            Err(e) => return responses::err(&e),
+        };
 
         self.emit(AuditEvent::RevealProtected {
             target_path,
             target_uuid,
             field_name: params.field_name.clone(),
-            sha256: hash_revealed(&value),
+            fingerprint,
         });
 
         responses::ok(serde_json::json!({ "value": value }))
     }
 
-    /// Reveal: return an attachment's bytes, base64-encoded, with its size and a
-    /// content sha256. Consent-gated; logs the content sha256 (a plain digest,
-    /// not the reveal hash, since this fingerprints bytes rather than a string).
+    /// Reveal: return an attachment's bytes, base64-encoded, with its size and
+    /// its keyed fingerprint. Consent-gated; logs the same fingerprint.
     #[tool(
-        description = "Download an entry's attachment by name: returns the bytes base64-encoded, plus size_bytes and a sha256 content fingerprint. There is no size cap; attachments over 10 MB are logged at warn but still returned. Records an audit event with the content sha256. Requires an unlocked vault."
+        description = "Download an entry's attachment by name: returns the bytes base64-encoded, plus size_bytes and the content fingerprint (keyed, the same value kdbx_list_attachments reports). There is no size cap; attachments over 10 MB are logged at warn but still returned. Records an audit event with the fingerprint. Requires an unlocked vault."
     )]
     async fn kdbx_download_attachment(
         &self,
@@ -265,10 +274,13 @@ impl KdbxServer {
                 "downloading an attachment larger than 10 MB"
             );
         }
-        // The content sha256 is a plain digest fingerprint of the bytes (spec
-        // section 1: the download_attachment event carries the content sha256),
-        // not the domain-separated reveal hash, which is for string secrets.
-        let content_sha256 = crate::adapter::views::sha256_hex(&bytes);
+        // The keyed fingerprint of the bytes in kdbx-core's attachment
+        // domain: the value kdbx_list_attachments reports for the same
+        // content, and never a plain digest (a lookup oracle on small files).
+        let fingerprint = match vault.fingerprint(Domain::Attachment, &bytes) {
+            Ok(fp) => fp,
+            Err(e) => return responses::err(&e),
+        };
         let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
         self.emit(AuditEvent::DownloadAttachment {
@@ -276,13 +288,13 @@ impl KdbxServer {
             target_uuid: entry.id().uuid().to_string(),
             attachment_name: params.name.clone(),
             size_bytes: size_bytes as u64,
-            sha256: content_sha256.clone(),
+            fingerprint,
         });
 
         responses::ok(serde_json::json!({
             "name": params.name,
             "size_bytes": size_bytes,
-            "sha256": content_sha256,
+            "fingerprint": fingerprint.to_hex(),
             "base64": base64,
         }))
     }

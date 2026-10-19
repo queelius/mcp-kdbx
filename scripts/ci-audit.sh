@@ -53,19 +53,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# C. Reveal handlers must hash the value, never log it. The reveals module must
-#    reference hash_revealed (the domain-separated reveal hash) and sha256 (the
-#    attachment content fingerprint).
+# C. Reveal handlers must fingerprint the value with the session's keyed audit
+#    key, never log it and never hash it unkeyed. The reveals module must call
+#    Vault::fingerprint (kdbx-core's keyed HMAC) for field values and for
+#    attachment bytes, and must not compute a plain digest.
 # ---------------------------------------------------------------------------
 reveals="src/adapter/reveals.rs"
 if [ ! -f "$reveals" ]; then
     problem "expected reveal handlers at $reveals (file missing)"
-elif ! grep -q 'hash_revealed' "$reveals"; then
-    problem "$reveals does not reference hash_revealed (reveal events must log a hash, not the value)"
-elif ! grep -q 'sha256' "$reveals"; then
-    problem "$reveals does not reference sha256 (attachment reveals must log a content fingerprint)"
+elif ! grep -q 'fingerprint(Domain::Field' "$reveals"; then
+    problem "$reveals does not fingerprint revealed field values (vault.fingerprint(Domain::Field, ..))"
+elif ! grep -q 'fingerprint(Domain::Attachment' "$reveals"; then
+    problem "$reveals does not fingerprint downloaded attachments (vault.fingerprint(Domain::Attachment, ..))"
+elif grep -qE 'sha2|Sha256|hash_revealed' "$reveals"; then
+    problem "$reveals computes an unkeyed digest (reveal events must carry keyed fingerprints only)"
 else
-    pass "reveal handlers use hash_revealed and sha256"
+    pass "reveal handlers log keyed fingerprints only"
+fi
+
+# ---------------------------------------------------------------------------
+# G. No unkeyed hash of vault content. An unkeyed digest of a low-entropy
+#    secret is a lookup oracle, so SHA-256 is allowed only where it hashes the
+#    encrypted vault file for save-conflict detection (engine/vault_file.rs).
+#    Fingerprints of secrets come from kdbx-core's keyed FingerprintKey.
+# ---------------------------------------------------------------------------
+hits=$(grep -rlnE 'sha2::|Sha256' src --include='*.rs' | grep -v '^src/engine/vault_file.rs$' || true)
+if [ -n "$hits" ]; then
+    problem "SHA-256 used outside engine/vault_file.rs (fingerprint secrets with kdbx-core's keyed FingerprintKey instead)" "$hits"
+else
+    pass "SHA-256 only hashes the vault file (no unkeyed digest of a secret)"
 fi
 
 # ---------------------------------------------------------------------------

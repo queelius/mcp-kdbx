@@ -214,7 +214,7 @@ input:  { entry_path: string }
 output: {
   ok: true,
   data: {
-    attachments: [{ name: string, size_bytes: number, sha256: string /* hex */ }]
+    attachments: [{ name: string, size_bytes: number, fingerprint: string /* 64 hex, keyed; was sha256 before the kdbx-core adoption */ }]
   }
 }
 
@@ -263,7 +263,7 @@ output: { ok: true, data: { value: string } }
 
 // kdbx_download_attachment
 input:  { entry_path: string, name: string }
-output: { ok: true, data: { name, size_bytes, sha256, base64: string } }
+output: { ok: true, data: { name, size_bytes, fingerprint, base64: string } }  // fingerprint: 64 hex, keyed (was sha256)
 
 // kdbx_get_otp
 input:  { path: string, time_unix?: number }              // default now
@@ -584,7 +584,7 @@ KDBX deduplicates attachments at the database level. Entries reference attachmen
 
 `kdbx_add_entry` with attachments: decode base64, compute SHA-256, insert into database (let keepass-rs handle dedup), link to entry under the input-provided name.
 
-`kdbx_download_attachment`: resolve entry, find attachment by name, fetch bytes, return `{ name, size_bytes, sha256, base64 }`. No hard size cap (KDBX is unlimited; we accept what KDBX accepts). Sizes above 10MB get a `warn` log entry but are not rejected.
+`kdbx_download_attachment`: resolve entry, find attachment by name, fetch bytes, return `{ name, size_bytes, fingerprint, base64 }` (the keyed fingerprint; see "Implementation notes (kdbx-core adoption)"). No hard size cap (KDBX is unlimited; we accept what KDBX accepts). Sizes above 10MB get a `warn` log entry but are not rejected.
 
 ## Save atomicity
 
@@ -800,7 +800,7 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 | Event | Level | Details |
 |---|---|---|
 | `server_started` | info | server_version, vault_path, writes_allowed, idle_timeout_seconds |
-| `vault_unlocked` | info | unlock_source ("input" \| "env" \| "cmd"), file_mtime |
+| `vault_unlocked` | info | unlock_source ("input" \| "env" \| "cmd"), file_mtime, fingerprint_params, fingerprint_salt (added with the kdbx-core adoption: what a verifier needs to rebuild the audit key) |
 | `vault_locked` | info | reason, pending_discarded_count |
 | `auth_failed` | error | source, error_code |
 | `write_staged` | info | tool, target_path, target_uuid, field_name (if applicable) |
@@ -808,9 +808,9 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 | `save_committed` | info | num_changes, before_mtime, after_mtime |
 | `save_refused` | warn | before_mtime, conflict_mtime, pending_changes |
 | `save_failed` | error | failure_step, error_message, pending_changes |
-| `reveal_password` | info | target_path, target_uuid, sha256 |
-| `reveal_protected` | info | target_path, target_uuid, field_name, sha256 |
-| `download_attachment` | info | target_path, target_uuid, attachment_name, size_bytes, sha256 |
+| `reveal_password` | info | target_path, target_uuid, fingerprint, fingerprint_domain |
+| `reveal_protected` | info | target_path, target_uuid, field_name, fingerprint, fingerprint_domain |
+| `download_attachment` | info | target_path, target_uuid, attachment_name, size_bytes, fingerprint, fingerprint_domain |
 | `get_otp` | info | target_path, target_uuid (no code logged) |
 | `unlock_failed` | warn | unlock_source, reason (added 2026-10-18: `VAULT_UNREADABLE`) |
 | `writer_lock_unavailable` | warn | reason (added 2026-10-18: save without the writer lock) |
@@ -822,7 +822,7 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 These are non-negotiable:
 
 - **Never log plaintext values.** No password, no protected field, no OTP code, no attachment bytes ever appears in any log entry except at `trace` level.
-- **Reveal events log SHA-256 hash, not value.** Hash computed as `sha256("kdbx-reveal-v1\0" || value)` for domain-separation against rainbow-table attacks.
+- **Reveal events log a keyed fingerprint, not the value.** Since the kdbx-core adoption: `HMAC-SHA256(K, domain || value)` (kdbx-core's `Fingerprint`, 64 hex), where `K` is derived once per unlock with Argon2id from the master key material, salted with the root group UUID, at parameters never cheaper than the vault's own KDF (floor 64 MiB x 3 passes). The original `sha256("kdbx-reveal-v1\0" || value)` was unkeyed, so a low-entropy secret could be recovered by hashing candidates (a reviewer recovered a 4-digit PIN in under 10,000 tries); the keyed form can be checked only with the vault's key material, using `diff-kdbx fingerprint`.
 - **Path segments and field names ARE logged.** They're metadata, not secrets. Users with paranoid threat models can disable info-level logging by setting `KDBX_LOG_LEVEL=warn`.
 - **Master password and unlock-command output never appear anywhere.** Specifically scrubbed in `mcp_message` capture (`password` parameter replaced with `"<redacted>"`).
 - **`KDBX_PASSWORD` env var is not logged.** `server_started` event captures vault_path and idle_timeout_seconds but no env-var-derived secrets.
@@ -861,7 +861,7 @@ A misbehaving or hostile LLM agent. Defenses:
 - **Bulk reads metadata-only.** `kdbx_list_entries`, `kdbx_get_entry`, `kdbx_find_entry`, `kdbx_list_attachments` never include protected values, attachment bytes, or OTP codes.
 - **Per-call consent-gated reveals.** Each `kdbx_reveal_*` and `kdbx_download_attachment` is a separate audited event. The MCP host can show a confirm UI per call.
 - **Minimal write surface.** No delete or move tools. Writes require `KDBX_ALLOW_WRITES=true`. Stage-then-commit pattern allows review before disk write.
-- **Audit log of every reveal and write.** sha256-hashed values let the user verify access without storing secrets.
+- **Audit log of every reveal and write.** Keyed fingerprints of revealed values let the user (who holds the vault) verify access without storing secrets, and give nobody else a dictionary oracle.
 
 ### External vault modification
 

@@ -100,7 +100,8 @@ per line (JSONL). The same lines also go to stderr.
 ### Format
 
 ```json
-{"timestamp":"2026-06-18T06:29:14Z","level":"info","event":"reveal_password","pid":2515757,"details":{"target_path":"/Bank","target_uuid":"2278f0b7-...","sha256":"be9243f2..."}}
+{"timestamp":"2026-10-19T00:21:24Z","level":"info","event":"vault_unlocked","pid":239659,"details":{"file_mtime":"2026-06-18T08:10:42Z","fingerprint_params":"argon2id$v=19$m=65536,t=3,p=1","fingerprint_salt":"133fb32a-2e9c-4281-b9fc-f462745668bc","unlock_source":"input"}}
+{"timestamp":"2026-10-19T00:21:24Z","level":"info","event":"reveal_protected","pid":239659,"details":{"field_name":"PIN","fingerprint":"3671f5b92f3621151eed445763cdbac02cf6cfc40d36704a294036b6d9807f39","fingerprint_domain":"kdbx-core/field/v1","target_path":"/Bank","target_uuid":"2278f0b7-ecbd-4e10-ba9a-9f6b53ba7f92"}}
 ```
 
 | Field | Meaning |
@@ -112,18 +113,60 @@ per line (JSONL). The same lines also go to stderr.
 | `details` | Event-specific fields. |
 
 Event types: `server_started`, `vault_unlocked`, `vault_locked`, `auth_failed`,
-`reveal_password`, `reveal_protected`, `download_attachment`, `get_otp`,
-`write_staged`, `save_committed`, `save_refused`, `save_failed`,
-`stage_discarded`.
+`unlock_failed`, `reveal_password`, `reveal_protected`, `download_attachment`,
+`get_otp`, `write_staged`, `save_committed`, `save_refused`, `save_failed`,
+`stage_discarded`, `writer_lock_unavailable`.
 
 ### Privacy invariant
 
-Reveal events record a sha256 of the value, never the value. String reveals
-(`reveal_password`, `reveal_protected`) use a domain-separated hash
-(`sha256("kdbx-reveal-v1\0" || value)`); attachment reveals record the content
-sha256. The master password and `KDBX_UNLOCK_CMD` output never appear at any
-level. Plaintext values appear only at `trace` level, an explicit opt-in for
-local debugging; do not run `trace` against a real vault.
+Reveal events record a keyed fingerprint of the value, never the value:
+`fingerprint` is HMAC-SHA256 under a key derived from the vault's master key
+material (64 hex), and `fingerprint_domain` names what was fingerprinted
+(`kdbx-core/field/v1` for `reveal_password` and `reveal_protected`,
+`kdbx-core/attachment/v1` for `download_attachment`, whose fingerprint is also
+what `kdbx_list_attachments` reports). The master password and
+`KDBX_UNLOCK_CMD` output never appear at any level. Plaintext values appear
+only at `trace` level, an explicit opt-in for local debugging; do not run
+`trace` against a real vault.
+
+An unkeyed hash would be a lookup oracle: whoever reads the log could hash
+every 4-digit PIN and find the one revealed. The key closes that. It is
+derived once per unlock with Argon2id over the master password and key file,
+salted with the vault's root group UUID, with the vault's own Argon2
+parameters when they cost at least 64 MiB x 3 passes and those floor
+parameters otherwise, so guessing the key is never cheaper than attacking the
+vault. `vault_unlocked` records the parameters (`fingerprint_params`) and the
+salt (`fingerprint_salt`), and the key is dropped (and wiped) on lock. An
+unlock therefore costs one extra Argon2 run.
+
+The format changed with the kdbx-core adoption: earlier logs carry `sha256`
+(`sha256("kdbx-reveal-v1\0" || value)` for string reveals, a plain content
+sha256 for attachments) and no `fingerprint_*` keys.
+
+### Verifying a logged fingerprint
+
+Whoever holds the vault can check which value a reveal event names, with
+diff-kdbx's `fingerprint` subcommand and the `vault_unlocked` event of the
+same session:
+
+```sh
+# fingerprint_params and fingerprint_salt from the session's vault_unlocked
+KDBX_DIFF_PASSWORD=... diff-kdbx fingerprint \
+    --params 'argon2id$v=19$m=65536,t=3,p=1' \
+    --salt 133fb32a-2e9c-4281-b9fc-f462745668bc \
+    --field PIN --entry /Bank vault.kdbx
+# prints 3671f5b9...; equal to the event's fingerprint when the field still
+# holds the value that was revealed
+```
+
+`--entry` takes the event's `target_uuid` too (stable across renames), and
+`--key-file` adds a key file. Without `--params` and `--salt`, diff-kdbx uses
+the vault's own, which is what mcp-kdbx used unless the vault's KDF or root
+group changed since. The subcommand covers fields; there is no attachment
+counterpart yet. One mismatch to know: mcp-kdbx always includes the password
+in the key material (an empty password is the empty string), while diff-kdbx
+treats an empty password next to a key file as "no password", so a session
+unlocked with an empty password and a key file cannot be verified this way.
 
 ### Log levels and what they capture
 

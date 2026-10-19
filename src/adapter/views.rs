@@ -27,7 +27,6 @@ use kdbx_core::visibility::is_secret;
 use keepass::Database;
 use keepass::db::{EntryId, GroupId};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 
 /// The longer of an entry's notes shown in a list view (spec: first 200 chars).
@@ -92,18 +91,24 @@ pub fn group_summary(db: &Database, view: &View, group_id: GroupId) -> Option<Va
 }
 
 /// Build the attachment list for an entry (the `kdbx_list_attachments` shape):
-/// name, size in bytes, and the hex SHA-256 of the content. No bytes returned;
-/// downloading bytes is the consent-gated `kdbx_download_attachment`.
-pub fn attachment_list(db: &Database, entry_id: EntryId) -> Option<Value> {
-    let entry = db.entry(entry_id)?;
+/// name, size in bytes, and the keyed fingerprint of the content, in name
+/// order. No bytes returned; downloading bytes is the consent-gated
+/// `kdbx_download_attachment`.
+///
+/// Read from the view's snapshot, which never holds attachment bytes: each
+/// attachment is already a fingerprint there, computed under the session's
+/// audit key, so it equals the fingerprint a download of the same bytes
+/// logs.
+pub fn attachment_list(view: &View, entry_id: EntryId) -> Option<Value> {
+    let entry = view.snapshot().find_entry(entry_id.uuid())?;
     let attachments: Vec<Value> = entry
-        .attachments_named()
-        .map(|(name, attachment)| {
-            let bytes = attachment.get();
+        .attachments
+        .iter()
+        .map(|(name, info)| {
             json!({
-                "name": name.to_string(),
-                "size_bytes": bytes.len(),
-                "sha256": sha256_hex(bytes),
+                "name": name,
+                "size_bytes": info.size,
+                "fingerprint": info.fingerprint.to_hex(),
             })
         })
         .collect();
@@ -170,16 +175,6 @@ fn has_otp(entry: &keepass::db::EntryRef<'_>) -> bool {
 /// Format an optional KDBX timestamp as `YYYY-MM-DDTHH:MM:SSZ`, or null.
 fn format_time(time: Option<NaiveDateTime>) -> Option<String> {
     time.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-}
-
-/// Lowercase hex SHA-256 of `bytes`. Used for attachment content fingerprints
-/// (metadata, not a reveal), so it is a plain digest with no domain prefix. The
-/// single definition the adapter shares: the read views and the
-/// `kdbx_download_attachment` reveal both report the same fingerprint, so they
-/// cannot drift.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Format a `SystemTime` as `YYYY-MM-DDTHH:MM:SSZ` (UTC). The single definition

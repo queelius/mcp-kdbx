@@ -158,7 +158,7 @@ impl KdbxServer {
 
     /// Read: list the attachments of an entry (names, sizes, content hashes).
     #[tool(
-        description = "List the attachments of an entry. Provide entry_path. Returns each attachment's name, size in bytes, and sha256 of its content. No attachment bytes: downloading bytes is a separate consent-gated tool."
+        description = "List the attachments of an entry. Provide entry_path. Returns each attachment's name, size in bytes, and a keyed fingerprint of its content (the value kdbx_download_attachment reports and audits for the same bytes). No attachment bytes: downloading bytes is a separate consent-gated tool."
     )]
     async fn kdbx_list_attachments(
         &self,
@@ -184,7 +184,7 @@ impl KdbxServer {
         };
         // attachment_list returns the full { attachments: [...] } object, which
         // is exactly the data payload. None means the id stopped resolving.
-        match views::attachment_list(db, entry_id) {
+        match views::attachment_list(view, entry_id) {
             Some(data) => responses::ok(data),
             None => responses::err(&ErrorCode::EntryNotFound.into()),
         }

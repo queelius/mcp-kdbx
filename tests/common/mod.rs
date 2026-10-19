@@ -269,3 +269,40 @@ pub fn temp_copy_of(fixture: &str) -> (tempfile::TempDir, PathBuf) {
     std::fs::copy(fixture_path(fixture), &dest).expect("copy fixture into temp dir");
     (dir, dest)
 }
+
+/// The audit fingerprint key a verifier derives from a log: the fixture
+/// password, and the `fingerprint_params` and `fingerprint_salt` the
+/// `vault_unlocked` event recorded. This is what `diff-kdbx fingerprint
+/// --params .. --salt ..` does with the vault in hand.
+pub fn audit_key_from_log(events: &[Value]) -> kdbx_core::fingerprint::FingerprintKey {
+    use kdbx_core::fingerprint::{DeriveParams, FingerprintKey, KeyMaterial};
+    let unlocked = events
+        .iter()
+        .find(|e| e["event"] == json!("vault_unlocked"))
+        .expect("vault_unlocked event present");
+    let params: DeriveParams = unlocked["details"]["fingerprint_params"]
+        .as_str()
+        .expect("fingerprint_params recorded")
+        .parse()
+        .expect("fingerprint_params parse");
+    let salt: uuid::Uuid = unlocked["details"]["fingerprint_salt"]
+        .as_str()
+        .expect("fingerprint_salt recorded")
+        .parse()
+        .expect("fingerprint_salt is a uuid");
+    FingerprintKey::derive(
+        &KeyMaterial::new(Some(FIXTURE_PASSWORD.as_bytes()), None),
+        salt,
+        &params,
+    )
+    .expect("derive the audit key")
+}
+
+/// The 64-hex keyed fingerprint of `bytes` in `domain` under `key`.
+pub fn fingerprint_hex(
+    key: &kdbx_core::fingerprint::FingerprintKey,
+    domain: kdbx_core::fingerprint::Domain,
+    bytes: &[u8],
+) -> String {
+    key.fingerprint(domain, bytes).to_hex()
+}

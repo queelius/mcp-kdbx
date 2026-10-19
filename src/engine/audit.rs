@@ -1,4 +1,4 @@
-//! JSONL audit-log events and sha256 reveal hashing.
+//! JSONL audit-log events with keyed fingerprints of revealed values.
 //!
 //! This module implements spec section 6 ("Audit trail"). Every audited action
 //! is an [`AuditEvent`] variant. A variant knows two things on its own: its
@@ -20,8 +20,12 @@
 //!
 //! Privacy invariants (non-negotiable, spec section 6):
 //!
-//! - Plaintext values never appear in any event. Reveal events carry a sha256
-//!   hash via [`hash_revealed`], never the value.
+//! - Plaintext values never appear in any event. Reveal events carry a keyed
+//!   fingerprint ([`KeyedFingerprint`]: HMAC-SHA256 under the session's audit
+//!   key, derived at unlock), never the value. An unkeyed hash of a
+//!   low-entropy secret would be a lookup oracle (a 4-digit PIN falls in
+//!   under 10,000 tries); the keyed one can be checked only by someone who
+//!   holds the vault's key material, with `diff-kdbx fingerprint`.
 //! - The master password and unlock-command output never appear anywhere.
 //!
 //! Deferred beyond v0.1: debug/trace JSON-RPC payload capture (the spec's
@@ -35,9 +39,9 @@ use crate::engine::error::ErrorCode;
 use crate::engine::unlock::UnlockSource;
 use crate::engine::vault::{LockReason, UnreadableReason};
 use crate::engine::vault_file::{LockUnavailable, SaveStep};
+use kdbx_core::fingerprint::{DeriveParams, Domain, Fingerprint};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
@@ -101,6 +105,27 @@ pub enum StageDiscardReason {
     Manual,
 }
 
+/// A keyed fingerprint together with the kdbx-core domain it was computed in.
+///
+/// Built only by `Vault::fingerprint`, which owns the session's audit key, so
+/// the recorded domain is the one actually used. An event renders it as
+/// `fingerprint` (64 lowercase hex) and `fingerprint_domain` (the domain's
+/// versioned label, `kdbx-core/field/v1` or `kdbx-core/attachment/v1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyedFingerprint {
+    /// The domain the fingerprint separates (field value, attachment bytes).
+    pub domain: Domain,
+    /// The fingerprint.
+    pub fingerprint: Fingerprint,
+}
+
+impl KeyedFingerprint {
+    /// The 64-character lowercase hex form, as logged and as tools report it.
+    pub fn to_hex(&self) -> String {
+        self.fingerprint.to_hex()
+    }
+}
+
 /// One audited action. Each variant carries the event-specific detail fields
 /// named in the spec's "Logged events" table (section 6).
 ///
@@ -119,10 +144,15 @@ pub enum AuditEvent {
         writes_allowed: bool,
         idle_timeout_seconds: u64,
     },
-    /// A vault was unlocked.
+    /// A vault was unlocked. `fingerprint_params` (rendered in its
+    /// `argon2id$v=19$m=..,t=..,p=..` form) and `fingerprint_salt` (the root
+    /// group UUID) are what a verifier needs to rebuild this session's audit
+    /// key from the vault's key material.
     VaultUnlocked {
         unlock_source: UnlockSource,
         file_mtime: String,
+        fingerprint_params: DeriveParams,
+        fingerprint_salt: uuid::Uuid,
     },
     /// A vault was locked (idle, explicit, or shutdown).
     VaultLocked {
@@ -175,30 +205,30 @@ pub enum AuditEvent {
         error_message: String,
         pending_changes: u64,
     },
-    /// A password field was revealed. `sha256` is [`hash_revealed`] of the value.
+    /// A password field was revealed. `fingerprint` is the keyed fingerprint
+    /// of the value (domain `kdbx-core/field/v1`).
     RevealPassword {
         target_path: Option<String>,
         target_uuid: String,
-        sha256: String,
+        fingerprint: KeyedFingerprint,
     },
-    /// A non-password protected field was revealed.
+    /// A non-password secret field was revealed.
     RevealProtected {
         target_path: Option<String>,
         target_uuid: String,
         field_name: String,
-        sha256: String,
+        fingerprint: KeyedFingerprint,
     },
-    /// An attachment was downloaded. `sha256` is a plain SHA-256 content
-    /// fingerprint of the bytes (lowercase hex), the same digest the
-    /// `kdbx_list_attachments` view reports, not the domain-separated
-    /// [`hash_revealed`] (which is for string secrets). It identifies which
-    /// attachment was taken without storing its content.
+    /// An attachment was downloaded. `fingerprint` is the keyed fingerprint
+    /// of its bytes (domain `kdbx-core/attachment/v1`), the same value the
+    /// `kdbx_list_attachments` view reports. It identifies which attachment
+    /// was taken without storing its content.
     DownloadAttachment {
         target_path: Option<String>,
         target_uuid: String,
         attachment_name: String,
         size_bytes: u64,
-        sha256: String,
+        fingerprint: KeyedFingerprint,
     },
     /// A save proceeded without the inter-instance writer lock because the
     /// filesystem cannot lock (the content check still ran).
@@ -277,9 +307,13 @@ impl AuditEvent {
             AuditEvent::VaultUnlocked {
                 unlock_source,
                 file_mtime,
+                fingerprint_params,
+                fingerprint_salt,
             } => json!({
                 "unlock_source": unlock_source,
                 "file_mtime": file_mtime,
+                "fingerprint_params": fingerprint_params.to_string(),
+                "fingerprint_salt": fingerprint_salt.to_string(),
             }),
             AuditEvent::VaultLocked {
                 reason,
@@ -342,35 +376,38 @@ impl AuditEvent {
             AuditEvent::RevealPassword {
                 target_path,
                 target_uuid,
-                sha256,
+                fingerprint,
             } => json!({
                 "target_path": target_path,
                 "target_uuid": target_uuid,
-                "sha256": sha256,
+                "fingerprint": fingerprint.to_hex(),
+                "fingerprint_domain": fingerprint.domain.label(),
             }),
             AuditEvent::RevealProtected {
                 target_path,
                 target_uuid,
                 field_name,
-                sha256,
+                fingerprint,
             } => json!({
                 "target_path": target_path,
                 "target_uuid": target_uuid,
                 "field_name": field_name,
-                "sha256": sha256,
+                "fingerprint": fingerprint.to_hex(),
+                "fingerprint_domain": fingerprint.domain.label(),
             }),
             AuditEvent::DownloadAttachment {
                 target_path,
                 target_uuid,
                 attachment_name,
                 size_bytes,
-                sha256,
+                fingerprint,
             } => json!({
                 "target_path": target_path,
                 "target_uuid": target_uuid,
                 "attachment_name": attachment_name,
                 "size_bytes": size_bytes,
-                "sha256": sha256,
+                "fingerprint": fingerprint.to_hex(),
+                "fingerprint_domain": fingerprint.domain.label(),
             }),
             AuditEvent::WriterLockUnavailable { reason } => json!({ "reason": reason }),
             AuditEvent::UnlockFailed {
@@ -406,30 +443,6 @@ impl AuditEvent {
             "details": self.details_json(),
         })
     }
-}
-
-/// The reveal-hash domain prefix. The single trailing NUL byte is part of the
-/// contract: `sha256("kdbx-reveal-v1\0" || value)`. Changing these bytes breaks
-/// every previously logged hash, so they are pinned here and asserted in tests.
-const REVEAL_DOMAIN_PREFIX: &[u8] = b"kdbx-reveal-v1\0";
-
-/// Domain-separated sha256 of a revealed value, as lowercase hex.
-///
-/// The hash is over `REVEAL_DOMAIN_PREFIX` followed by the value bytes. The
-/// domain prefix separates these hashes from any other sha256 use and blunts
-/// generic rainbow-table lookups. This is the privacy invariant for reveal
-/// events: the log stores this hash, never the value.
-pub fn hash_revealed(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(REVEAL_DOMAIN_PREFIX);
-    hasher.update(value.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        // Two lowercase hex chars per byte, no separators.
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
 }
 
 /// Writes audit events as JSONL to stderr and, if configured, to a file.
@@ -485,6 +498,16 @@ impl AuditLog {
 mod tests {
     use super::*;
 
+    /// A fixed fingerprint for the pinned envelopes: all bytes 0xab.
+    fn fixed(domain: Domain) -> KeyedFingerprint {
+        KeyedFingerprint {
+            domain,
+            fingerprint: Fingerprint::from_bytes([0xab; 32]),
+        }
+    }
+
+    const FIXED_HEX: &str = "abababababababababababababababababababababababababababababababab";
+
     /// Construct one of every variant. Used to check the event name and level
     /// mapping is exhaustive and matches the spec table.
     fn all_events() -> Vec<(AuditEvent, &'static str, Level)> {
@@ -503,6 +526,10 @@ mod tests {
                 AuditEvent::VaultUnlocked {
                     unlock_source: UnlockSource::Env,
                     file_mtime: "2026-05-08T10:00:00Z".to_string(),
+                    fingerprint_params: DeriveParams::FLOOR,
+                    fingerprint_salt: uuid::Uuid::from_u128(
+                        0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+                    ),
                 },
                 "vault_unlocked",
                 Level::Info,
@@ -573,7 +600,7 @@ mod tests {
                 AuditEvent::RevealPassword {
                     target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
-                    sha256: "deadbeef".to_string(),
+                    fingerprint: fixed(Domain::Field),
                 },
                 "reveal_password",
                 Level::Info,
@@ -583,7 +610,7 @@ mod tests {
                     target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                     field_name: "RecoveryKey".to_string(),
-                    sha256: "deadbeef".to_string(),
+                    fingerprint: fixed(Domain::Field),
                 },
                 "reveal_protected",
                 Level::Info,
@@ -594,7 +621,7 @@ mod tests {
                     target_uuid: "abcd".to_string(),
                     attachment_name: "key.pem".to_string(),
                     size_bytes: 2048,
-                    sha256: "deadbeef".to_string(),
+                    fingerprint: fixed(Domain::Attachment),
                 },
                 "download_attachment",
                 Level::Info,
@@ -633,7 +660,7 @@ mod tests {
     /// deliberate.
     const PINNED_ENVELOPES: &[&str] = &[
         r#"{"details":{"idle_timeout_seconds":900,"server_version":"0.1.0","vault_path":"/vault.kdbx","writes_allowed":false},"event":"server_started","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
-        r#"{"details":{"file_mtime":"2026-05-08T10:00:00Z","unlock_source":"env"},"event":"vault_unlocked","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"file_mtime":"2026-05-08T10:00:00Z","fingerprint_params":"argon2id$v=19$m=65536,t=3,p=1","fingerprint_salt":"01234567-89ab-cdef-0123-456789abcdef","unlock_source":"env"},"event":"vault_unlocked","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"pending_discarded_count":0,"reason":"idle_timeout"},"event":"vault_locked","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"error_code":"AUTH_FAILED","source":"cmd"},"event":"auth_failed","level":"error","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"field_name":"Password","target_path":"/Web/GitHub","target_uuid":"abcd","tool":"kdbx_update_field"},"event":"write_staged","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
@@ -641,9 +668,9 @@ mod tests {
         r#"{"details":{"after_mtime":"2026-05-08T10:01:00Z","before_mtime":"2026-05-08T10:00:00Z","num_changes":1},"event":"save_committed","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"before_mtime":"2026-05-08T10:00:00Z","conflict_mtime":"2026-05-08T10:00:30Z","pending_changes":1},"event":"save_refused","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"error_message":"disk full","failure_step":"rename","pending_changes":1},"event":"save_failed","level":"error","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
-        r#"{"details":{"sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_password","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
-        r#"{"details":{"field_name":"RecoveryKey","sha256":"deadbeef","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_protected","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
-        r#"{"details":{"attachment_name":"key.pem","sha256":"deadbeef","size_bytes":2048,"target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"download_attachment","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"fingerprint":"abababababababababababababababababababababababababababababababab","fingerprint_domain":"kdbx-core/field/v1","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_password","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"field_name":"RecoveryKey","fingerprint":"abababababababababababababababababababababababababababababababab","fingerprint_domain":"kdbx-core/field/v1","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_protected","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"details":{"attachment_name":"key.pem","fingerprint":"abababababababababababababababababababababababababababababababab","fingerprint_domain":"kdbx-core/attachment/v1","size_bytes":2048,"target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"download_attachment","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"requested_time_unix":null,"target_path":"/Web/GitHub","target_uuid":"abcd","time_unix":1700000000},"event":"get_otp","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"reason":"not_kdbx","unlock_source":"input"},"event":"unlock_failed","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
         r#"{"details":{"reason":"no_locks"},"event":"writer_lock_unavailable","level":"warn","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
@@ -739,11 +766,13 @@ mod tests {
             target_path: Some("/Web/X".to_string()),
             target_uuid: "uuid-2".to_string(),
             field_name: "Secret".to_string(),
-            sha256: "abc123".to_string(),
+            fingerprint: fixed(Domain::Field),
         };
         let d = reveal.details_json();
         assert_eq!(d["field_name"], json!("Secret"));
-        assert_eq!(d["sha256"], json!("abc123"));
+        assert_eq!(d["fingerprint"], json!(FIXED_HEX));
+        assert_eq!(d["fingerprint_domain"], json!(Domain::Field.label()));
+        assert!(d.get("sha256").is_none(), "the unkeyed sha256 is gone");
 
         let otp = AuditEvent::GetOtp {
             target_path: Some("/Web/X".to_string()),
@@ -758,69 +787,6 @@ mod tests {
         assert_eq!(d["requested_time_unix"], json!(0));
         assert_eq!(d["time_unix"], json!(1_699_999_970));
         assert_eq!(d.as_object().unwrap().len(), 4);
-    }
-
-    #[test]
-    fn hash_revealed_matches_handcomputed_sha256() {
-        // Compute the expected digest directly over the domain prefix bytes
-        // plus the value, so the test does not depend on the function under
-        // test for its own expectation.
-        let value = "hunter2";
-        let mut hasher = Sha256::new();
-        hasher.update(b"kdbx-reveal-v1\0");
-        hasher.update(value.as_bytes());
-        let expected: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-
-        assert_eq!(hash_revealed(value), expected);
-        // sha256 hex is 64 lowercase chars.
-        assert_eq!(hash_revealed(value).len(), 64);
-        assert!(
-            hash_revealed(value)
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
-    }
-
-    #[test]
-    fn hash_revealed_pinned_vector_for_empty_string() {
-        // Pinned vector: sha256 of exactly the 15 prefix bytes "kdbx-reveal-v1\0"
-        // with an empty value. Guards the prefix byte-for-byte, including the
-        // single trailing NUL.
-        let mut hasher = Sha256::new();
-        hasher.update(b"kdbx-reveal-v1\0");
-        let expected: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_eq!(hash_revealed(""), expected);
-    }
-
-    #[test]
-    fn hash_domain_prefix_includes_single_nul() {
-        // The constant is exactly the ascii text plus one NUL byte: 15 bytes.
-        assert_eq!(REVEAL_DOMAIN_PREFIX, b"kdbx-reveal-v1\0");
-        assert_eq!(REVEAL_DOMAIN_PREFIX.len(), 15);
-        assert_eq!(REVEAL_DOMAIN_PREFIX[14], 0u8);
-    }
-
-    #[test]
-    fn hash_differs_from_undomained_sha256() {
-        // A plain sha256 of the value (no domain prefix) must not match, which
-        // confirms the prefix is actually mixed in.
-        let value = "hunter2";
-        let mut plain = Sha256::new();
-        plain.update(value.as_bytes());
-        let plain_hex: String = plain
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_ne!(hash_revealed(value), plain_hex);
     }
 
     #[test]

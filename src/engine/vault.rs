@@ -21,10 +21,12 @@
 //! which is what discards the pending stage: there is no separate stage data
 //! structure to clear.
 
+use crate::engine::audit::KeyedFingerprint;
 use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 use crate::engine::vault_file::{FileFingerprint, read_with_fingerprint};
-use crate::engine::view::{View, ephemeral_key};
-use kdbx_core::fingerprint::FingerprintKey;
+use crate::engine::view::View;
+use kdbx_core::capture::keepass_0_12::header;
+use kdbx_core::fingerprint::{DeriveParams, Domain, FingerprintKey, KeyMaterial};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
@@ -87,6 +89,13 @@ pub enum UnreadableReason {
     Truncated,
     /// The outer header does not parse or fails its sha256 integrity check.
     CorruptHeader,
+    /// The vault opened, but its key-derivation parameters cannot be used to
+    /// derive the audit fingerprint key (Argon2 rejected them, or their
+    /// memory cost could not be allocated). The fingerprint key never costs
+    /// less than the vault's own KDF, so there is no cheaper fallback, and
+    /// without a key no reveal could be audited: the unlock fails closed.
+    /// Unlike the other reasons, this one is found after the key was checked.
+    KdfParametersUnsupported,
 }
 
 /// Classify a keepass open failure. Errors raised while reading the version
@@ -118,6 +127,41 @@ fn open_error(e: &keepass::error::DatabaseOpenError) -> CoreError {
             .with_details(serde_json::json!({ "reason": reason })),
         None => CoreError::new(ErrorCode::AuthFailed),
     }
+}
+
+/// Derive this session's audit fingerprint key from the key material that
+/// just opened `db`: `FingerprintKey::derive` (Argon2id) over the password
+/// bytes and the raw key file bytes, salted with the root group UUID, with
+/// `DeriveParams::for_header` (the vault's own Argon2 parameters when they
+/// cost at least the 64 MiB x 3 floor, else the floor). The result is stable
+/// across processes, so a logged fingerprint can be verified later
+/// (`diff-kdbx fingerprint --params .. --salt ..`), and breaking it costs at
+/// least as much as attacking the vault itself.
+///
+/// The password is always part of the material, as it is of the keepass key
+/// mcp-kdbx opens the vault with (an empty password is an empty string, not
+/// an absent one).
+///
+/// Runs the KDF, so callers run it off the async worker, as they do the
+/// unlock it belongs to.
+fn derive_audit_key(
+    db: &keepass::Database,
+    password: &str,
+    keyfile: Option<&[u8]>,
+) -> CoreResult<(FingerprintKey, DeriveParams, uuid::Uuid)> {
+    let params = DeriveParams::for_header(Some(&header(db)));
+    let salt = db.root().id().uuid();
+    let material = KeyMaterial::new(Some(password.as_bytes()), keyfile);
+    let key = FingerprintKey::derive(&material, salt, &params).map_err(|e| {
+        CoreError::new(ErrorCode::VaultUnreadable)
+            .with_message(format!(
+                "the vault opened, but its KDF parameters cannot derive the audit key: {e}"
+            ))
+            .with_details(
+                serde_json::json!({ "reason": UnreadableReason::KdfParametersUnsupported }),
+            )
+    })?;
+    Ok((key, params, salt))
 }
 
 /// The two states a vault can be in.
@@ -155,9 +199,16 @@ pub enum VaultState {
         /// the last save) plus the mtime seen on that handle. The save path
         /// re-reads the file and refuses when the content differs.
         file_baseline: FileFingerprint,
-        /// The key this session's snapshots are sealed under. Zeroized on
-        /// drop, so locking (which drops this state) wipes it.
+        /// This session's audit fingerprint key, derived at unlock from the
+        /// master key material (see [`derive_audit_key`]). Audit events and
+        /// the cached [`View`] fingerprint under it. Zeroized on drop, so
+        /// locking (which drops this state) wipes it.
         fingerprint_key: FingerprintKey,
+        /// The parameters `fingerprint_key` was derived with, recorded in the
+        /// `vault_unlocked` audit event so a verifier can reproduce it.
+        fingerprint_params: DeriveParams,
+        /// The salt `fingerprint_key` was derived with: the root group UUID.
+        fingerprint_salt: uuid::Uuid,
         /// The cached [`View`] of `working_db`, captured on first use and
         /// dropped by every path that can change the working db
         /// ([`Vault::working_db_mut`], a discard, a save). A lock drops it
@@ -248,6 +299,9 @@ impl Vault {
         let canonical_db = keepass::Database::open(&mut std::io::Cursor::new(&bytes), key.clone())
             .map_err(|e| open_error(&e))?;
 
+        let (fingerprint_key, fingerprint_params, fingerprint_salt) =
+            derive_audit_key(&canonical_db, password, keyfile)?;
+
         let working_db = canonical_db.clone();
 
         self.state = VaultState::Unlocked {
@@ -256,7 +310,9 @@ impl Vault {
             key,
             last_activity: Instant::now(),
             file_baseline,
-            fingerprint_key: ephemeral_key(),
+            fingerprint_key,
+            fingerprint_params,
+            fingerprint_salt,
             view: OnceLock::new(),
         };
 
@@ -386,6 +442,38 @@ impl Vault {
                 view,
                 ..
             } => Ok(view.get_or_init(|| View::capture(working_db, fingerprint_key))),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// The keyed fingerprint of `bytes` in `domain` under this session's audit
+    /// key, for audit events and attachment listings. The key itself never
+    /// leaves the vault.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn fingerprint(&self, domain: Domain, bytes: &[u8]) -> CoreResult<KeyedFingerprint> {
+        match &self.state {
+            VaultState::Unlocked {
+                fingerprint_key, ..
+            } => Ok(KeyedFingerprint {
+                domain,
+                fingerprint: fingerprint_key.fingerprint(domain, bytes),
+            }),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// The derivation parameters and salt of this session's audit key, for
+    /// the `vault_unlocked` event.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn fingerprint_derivation(&self) -> CoreResult<(DeriveParams, uuid::Uuid)> {
+        match &self.state {
+            VaultState::Unlocked {
+                fingerprint_params,
+                fingerprint_salt,
+                ..
+            } => Ok((*fingerprint_params, *fingerprint_salt)),
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
         }
     }
@@ -957,6 +1045,70 @@ mod tests {
         let view = vault.view().unwrap();
         let entry = view.snapshot().entries().next().unwrap();
         assert!(entry.field("Password").unwrap().value.is_sealed());
+    }
+
+    #[test]
+    fn unlock_derives_a_reproducible_audit_key_and_lock_drops_it() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        assert_eq!(
+            vault
+                .fingerprint(Domain::Field, b"x")
+                .unwrap_err()
+                .code_enum(),
+            ErrorCode::VaultLocked
+        );
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        let (params, salt) = vault.fingerprint_derivation().unwrap();
+        // The fixture's KDF is cheaper than the floor, so the floor applies.
+        assert_eq!(params, DeriveParams::FLOOR);
+        assert_eq!(salt, vault.working_db().unwrap().root().id().uuid());
+
+        // A verifier with the password, the params and the salt rebuilds the
+        // same key (what `diff-kdbx fingerprint` does).
+        let verifier = FingerprintKey::derive(
+            &KeyMaterial::new(Some(TEST_PASSWORD.as_bytes()), None),
+            salt,
+            &params,
+        )
+        .unwrap();
+        let logged = vault.fingerprint(Domain::Field, b"hunter2").unwrap();
+        assert_eq!(logged.domain, Domain::Field);
+        assert_eq!(
+            logged.fingerprint,
+            verifier.fingerprint(Domain::Field, b"hunter2")
+        );
+        // Domains separate: the same bytes as an attachment differ.
+        assert_ne!(
+            vault
+                .fingerprint(Domain::Attachment, b"hunter2")
+                .unwrap()
+                .fingerprint,
+            logged.fingerprint
+        );
+        // The cached view seals under the same key.
+        let view = vault.view().unwrap();
+        let entry = view.snapshot().entries().next().unwrap();
+        assert_eq!(
+            entry.field("Password").unwrap().value,
+            kdbx_core::model::Value::Sealed(logged.fingerprint)
+        );
+
+        vault.lock(LockReason::Manual);
+        assert_eq!(
+            vault.fingerprint_derivation().unwrap_err().code_enum(),
+            ErrorCode::VaultLocked
+        );
+    }
+
+    #[test]
+    fn unreadable_reason_wire_names_are_stable() {
+        let name = |r| serde_json::to_value(r).unwrap();
+        assert_eq!(name(UnreadableReason::NotKdbx), "not_kdbx");
+        assert_eq!(
+            name(UnreadableReason::KdfParametersUnsupported),
+            "kdf_parameters_unsupported"
+        );
     }
 
     #[test]

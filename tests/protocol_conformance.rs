@@ -334,7 +334,18 @@ fn list_attachments_happy_path() {
     assert_eq!(attachments.len(), 1);
     assert_eq!(attachments[0]["name"], json!("notes.txt"));
     assert_eq!(attachments[0]["size_bytes"], json!("meeting notes\n".len()));
-    assert!(attachments[0]["sha256"].as_str().unwrap().len() == 64);
+    // A keyed fingerprint (the session's audit key), not a plain sha256: a
+    // plain digest of a small file would be a lookup oracle.
+    assert!(attachments[0].get("sha256").is_none());
+    let listed = attachments[0]["fingerprint"].as_str().unwrap().to_string();
+    assert_eq!(listed.len(), 64);
+    // The download reports the same fingerprint for the same bytes.
+    let downloaded = server.call_ok(
+        "kdbx_download_attachment",
+        json!({ "entry_path": "/Document A", "name": "notes.txt" }),
+    );
+    assert_eq!(downloaded["fingerprint"], json!(listed));
+    assert!(downloaded.get("sha256").is_none());
 }
 
 #[test]
