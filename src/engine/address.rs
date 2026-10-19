@@ -15,6 +15,7 @@
 
 use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 use crate::engine::view::{View, entry_id, group_id};
+use kdbx_core::model::{Entry, Group};
 use kdbx_core::path::{PathError, ResolveError, VaultPath};
 use keepass::Database;
 use keepass::db::{EntryId, GroupId};
@@ -102,6 +103,13 @@ fn not_found(path: &VaultPath, e: &ResolveError) -> CoreError {
     }
 }
 
+/// The not-found error for a record UUID that names no `kind` record.
+fn unknown_uuid(code: ErrorCode, kind: &str, uuid: Uuid) -> CoreError {
+    CoreError::new(code)
+        .with_message(format!("no {kind} has that uuid"))
+        .with_details(serde_json::json!({ "uuid": uuid.to_string() }))
+}
+
 /// A parsed entry address: a vault path or a record UUID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryAddress {
@@ -128,27 +136,31 @@ impl EntryAddress {
         }
     }
 
-    /// Resolve the address against `view` (a capture of `db`) to the live
-    /// entry id in `db`.
+    /// Resolve the address against `view` to the snapshot entry it names,
+    /// for the read views.
     ///
     /// A path resolves through kdbx-core's `VaultPath::resolve_entry` (a
     /// group-shaped path never names an entry). A UUID matches the entry with
     /// that record UUID (history snapshots are not entries). No match is
     /// `ENTRY_NOT_FOUND`.
+    pub fn resolve_in<'v>(&self, view: &'v View) -> CoreResult<&'v Entry> {
+        match self {
+            EntryAddress::Path(path) => path
+                .resolve_entry(view.snapshot())
+                .map_err(|e| not_found(path, &e)),
+            EntryAddress::Uuid(uuid) => view
+                .snapshot()
+                .find_entry(*uuid)
+                .ok_or_else(|| unknown_uuid(ErrorCode::EntryNotFound, "entry", *uuid)),
+        }
+    }
+
+    /// Resolve the address against `view` (a capture of `db`) to the live
+    /// entry id in `db`, for the tools that read or write the live record
+    /// (reveals, writes). Same rules as [`resolve_in`](Self::resolve_in).
     pub fn resolve(&self, db: &Database, view: &View) -> CoreResult<EntryId> {
-        let uuid = match self {
-            EntryAddress::Path(path) => {
-                path.resolve_entry(view.snapshot())
-                    .map_err(|e| not_found(path, &e))?
-                    .uuid
-            }
-            EntryAddress::Uuid(uuid) => *uuid,
-        };
-        entry_id(db, uuid).ok_or_else(|| {
-            CoreError::new(ErrorCode::EntryNotFound)
-                .with_message("no entry has that uuid")
-                .with_details(serde_json::json!({ "uuid": uuid.to_string() }))
-        })
+        let uuid = self.resolve_in(view)?.uuid;
+        entry_id(db, uuid).ok_or_else(|| unknown_uuid(ErrorCode::EntryNotFound, "entry", uuid))
     }
 }
 
@@ -184,25 +196,29 @@ impl GroupAddress {
         GroupAddress::Path(VaultPath::root())
     }
 
-    /// Resolve the address against `view` (a capture of `db`) to the live
-    /// group id in `db`. A path resolves through kdbx-core's
+    /// Resolve the address against `view` to the snapshot group it names,
+    /// for the read views. A path resolves through kdbx-core's
     /// `VaultPath::resolve_group`, which reads every segment as a group (so
     /// `/Web` and `/Web/` name the same group); a UUID matches any group,
     /// including the root. No match is `GROUP_NOT_FOUND`.
+    pub fn resolve_in<'v>(&self, view: &'v View) -> CoreResult<&'v Group> {
+        match self {
+            GroupAddress::Path(path) => path
+                .resolve_group(view.snapshot())
+                .map_err(|e| not_found(path, &e)),
+            GroupAddress::Uuid(uuid) => view
+                .snapshot()
+                .find_group(*uuid)
+                .ok_or_else(|| unknown_uuid(ErrorCode::GroupNotFound, "group", *uuid)),
+        }
+    }
+
+    /// Resolve the address against `view` (a capture of `db`) to the live
+    /// group id in `db`, for the write tools. Same rules as
+    /// [`resolve_in`](Self::resolve_in).
     pub fn resolve(&self, db: &Database, view: &View) -> CoreResult<GroupId> {
-        let uuid = match self {
-            GroupAddress::Path(path) => {
-                path.resolve_group(view.snapshot())
-                    .map_err(|e| not_found(path, &e))?
-                    .uuid
-            }
-            GroupAddress::Uuid(uuid) => *uuid,
-        };
-        group_id(db, uuid).ok_or_else(|| {
-            CoreError::new(ErrorCode::GroupNotFound)
-                .with_message("no group has that uuid")
-                .with_details(serde_json::json!({ "uuid": uuid.to_string() }))
-        })
+        let uuid = self.resolve_in(view)?.uuid;
+        group_id(db, uuid).ok_or_else(|| unknown_uuid(ErrorCode::GroupNotFound, "group", uuid))
     }
 }
 

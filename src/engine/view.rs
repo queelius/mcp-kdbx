@@ -5,9 +5,15 @@
 //! [`Snapshot`](kdbx_core::model::Snapshot), not on a live
 //! `keepass::Database`. A `View` is that snapshot, captured from a database
 //! under fingerprint sealing (no secret value is copied into it), together
-//! with a [`PathIndex`] of every node, computed in one pass. Paths are
-//! resolved against the snapshot to a record UUID, which [`entry_id`] and
-//! [`group_id`] then map back to the live keepass record.
+//! with a [`PathIndex`] of every node, computed in one pass, and the set of
+//! entries whose TOTP configuration resolves (computed from the live entries
+//! at capture, since the snapshot seals the OTP secret). Paths are resolved
+//! against the snapshot to a record UUID, which [`entry_id`] and [`group_id`]
+//! then map back to the live keepass record.
+//!
+//! The read views are built from a `View` alone, so they cannot emit a
+//! secret by construction: the snapshot has none to give. Only the reveal
+//! tools read the live database.
 //!
 //! The vault caches one `View` of its working database per generation (see
 //! `Vault::view`): any mutable access to the working db, a discard, a save,
@@ -19,6 +25,7 @@ use kdbx_core::model::{Sealing, Snapshot};
 use kdbx_core::path::{PathIndex, VaultPath};
 use keepass::Database;
 use keepass::db::{EntryId, GroupId};
+use std::collections::HashSet;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -27,6 +34,7 @@ use zeroize::Zeroize;
 pub struct View {
     snapshot: Snapshot,
     paths: PathIndex,
+    with_otp: HashSet<Uuid>,
 }
 
 impl View {
@@ -34,7 +42,16 @@ impl View {
     pub fn capture(db: &Database, key: &FingerprintKey) -> View {
         let snapshot = capture(db, &Sealing::Fingerprint(key));
         let paths = PathIndex::new(&snapshot);
-        View { snapshot, paths }
+        let with_otp = db
+            .iter_all_entries()
+            .filter(|entry| crate::engine::otp::has_otp(entry))
+            .map(|entry| entry.id().uuid())
+            .collect();
+        View {
+            snapshot,
+            paths,
+            with_otp,
+        }
     }
 
     /// Capture `db` with a fresh [`ephemeral_key`], for a caller that needs
@@ -58,6 +75,12 @@ impl View {
     /// [`path`](Self::path) in its canonical string form.
     pub fn path_string(&self, uuid: Uuid) -> Option<String> {
         self.path(uuid).map(VaultPath::format)
+    }
+
+    /// Whether the entry `uuid` has a usable TOTP configuration (the
+    /// `has_otp` flag: true exactly when `kdbx_get_otp` would produce a code).
+    pub fn has_otp(&self, uuid: Uuid) -> bool {
+        self.with_otp.contains(&uuid)
     }
 
     /// The canonical path of the group that holds node `uuid`, as a string.

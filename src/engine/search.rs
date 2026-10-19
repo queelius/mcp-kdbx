@@ -25,8 +25,8 @@
 
 use crate::engine::view::View;
 use kdbx_core::fields::StandardField;
+use kdbx_core::model::Entry;
 use kdbx_core::visibility::metadata_value;
-use uuid::Uuid;
 
 /// One field of an entry that a search may look at.
 ///
@@ -65,13 +65,13 @@ const DEFAULT_FIELDS: &[Field] = &[Field::Title, Field::Username, Field::Url];
 /// [`SearchResults::truncated`] is set.
 const MAX_RESULTS: usize = 100;
 
-/// One entry that matched the query: its record UUID (which the adapter maps
-/// back to the live entry), its title, and the canonical path of the group
+/// One entry that matched the query: the snapshot entry itself (the read
+/// views render it directly), its title, and the canonical path of the group
 /// that holds it (`None` when that group has no addressable path).
 #[derive(Debug, Clone)]
-pub struct SearchMatch {
-    /// The entry's record UUID.
-    pub uuid: Uuid,
+pub struct SearchMatch<'v> {
+    /// The matching entry, in the view's snapshot.
+    pub entry: &'v Entry,
     /// The entry title, or the empty string when it has none.
     pub title: String,
     /// The canonical path of the containing group, like `/Web/Banking/`.
@@ -81,10 +81,10 @@ pub struct SearchMatch {
 /// The result of a search: the (capped, sorted) matches, how many entries
 /// matched in total, and whether the returned list was cut short.
 #[derive(Debug, Clone)]
-pub struct SearchResults {
+pub struct SearchResults<'v> {
     /// The matches, stable-sorted by `(group_path, title)` and capped at
     /// [`MAX_RESULTS`].
-    pub entries: Vec<SearchMatch>,
+    pub entries: Vec<SearchMatch<'v>>,
     /// How many entries matched across the whole database, before the cap.
     pub matched_count: usize,
     /// True when more than [`MAX_RESULTS`] entries matched, so `entries` holds
@@ -100,7 +100,7 @@ pub struct SearchResults {
 /// case-insensitive. Matches are stable-sorted by `(group_path, title)` (the
 /// group path from the view's path index) and capped at 100, with `truncated`
 /// set when more matched.
-pub fn find_entry(view: &View, query: &str, fields: &[Field]) -> SearchResults {
+pub fn find_entry<'v>(view: &'v View, query: &str, fields: &[Field]) -> SearchResults<'v> {
     let active_fields: &[Field] = if fields.is_empty() {
         DEFAULT_FIELDS
     } else {
@@ -118,7 +118,7 @@ pub fn find_entry(view: &View, query: &str, fields: &[Field]) -> SearchResults {
             })
         })
         .map(|entry| SearchMatch {
-            uuid: entry.uuid,
+            entry,
             title: entry.title().unwrap_or("").to_string(),
             group_path: view.parent_path_string(entry.uuid),
         })
@@ -181,8 +181,34 @@ mod tests {
     }
 
     /// Search `db` through a fresh view, as the adapter searches the vault's.
-    fn find_entry(db: &Database, query: &str, fields: &[Field]) -> SearchResults {
-        super::find_entry(&View::capture_ephemeral(db), query, fields)
+    /// Owned results (titles and group paths), since the view is temporary.
+    fn find_entry(db: &Database, query: &str, fields: &[Field]) -> Found {
+        let view = View::capture_ephemeral(db);
+        let results = super::find_entry(&view, query, fields);
+        Found {
+            entries: results
+                .entries
+                .iter()
+                .map(|m| Hit {
+                    title: m.title.clone(),
+                    group_path: m.group_path.clone(),
+                })
+                .collect(),
+            matched_count: results.matched_count,
+            truncated: results.truncated,
+        }
+    }
+
+    /// [`SearchResults`] without the borrowed entries.
+    struct Found {
+        entries: Vec<Hit>,
+        matched_count: usize,
+        truncated: bool,
+    }
+
+    struct Hit {
+        title: String,
+        group_path: Option<String>,
     }
 
     /// A field to set on a seeded entry: (keepass field name, value).

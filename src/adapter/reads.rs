@@ -4,16 +4,15 @@
 //! These five tools are the bulk-read surface. Each requires an unlocked vault
 //! and returns metadata only: no protected value, no attachment bytes, and no
 //! OTP code (revealing those is a separate, consent-gated tool group). The
-//! shapes come straight from the view builders in [`crate::adapter::views`],
-//! which the spec section 1 defines. Reads are not in the spec's logged-events
+//! shapes (spec section 1) come straight from the view builders in
+//! [`crate::adapter::views`], which read only the vault's cached snapshot,
+//! never the live database. Reads are not in the spec's logged-events
 //! table, so these tools emit no audit events; they still count as activity
 //! because every call goes through [`KdbxServer::vault`].
 
-use crate::adapter::{KdbxServer, locate_entry, responses, views};
-use crate::engine::address::GroupAddress;
-use crate::engine::error::ErrorCode;
+use crate::adapter::{KdbxServer, responses, views};
+use crate::engine::address::{EntryAddress, GroupAddress};
 use crate::engine::search::{self, Field};
-use crate::engine::view::entry_id;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
 
@@ -93,8 +92,8 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let (db, view) = match vault.working_db_and_view() {
-            Ok(pair) => pair,
+        let view = match vault.view() {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
         // With neither parent_path nor uuid, list the root group's children.
@@ -104,19 +103,14 @@ impl KdbxServer {
                 GroupAddress::from_parts(path.as_deref(), uuid.as_deref(), "parent_path", "uuid")
             }
         };
-        let parent_id = match parent.and_then(|p| p.resolve(db, view)) {
-            Ok(id) => id,
+        let parent = match parent.and_then(|p| p.resolve_in(view)) {
+            Ok(group) => group,
             Err(e) => return responses::err(&e),
         };
-        // db.group returns None only if the id vanished; resolve_group just gave
-        // it to us, so an empty child list is the worst case.
-        let child_ids: Vec<_> = match db.group(parent_id) {
-            Some(group) => group.group_ids().collect(),
-            None => Vec::new(),
-        };
-        let groups: Vec<_> = child_ids
-            .into_iter()
-            .filter_map(|id| views::group_summary(db, view, id))
+        let groups: Vec<_> = parent
+            .groups
+            .iter()
+            .map(|group| views::group_summary(view, group))
             .collect();
         responses::ok(serde_json::json!({ "groups": groups }))
     }
@@ -130,33 +124,30 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let (db, view) = match vault.working_db_and_view() {
-            Ok(pair) => pair,
+        let view = match vault.view() {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
-        let group_id = match GroupAddress::from_parts(
+        let group = match GroupAddress::from_parts(
             params.group_path.as_deref(),
             params.uuid.as_deref(),
             "group_path",
             "uuid",
         )
-        .and_then(|g| g.resolve(db, view))
+        .and_then(|g| g.resolve_in(view))
         {
-            Ok(id) => id,
+            Ok(group) => group,
             Err(e) => return responses::err(&e),
         };
-        let entry_ids: Vec<_> = match db.group(group_id) {
-            Some(group) => group.entry_ids().collect(),
-            None => Vec::new(),
-        };
-        let entries: Vec<_> = entry_ids
-            .into_iter()
-            .filter_map(|id| views::entry_summary(db, view, id))
+        let entries: Vec<_> = group
+            .entries
+            .iter()
+            .map(|entry| views::entry_summary(view, entry))
             .collect();
         responses::ok(serde_json::json!({ "entries": entries }))
     }
 
-    /// Read: list the attachments of an entry (names, sizes, content hashes).
+    /// Read: list the attachments of an entry (names, sizes, fingerprints).
     #[tool(
         description = "List the attachments of an entry. Provide entry_path. Returns each attachment's name, size in bytes, and a fingerprint of its content keyed per session (equal to what kdbx_download_attachment returns for the same bytes until the next unlock; not stable across unlocks). No attachment bytes: downloading bytes is a separate consent-gated tool."
     )]
@@ -168,25 +159,20 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let (db, view) = match vault.working_db_and_view() {
-            Ok(pair) => pair,
+        let view = match vault.view() {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
-        let entry_id = match locate_entry(
-            db,
-            view,
+        match EntryAddress::from_parts(
             params.entry_path.as_deref(),
             params.uuid.as_deref(),
             "entry_path",
-        ) {
-            Ok(e) => e.id(),
-            Err(e) => return responses::err(&e),
-        };
-        // attachment_list returns the full { attachments: [...] } object, which
-        // is exactly the data payload. None means the id stopped resolving.
-        match views::attachment_list(view, entry_id) {
-            Some(data) => responses::ok(data),
-            None => responses::err(&ErrorCode::EntryNotFound.into()),
+        )
+        .and_then(|address| address.resolve_in(view))
+        {
+            // The full { attachments: [...] } object is the data payload.
+            Ok(entry) => responses::ok(views::attachment_list(entry)),
+            Err(e) => responses::err(&e),
         }
     }
 
@@ -199,23 +185,15 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let (db, view) = match vault.working_db_and_view() {
-            Ok(pair) => pair,
+        let view = match vault.view() {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
-        let entry_id = match locate_entry(
-            db,
-            view,
-            params.path.as_deref(),
-            params.uuid.as_deref(),
-            "path",
-        ) {
-            Ok(e) => e.id(),
-            Err(e) => return responses::err(&e),
-        };
-        match views::entry_detail(db, view, entry_id) {
-            Some(data) => responses::ok(data),
-            None => responses::err(&ErrorCode::EntryNotFound.into()),
+        match EntryAddress::from_parts(params.path.as_deref(), params.uuid.as_deref(), "path")
+            .and_then(|address| address.resolve_in(view))
+        {
+            Ok(entry) => responses::ok(views::entry_detail(view, entry)),
+            Err(e) => responses::err(&e),
         }
     }
 
@@ -229,8 +207,8 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let (db, view) = match vault.working_db_and_view() {
-            Ok(pair) => pair,
+        let view = match vault.view() {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
         // The fields arrive as typed Field values (serde rejected anything
@@ -242,8 +220,7 @@ impl KdbxServer {
         let entries: Vec<_> = results
             .entries
             .iter()
-            .filter_map(|m| entry_id(db, m.uuid))
-            .filter_map(|id| views::entry_summary(db, view, id))
+            .map(|m| views::entry_summary(view, m.entry))
             .collect();
         responses::ok(serde_json::json!({
             "entries": entries,

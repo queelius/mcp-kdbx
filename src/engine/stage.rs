@@ -577,7 +577,7 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
         };
         match &node.status {
             NodeStatus::Added => {
-                if let Some(entry) = map_added_entry(working, &after, node.uuid) {
+                if let Some(entry) = map_added_entry(&after, node.uuid) {
                     added.push(entry);
                 }
             }
@@ -621,32 +621,21 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
     }
 }
 
-/// Build an [`AddedEntry`] for the entry `uuid` of the working db, whose
-/// [`View`] is `after`.
-fn map_added_entry(working: &Database, after: &View, uuid: uuid::Uuid) -> Option<AddedEntry> {
-    let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
-
-    // Both paths are None for a record with no addressable path. There is no
-    // fallback string: a placeholder like "/" would alias the root group.
-    let path = after.path_string(uuid);
-    let group_path = after.parent_path_string(uuid);
-
-    let title = entry_ref.get_title().unwrap_or("").to_string();
-    let field_count = entry_ref.fields.len();
-    let has_attachments = entry_ref.attachments_named().next().is_some();
-    // Route has_otp through the same resolver the read views use
-    // (src/adapter/views.rs), so kdbx_diff_pending and kdbx_list_entries agree on
-    // whether an entry has a usable TOTP source.
-    let has_otp = crate::engine::otp::has_otp(&entry_ref);
-
+/// Build an [`AddedEntry`] for the entry `uuid` from the working db's
+/// [`View`], `after` (the same source the read views use, so the two agree on
+/// paths and on `has_otp`).
+fn map_added_entry(after: &View, uuid: uuid::Uuid) -> Option<AddedEntry> {
+    let entry = after.snapshot().find_entry(uuid)?;
     Some(AddedEntry {
-        path,
+        // Both paths are None for a record with no addressable path. There is
+        // no fallback string: a placeholder like "/" would alias the root.
+        path: after.path_string(uuid),
         uuid: uuid.hyphenated().to_string(),
-        title,
-        group_path,
-        field_count,
-        has_attachments,
-        has_otp,
+        title: entry.title().unwrap_or("").to_string(),
+        group_path: after.parent_path_string(uuid),
+        field_count: entry.fields.len(),
+        has_attachments: !entry.attachments.is_empty(),
+        has_otp: after.has_otp(uuid),
     })
 }
 
