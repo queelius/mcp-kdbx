@@ -25,7 +25,6 @@
 //! values only when both sides are plain, so no protected plaintext is ever
 //! held, let alone emitted, by the diff.
 
-use crate::engine::address::{EntryAddress, GroupAddress};
 use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 use crate::engine::secret::Secret;
 use crate::engine::vault::Vault;
@@ -39,7 +38,7 @@ use kdbx_core::fields::StandardField;
 use kdbx_core::model::Value as SnapValue;
 use kdbx_core::visibility::is_address;
 use keepass::Database;
-use keepass::db::{EntryId, Value};
+use keepass::db::{EntryId, GroupId, Value};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -311,11 +310,62 @@ fn validate_field_write(name: &str, value: &str) -> CoreResult<()> {
 // Write operations.
 // ---------------------------------------------------------------------------
 
-/// Stage a new entry under the group named by `group_path`.
+impl EntryInput {
+    /// Validate the input for [`add_entry`]: the title, and every field name
+    /// and value (a Title key in the fields map is refused, since the title
+    /// parameter is the one way to set it). Callers validate before they
+    /// resolve the target group, so an invalid input is reported as such even
+    /// when the group is also wrong.
+    pub fn validate(self) -> CoreResult<ValidEntryInput> {
+        validate_title(&self.title)?;
+        for f in &self.fields {
+            // A Title key in the fields map would silently override the
+            // title parameter.
+            if is_address(&f.name) {
+                return Err(CoreError::new(ErrorCode::FieldNameInvalid)
+                    .with_message("set the title with the title parameter, not in fields")
+                    .with_details(serde_json::json!({ "name": f.name })));
+            }
+            validate_field_write(&f.name, f.value.expose())?;
+        }
+        Ok(ValidEntryInput(self))
+    }
+}
+
+/// An [`EntryInput`] that passed [`EntryInput::validate`]; the only input
+/// [`add_entry`] accepts.
+#[derive(Debug, Clone)]
+pub struct ValidEntryInput(EntryInput);
+
+/// One validated field write for [`update_field`]: the name passed
+/// `validate_field_name`, and a Title value passed `validate_title`.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldWrite<'a> {
+    name: &'a str,
+    value: &'a str,
+    protected: Option<bool>,
+}
+
+impl<'a> FieldWrite<'a> {
+    /// Validate a write of `value` to field `name`. `protected = None` keeps
+    /// an existing field's protection (unprotected for a new field);
+    /// `Some(b)` forces it.
+    pub fn new(name: &'a str, value: &'a str, protected: Option<bool>) -> CoreResult<Self> {
+        validate_field_write(name, value)?;
+        Ok(FieldWrite {
+            name,
+            value,
+            protected,
+        })
+    }
+}
+
+/// Stage a new entry in the group `group_id` of `working`.
 ///
-/// Resolves the group in `working` (propagates `GROUP_NOT_FOUND`), validates
-/// the title and every field name, then creates the entry: sets Title, then
-/// each field (protected or not), then links each attachment under its name.
+/// The caller resolves the group (from the vault's cached view, so a write
+/// never captures a snapshot of its own) after validating the input. Creates
+/// the entry: sets Title, then each field (protected or not), then links each
+/// attachment under its name.
 /// Returns the new entry's id.
 ///
 /// keepass stamps a new entry's creation, modification, and access times with
@@ -324,22 +374,10 @@ fn validate_field_write(name: &str, value: &str) -> CoreResult<()> {
 /// be noise.
 pub fn add_entry(
     working: &mut Database,
-    group: &GroupAddress,
-    input: &EntryInput,
+    group_id: GroupId,
+    input: &ValidEntryInput,
 ) -> CoreResult<EntryId> {
-    validate_title(&input.title)?;
-    for f in &input.fields {
-        // The title parameter is the one way to set Title on a new entry; a
-        // Title key in the fields map would silently override it.
-        if is_address(&f.name) {
-            return Err(CoreError::new(ErrorCode::FieldNameInvalid)
-                .with_message("set the title with the title parameter, not in fields")
-                .with_details(serde_json::json!({ "name": f.name })));
-        }
-        validate_field_write(&f.name, f.value.expose())?;
-    }
-
-    let group_id = group.resolve(working, &View::capture_ephemeral(working))?;
+    let ValidEntryInput(input) = input;
 
     // Clone the inputs the closure needs. The edit closure is FnOnce and the
     // keepass write API takes owned values, so we move owned copies in.
@@ -385,8 +423,9 @@ pub fn add_entry(
     Ok(new_id)
 }
 
-/// Update or set a single field on the entry named by `target` (a vault path or
-/// a record UUID). Returns the entry's id.
+/// Apply the validated field write `write` to the entry `entry_id` of
+/// `working` (resolved by the caller from the vault's cached view, after
+/// validating the write). Returns the entry's id.
 ///
 /// `protected = None` preserves an existing field's protection state (and
 /// defaults to unprotected for a new field); `Some(b)` forces it. An empty
@@ -395,18 +434,17 @@ pub fn add_entry(
 /// A real change snapshots the previous entry state into the entry's history
 /// and updates its modification time (KeePass edit semantics). Setting a field
 /// to the value and protection it already has is a no-op.
-/// Propagates `ENTRY_NOT_FOUND` when the target does not resolve to an entry,
-/// and validates the field name.
+/// `ENTRY_NOT_FOUND` if `entry_id` names no entry of `working`.
 pub fn update_field(
     working: &mut Database,
-    target: &EntryAddress,
-    field_name: &str,
-    value: &str,
-    protected: Option<bool>,
+    entry_id: EntryId,
+    write: &FieldWrite<'_>,
 ) -> CoreResult<EntryId> {
-    validate_field_write(field_name, value)?;
-
-    let entry_id = target.resolve(working, &View::capture_ephemeral(working))?;
+    let FieldWrite {
+        name: field_name,
+        value,
+        protected,
+    } = *write;
 
     // Decide the protection state before taking the mutable borrow: when the
     // caller did not force it, read the current field's state (false when the
@@ -818,6 +856,7 @@ fn absolute_path_string(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::address::{EntryAddress, GroupAddress};
     use crate::engine::vault::Vault;
     use kdbx_core::path::VaultPath;
     use keepass::db::fields;
@@ -859,6 +898,31 @@ mod tests {
     /// Resolve the entry path `s` in `db`, as the write tools do.
     fn resolve(db: &Database, s: &str) -> CoreResult<EntryId> {
         addr(s).resolve(db, &View::capture_ephemeral(db))
+    }
+
+    /// Validate, resolve against a fresh view, then stage: the order the
+    /// adapter uses (it resolves against the vault's cached view).
+    fn add_entry(
+        db: &mut Database,
+        group: &GroupAddress,
+        input: &EntryInput,
+    ) -> CoreResult<EntryId> {
+        let input = input.clone().validate()?;
+        let group_id = group.resolve(db, &View::capture_ephemeral(db))?;
+        super::add_entry(db, group_id, &input)
+    }
+
+    /// [`add_entry`]'s counterpart for a field write.
+    fn update_field(
+        db: &mut Database,
+        target: &EntryAddress,
+        field_name: &str,
+        value: &str,
+        protected: Option<bool>,
+    ) -> CoreResult<EntryId> {
+        let write = FieldWrite::new(field_name, value, protected)?;
+        let entry_id = target.resolve(db, &View::capture_ephemeral(db))?;
+        super::update_field(db, entry_id, &write)
     }
 
     fn simple_input(title: &str) -> EntryInput {

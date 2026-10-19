@@ -471,6 +471,16 @@ impl Vault {
         }
     }
 
+    /// Whether the [`View`] of the working db is already captured, so
+    /// [`view`](Self::view) returns without capturing (which fingerprints
+    /// every attachment). False when locked.
+    pub fn has_cached_view(&self) -> bool {
+        match &self.state {
+            VaultState::Unlocked { view, .. } => view.get().is_some(),
+            VaultState::Locked => false,
+        }
+    }
+
     /// The fingerprint of `bytes` in `domain` under the random session key:
     /// the form every tool response uses (stable within this unlock only).
     ///
@@ -511,14 +521,6 @@ impl Vault {
             }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
         }
-    }
-
-    /// The working db and its [`View`] together, for tools that resolve an
-    /// address against the view and then read the live record.
-    ///
-    /// [`ErrorCode::VaultLocked`] when locked.
-    pub fn working_db_and_view(&self) -> CoreResult<(&keepass::Database, &View)> {
-        Ok((self.working_db()?, self.view()?))
     }
 
     /// Borrow the canonical db (the on-disk baseline).

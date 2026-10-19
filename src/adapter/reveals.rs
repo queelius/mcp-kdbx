@@ -17,7 +17,9 @@
 //! emitting and returning, so the audit emit and the response do not borrow the
 //! vault guard.
 
-use crate::adapter::{KdbxServer, canonical_entry_path, locate_entry, responses};
+use crate::adapter::{
+    KdbxServer, canonical_entry_path, locate_entry, responses, working_db_and_view_of,
+};
 use crate::engine::audit::AuditEvent;
 use crate::engine::error::{CoreError, ErrorCode};
 use crate::engine::otp;
@@ -109,7 +111,7 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let (db, view) = match vault.working_db_and_view() {
+        let (db, view) = match working_db_and_view_of(&vault) {
             Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
@@ -166,7 +168,7 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let (db, view) = match vault.working_db_and_view() {
+        let (db, view) = match working_db_and_view_of(&vault) {
             Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
@@ -235,7 +237,7 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let (db, view) = match vault.working_db_and_view() {
+        let (db, view) = match working_db_and_view_of(&vault) {
             Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
@@ -319,7 +321,7 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let (db, view) = match vault.working_db_and_view() {
+        let (db, view) = match working_db_and_view_of(&vault) {
             Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };

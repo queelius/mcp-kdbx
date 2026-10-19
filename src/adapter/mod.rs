@@ -23,10 +23,11 @@ pub mod writes;
 use crate::engine::address::EntryAddress;
 use crate::engine::audit::{AuditEvent, AuditLog};
 use crate::engine::config::Config;
-use crate::engine::error::{CoreError, ErrorCode};
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 use crate::engine::secret::Secret;
 use crate::engine::vault::{AuditFingerprints, Vault};
 use crate::engine::view::View;
+use keepass::Database;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool_handler};
@@ -184,6 +185,25 @@ its path. A record whose path is null has no addressable path: use its uuid.\n\n
 Unlocking: call kdbx_unlock with no arguments; the server reads the master password from \
 its configured KDBX_PASSWORD or KDBX_UNLOCK_CMD. Do not ask the user to type the master \
 password into the chat.";
+
+/// The vault's cached [`View`] of the working db. When it must be captured
+/// first, the capture runs in `block_in_place`: it fingerprints every
+/// attachment, which takes a while for large ones, and must not stall the
+/// async worker. A cached view returns directly.
+pub(crate) fn view_of(vault: &Vault) -> CoreResult<&View> {
+    if vault.has_cached_view() {
+        vault.view()
+    } else {
+        tokio::task::block_in_place(|| vault.view())
+    }
+}
+
+/// The working db and its [`View`] (see [`view_of`]), for tools that resolve
+/// an address against the view and then read the live record.
+pub(crate) fn working_db_and_view_of(vault: &Vault) -> CoreResult<(&Database, &View)> {
+    let view = view_of(vault)?;
+    Ok((vault.working_db()?, view))
+}
 
 /// Locate the entry an entry-targeting tool names, by vault path or by UUID
 /// (exactly one; see [`EntryAddress::from_parts`]). `path_param` is the tool's

@@ -25,7 +25,7 @@ use kdbx_core::model::{Sealing, Snapshot};
 use kdbx_core::path::{PathIndex, VaultPath};
 use keepass::Database;
 use keepass::db::{EntryId, GroupId};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -35,6 +35,10 @@ pub struct View {
     snapshot: Snapshot,
     paths: PathIndex,
     with_otp: HashSet<Uuid>,
+    /// Each node's containing group, built in the same capture pass, so a
+    /// parent lookup is O(1) instead of a tree walk per call (the snapshot's
+    /// own `parent_of` walks).
+    parents: HashMap<Uuid, Uuid>,
 }
 
 impl View {
@@ -47,10 +51,19 @@ impl View {
             .filter(|entry| crate::engine::otp::has_otp(entry))
             .map(|entry| entry.id().uuid())
             .collect();
+        let mut parents = HashMap::new();
+        for (node, parent) in snapshot.walk() {
+            if let Some(parent) = parent {
+                // First occurrence wins, as in Snapshot::parent_of and the
+                // path index, should a UUID repeat.
+                parents.entry(node.uuid()).or_insert(parent.uuid);
+            }
+        }
         View {
             snapshot,
             paths,
             with_otp,
+            parents,
         }
     }
 
@@ -83,10 +96,11 @@ impl View {
         self.with_otp.contains(&uuid)
     }
 
-    /// The canonical path of the group that holds node `uuid`, as a string.
+    /// The canonical path of the group that holds node `uuid`, as a string
+    /// (`None` for the root, an unknown node, or a group with no addressable
+    /// path). O(1): an index lookup, not a tree walk.
     pub fn parent_path_string(&self, uuid: Uuid) -> Option<String> {
-        let parent = self.snapshot.parent_of(uuid)?;
-        self.path_string(parent.uuid)
+        self.path_string(*self.parents.get(&uuid)?)
     }
 }
 

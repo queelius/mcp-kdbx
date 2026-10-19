@@ -17,7 +17,7 @@
 //! stage module takes raw bytes, not base64).
 
 use crate::adapter::views::format_system_time;
-use crate::adapter::{KdbxServer, responses};
+use crate::adapter::{KdbxServer, responses, view_of, working_db_and_view_of};
 use crate::engine::address::{EntryAddress, GroupAddress};
 use crate::engine::audit::{AuditEvent, StageDiscardReason, WriteTool};
 use crate::engine::error::{CoreError, ErrorCode};
@@ -159,27 +159,37 @@ impl KdbxServer {
             attachments.push(stage::AttachmentInput { name, bytes });
         }
 
-        let input = stage::EntryInput {
+        let input = match (stage::EntryInput {
             title: params.title,
             fields,
             attachments,
+        })
+        .validate()
+        {
+            Ok(input) => input,
+            Err(e) => return responses::err(&e),
         };
 
+        // Resolve the group against the cached view (no capture of its own),
+        // after validating the input, then mutate the working db.
+        let group_id =
+            match working_db_and_view_of(&vault).and_then(|(db, view)| group.resolve(db, view)) {
+                Ok(id) => id,
+                Err(e) => return responses::err(&e),
+            };
         let working = match vault.working_db_mut() {
             Ok(db) => db,
             Err(e) => return responses::err(&e),
         };
-
-        let entry_id = match stage::add_entry(working, &group, &input) {
+        let entry_id = match stage::add_entry(working, group_id, &input) {
             Ok(id) => id,
             Err(e) => return responses::err(&e),
         };
 
-        // Capture the audit data into owned values before returning. The new
-        // entry's path comes from a fresh view of the working db (None only
-        // when its group has no addressable path); the uuid comes off the id.
-        let path = vault
-            .view()
+        // The new entry's path (None only when its group has no addressable
+        // path) comes from the one capture of the changed working db, which
+        // the next read reuses; the uuid comes off the id.
+        let path = view_of(&vault)
             .ok()
             .and_then(|view| view.path_string(entry_id.uuid()));
         let uuid = entry_id.uuid().to_string();
@@ -222,26 +232,34 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let working = match vault.working_db_mut() {
-            Ok(db) => db,
-            Err(e) => return responses::err(&e),
-        };
-
-        let entry_id = match stage::update_field(
-            working,
-            &target,
+        let write = match stage::FieldWrite::new(
             &params.field_name,
             params.value.expose(),
             params.protected,
         ) {
-            Ok(id) => id,
+            Ok(write) => write,
             Err(e) => return responses::err(&e),
         };
 
-        // Report the canonical path of the entry actually written (re-derived
-        // after the write, since a Title change moves it) and its uuid.
-        let path = vault
-            .view()
+        // Resolve the target against the cached view (no capture of its own),
+        // after validating the write, then mutate the working db.
+        let entry_id =
+            match working_db_and_view_of(&vault).and_then(|(db, view)| target.resolve(db, view)) {
+                Ok(id) => id,
+                Err(e) => return responses::err(&e),
+            };
+        let working = match vault.working_db_mut() {
+            Ok(db) => db,
+            Err(e) => return responses::err(&e),
+        };
+        if let Err(e) = stage::update_field(working, entry_id, &write) {
+            return responses::err(&e);
+        }
+
+        // Report the canonical path of the entry actually written, from the
+        // one capture of the changed working db (a Title change moves it),
+        // which the next read reuses.
+        let path = view_of(&vault)
             .ok()
             .and_then(|view| view.path_string(entry_id.uuid()));
         let uuid = entry_id.uuid().to_string();
@@ -282,7 +300,9 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let diff = stage::diff_pending(canonical, working);
+        // Two fresh captures (canonical and working, under one per-call key),
+        // each fingerprinting every attachment: run them off the async worker.
+        let diff = tokio::task::block_in_place(|| stage::diff_pending(canonical, working));
         responses::ok(diff)
     }
 
@@ -397,7 +417,10 @@ impl KdbxServer {
         // collected, so the mutable discard borrow that follows does not
         // conflict.
         let summary: Vec<String> = match vault.canonical_and_working() {
-            Ok((canonical, working)) => stage::diff_pending(canonical, working).entry_labels(),
+            Ok((canonical, working)) => {
+                tokio::task::block_in_place(|| stage::diff_pending(canonical, working))
+                    .entry_labels()
+            }
             Err(_) => Vec::new(),
         };
 

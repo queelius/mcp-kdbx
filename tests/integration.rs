@@ -721,3 +721,75 @@ fn unreadable_vault_unlock_is_audited_with_its_reason() {
     // It is not an authentication failure, so no auth_failed event.
     assert!(!lines.iter().any(|l| l["event"] == json!("auth_failed")));
 }
+
+/// A coarse performance guard over the real binary: a vault of a few thousand
+/// entries (with attachments, so every capture fingerprints bytes) must list,
+/// search, write and diff well inside a generous bound. It catches a
+/// regression to per-match tree walks or to several snapshot captures per
+/// write, not small slowdowns: the bound is far above the measured time.
+#[test]
+fn a_few_thousand_entries_search_write_and_diff_quickly() {
+    use keepass::db::{Value as KpValue, fields};
+    use keepass::{Database, DatabaseKey};
+    use std::time::Instant;
+
+    const GROUPS: usize = 40;
+    const PER_GROUP: usize = 75; // 3,000 entries
+
+    let mut db = Database::new();
+    for g in 0..GROUPS {
+        let mut root = db.root_mut();
+        let mut group = root.add_group();
+        group.name = format!("Group {g:02}");
+        for e in 0..PER_GROUP {
+            group.add_entry().edit(|entry| {
+                entry.set_unprotected(fields::TITLE, format!("Account {g:02}-{e:03}"));
+                entry.set_unprotected(fields::USERNAME, format!("user{e}@example.com"));
+                entry.set_unprotected(fields::URL, format!("https://site{e}.example"));
+                entry.set_protected(fields::PASSWORD, format!("secret-{g}-{e}"));
+                if e % 10 == 0 {
+                    entry.add_attachment("note.txt", KpValue::protected(vec![b'x'; 4096]));
+                }
+            });
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.kdbx");
+    let mut bytes = Vec::new();
+    db.save(
+        &mut bytes,
+        DatabaseKey::new().with_password(FIXTURE_PASSWORD),
+    )
+    .unwrap();
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", path.to_str().unwrap()),
+        ("KDBX_ALLOW_WRITES", "true"),
+    ]);
+    server.unlock_with_fixture_password();
+
+    let started = Instant::now();
+    let listed = server.call_ok("kdbx_list_entries", json!({ "group_path": "/Group 07/" }));
+    assert_eq!(listed["entries"].as_array().unwrap().len(), PER_GROUP);
+    // A query that matches every entry: the search caps its results, but it
+    // still visits and orders all 3,000 matches.
+    let found = server.call_ok("kdbx_find_entry", json!({ "query": "example" }));
+    assert_eq!(found["matched_count"], json!(GROUPS * PER_GROUP));
+    assert_eq!(found["truncated"], json!(true));
+    for i in 0..5 {
+        server.call_ok(
+            "kdbx_update_field",
+            json!({ "path": format!("/Group 0{i}/Account 0{i}-001"), "field_name": "URL", "value": "https://changed.example" }),
+        );
+        let after = server.call_ok("kdbx_find_entry", json!({ "query": "changed.example" }));
+        assert_eq!(after["matched_count"], json!(i + 1));
+    }
+    let diff = server.call_ok("kdbx_diff_pending", json!({}));
+    assert_eq!(diff["modified"].as_array().unwrap().len(), 5);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "list, 6 searches, 5 writes and a diff over 3,000 entries took {elapsed:?}"
+    );
+}

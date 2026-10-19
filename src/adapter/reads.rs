@@ -10,7 +10,7 @@
 //! table, so these tools emit no audit events; they still count as activity
 //! because every call goes through [`KdbxServer::vault`].
 
-use crate::adapter::{KdbxServer, responses, views};
+use crate::adapter::{KdbxServer, responses, view_of, views};
 use crate::engine::address::{EntryAddress, GroupAddress};
 use crate::engine::search::{self, Field};
 use rmcp::handler::server::wrapper::Parameters;
@@ -92,7 +92,7 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let view = match vault.view() {
+        let view = match view_of(&vault) {
             Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
@@ -124,7 +124,7 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let view = match vault.view() {
+        let view = match view_of(&vault) {
             Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
@@ -159,7 +159,7 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let view = match vault.view() {
+        let view = match view_of(&vault) {
             Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
@@ -185,7 +185,7 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let view = match vault.view() {
+        let view = match view_of(&vault) {
             Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
@@ -207,7 +207,7 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let view = match vault.view() {
+        let view = match view_of(&vault) {
             Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
