@@ -25,7 +25,7 @@ use crate::engine::audit::{AuditEvent, AuditLog};
 use crate::engine::config::Config;
 use crate::engine::error::{CoreError, ErrorCode};
 use crate::engine::secret::Secret;
-use crate::engine::vault::Vault;
+use crate::engine::vault::{AuditFingerprints, Vault};
 use crate::engine::view::View;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -56,7 +56,15 @@ impl KdbxServer {
     /// `audit`. The vault starts locked; no file is read until the first
     /// `kdbx_unlock`.
     pub fn new(config: Config, audit: AuditLog) -> Self {
-        let vault = Vault::new(config.vault_path.clone());
+        // The stable audit key exists only for audit-file fingerprints, so it
+        // is derived (one Argon2 run per unlock) exactly when there is a file.
+        let audit_fingerprints = if audit.has_file() {
+            AuditFingerprints::Keyed
+        } else {
+            AuditFingerprints::Off
+        };
+        let vault =
+            Vault::new(config.vault_path.clone()).with_audit_fingerprints(audit_fingerprints);
         Self {
             // Combine the per-category routers into one. Each submodule's
             // `#[tool_router(router = ..._router)]` block contributes its tools.

@@ -173,6 +173,86 @@ fn the_fixture_pin_cannot_be_recovered_from_the_log_without_the_key() {
     assert_eq!(logged, fingerprint_hex(&key, Domain::Field, b"4321"));
 }
 
+/// The audit fingerprint is keyed by the stable, Argon2-derived key: the same
+/// value revealed in two sessions logs the same fingerprint, which the
+/// verifier recomputes. Its derivation parameters and salt reach only the
+/// audit file, never stderr, and no audit-key field does either.
+#[test]
+fn audit_fingerprints_are_stable_across_unlocks_and_stay_off_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let stderr_path = dir.path().join("stderr.txt");
+    let vault = fixture_path("flat.kdbx");
+    let mut server = McpServer::spawn_with_stderr(
+        &[
+            ("KDBX_VAULT_PATH", vault.to_str().unwrap()),
+            ("KDBX_LOG_FILE", log_path.to_str().unwrap()),
+        ],
+        std::fs::File::create(&stderr_path).unwrap(),
+    );
+    for _ in 0..2 {
+        server.unlock_with_fixture_password();
+        server.call_ok("kdbx_reveal_password", json!({ "path": "/Bank" }));
+        server.call_ok("kdbx_lock", json!({}));
+    }
+    drop(server);
+
+    let events = read_audit_lines(&log_path);
+    let reveals: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["event"] == json!("reveal_password"))
+        .collect();
+    assert_eq!(reveals.len(), 2);
+    assert_eq!(
+        reveals[0]["details"]["fingerprint"], reveals[1]["details"]["fingerprint"],
+        "the audit key is stable across unlocks"
+    );
+    let key = audit_key_from_log(&events);
+    assert_eq!(
+        reveals[0]["details"]["fingerprint"],
+        json!(fingerprint_hex(&key, Domain::Field, b"bank-secret-456"))
+    );
+
+    let unlocked = events
+        .iter()
+        .find(|e| e["event"] == json!("vault_unlocked"))
+        .unwrap();
+    let params = unlocked["details"]["fingerprint_params"].as_str().unwrap();
+    let salt = unlocked["details"]["fingerprint_salt"].as_str().unwrap();
+    let logged_fp = reveals[0]["details"]["fingerprint"].as_str().unwrap();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        stderr.contains("reveal_password"),
+        "events still reach stderr"
+    );
+    for secretish in [params, salt, logged_fp, "fingerprint"] {
+        assert!(
+            !stderr.contains(secretish),
+            "{secretish} reached stderr: {stderr}"
+        );
+    }
+}
+
+/// Without an audit log file there is no stable key at all (no Argon2 run):
+/// stderr events carry no fingerprint and no derivation parameters.
+#[test]
+fn without_an_audit_file_no_stable_key_is_derived() {
+    let dir = tempfile::tempdir().unwrap();
+    let stderr_path = dir.path().join("stderr.txt");
+    let vault = fixture_path("flat.kdbx");
+    let mut server = McpServer::spawn_with_stderr(
+        &[("KDBX_VAULT_PATH", vault.to_str().unwrap())],
+        std::fs::File::create(&stderr_path).unwrap(),
+    );
+    server.unlock_with_fixture_password();
+    server.call_ok("kdbx_reveal_password", json!({ "path": "/Bank" }));
+    drop(server);
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    assert!(stderr.contains("reveal_password"));
+    assert!(!stderr.contains("fingerprint"), "{stderr}");
+    assert!(!stderr.contains("argon2id"), "{stderr}");
+}
+
 /// A protected standard field (KeePassXC's per-attribute "Protect" toggle on
 /// UserName or Notes) must behave like any other protected value: bulk reads
 /// return it as null and mark it protected, search never matches it, and the

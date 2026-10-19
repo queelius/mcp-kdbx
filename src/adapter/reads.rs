@@ -158,7 +158,7 @@ impl KdbxServer {
 
     /// Read: list the attachments of an entry (names, sizes, content hashes).
     #[tool(
-        description = "List the attachments of an entry. Provide entry_path. Returns each attachment's name, size in bytes, and a keyed fingerprint of its content (the value kdbx_download_attachment reports and audits for the same bytes). No attachment bytes: downloading bytes is a separate consent-gated tool."
+        description = "List the attachments of an entry. Provide entry_path. Returns each attachment's name, size in bytes, and a fingerprint of its content keyed per session (equal to what kdbx_download_attachment returns for the same bytes until the next unlock; not stable across unlocks). No attachment bytes: downloading bytes is a separate consent-gated tool."
     )]
     async fn kdbx_list_attachments(
         &self,

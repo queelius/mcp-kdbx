@@ -96,9 +96,10 @@ pub fn group_summary(db: &Database, view: &View, group_id: GroupId) -> Option<Va
 /// `kdbx_download_attachment`.
 ///
 /// Read from the view's snapshot, which never holds attachment bytes: each
-/// attachment is already a fingerprint there, computed under the session's
-/// audit key, so it equals the fingerprint a download of the same bytes
-/// logs.
+/// attachment is already a fingerprint there, computed under the random
+/// session key, so it equals the fingerprint a download of the same bytes
+/// returns in this session, and gives the client nothing to test
+/// master-password guesses against.
 pub fn attachment_list(view: &View, entry_id: EntryId) -> Option<Value> {
     let entry = view.snapshot().find_entry(entry_id.uuid())?;
     let attachments: Vec<Value> = entry

@@ -5,9 +5,11 @@
 //! crosses a secret out of the vault, so each requires an unlocked vault and
 //! emits exactly one info-level audit event on success. The security invariant
 //! is that the event carries a keyed fingerprint of the revealed value, never
-//! the value itself: `Vault::fingerprint` computes it under the session's audit
-//! key (derived at unlock), in kdbx-core's field domain for string secrets and
-//! its attachment domain for attachment bytes. The TOTP secret never leaves the
+//! the value itself: `Vault::audit_fingerprint` computes it under the stable
+//! audit key (derived at unlock when an audit file is configured, and
+//! written to that file only), in kdbx-core's field domain for string
+//! secrets and its attachment domain for attachment bytes. A fingerprint in
+//! a tool response is session-keyed instead (`Vault::fingerprint`). The TOTP secret never leaves the
 //! process; only the computed code crosses out, and the `get_otp` event logs no
 //! code and no secret.
 //!
@@ -136,7 +138,7 @@ impl KdbxServer {
             }
         };
         let target_uuid = entry.id().uuid().to_string();
-        let fingerprint = match vault.fingerprint(Domain::Field, password.as_bytes()) {
+        let fingerprint = match vault.audit_fingerprint(Domain::Field, password.as_bytes()) {
             Ok(fp) => fp,
             Err(e) => return responses::err(&e),
         };
@@ -205,7 +207,7 @@ impl KdbxServer {
         }
         let value = field.get().to_string();
         let target_uuid = entry.id().uuid().to_string();
-        let fingerprint = match vault.fingerprint(Domain::Field, value.as_bytes()) {
+        let fingerprint = match vault.audit_fingerprint(Domain::Field, value.as_bytes()) {
             Ok(fp) => fp,
             Err(e) => return responses::err(&e),
         };
@@ -223,7 +225,7 @@ impl KdbxServer {
     /// Reveal: return an attachment's bytes, base64-encoded, with its size and
     /// its keyed fingerprint. Consent-gated; logs the same fingerprint.
     #[tool(
-        description = "Download an entry's attachment by name: returns the bytes base64-encoded, plus size_bytes and the content fingerprint (keyed, the same value kdbx_list_attachments reports). There is no size cap; attachments over 10 MB are logged at warn but still returned. Records an audit event with the fingerprint. Requires an unlocked vault."
+        description = "Download an entry's attachment by name: returns the bytes base64-encoded, plus size_bytes and the content fingerprint (keyed per session: the value kdbx_list_attachments reports until the next unlock, not stable across unlocks). There is no size cap; attachments over 10 MB are logged at warn but still returned. Records an audit event with the fingerprint. Requires an unlocked vault."
     )]
     async fn kdbx_download_attachment(
         &self,
@@ -274,12 +276,18 @@ impl KdbxServer {
                 "downloading an attachment larger than 10 MB"
             );
         }
-        // The keyed fingerprint of the bytes in kdbx-core's attachment
-        // domain: the value kdbx_list_attachments reports for the same
-        // content, and never a plain digest (a lookup oracle on small files).
-        let fingerprint = match vault.fingerprint(Domain::Attachment, &bytes) {
-            Ok(fp) => fp,
-            Err(e) => return responses::err(&e),
+        // Two keyed fingerprints of the bytes in kdbx-core's attachment
+        // domain, never a plain digest (a lookup oracle on small files). The
+        // response carries the session-keyed one (what kdbx_list_attachments
+        // reports this session): with the bytes in hand, a stable-keyed one
+        // would let the client test master-password guesses offline. The
+        // audit file gets the stable-keyed one, for an operator to verify.
+        let (fingerprint, audit_fingerprint) = match (
+            vault.fingerprint(Domain::Attachment, &bytes),
+            vault.audit_fingerprint(Domain::Attachment, &bytes),
+        ) {
+            (Ok(session), Ok(audit)) => (session, audit),
+            (Err(e), _) | (_, Err(e)) => return responses::err(&e),
         };
         let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
@@ -288,7 +296,7 @@ impl KdbxServer {
             target_uuid: entry.id().uuid().to_string(),
             attachment_name: params.name.clone(),
             size_bytes: size_bytes as u64,
-            fingerprint,
+            fingerprint: audit_fingerprint,
         });
 
         responses::ok(serde_json::json!({

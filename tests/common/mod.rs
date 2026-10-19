@@ -58,6 +58,14 @@ impl McpServer {
     /// from the developer's shell cannot leak into a test), then `PATH` is
     /// restored so the unlock-command shell-out path can still find `/bin/sh`.
     pub fn spawn(envs: &[(&str, &str)]) -> Self {
+        // Inherit stderr so server diagnostics surface in a failing test's
+        // captured output; cargo hides it on success.
+        Self::spawn_with_stderr(envs, Stdio::inherit())
+    }
+
+    /// [`spawn`](Self::spawn), with the server's stderr sent to `stderr` (for
+    /// tests that inspect what the server writes there).
+    pub fn spawn_with_stderr(envs: &[(&str, &str)], stderr: impl Into<Stdio>) -> Self {
         let bin = env!("CARGO_BIN_EXE_mcp-kdbx");
         let mut cmd = Command::new(bin);
         cmd.env_clear();
@@ -69,9 +77,7 @@ impl McpServer {
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Inherit stderr so server diagnostics surface in a failing test's
-            // captured output; cargo hides it on success.
-            .stderr(Stdio::inherit());
+            .stderr(stderr);
 
         let mut child = cmd.spawn().expect("spawn mcp-kdbx binary");
         let stdin = child.stdin.take().expect("child stdin handle");

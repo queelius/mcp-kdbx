@@ -214,7 +214,7 @@ input:  { entry_path: string }
 output: {
   ok: true,
   data: {
-    attachments: [{ name: string, size_bytes: number, fingerprint: string /* 64 hex, keyed; was sha256 before the kdbx-core adoption */ }]
+    attachments: [{ name: string, size_bytes: number, fingerprint: string /* 64 hex, keyed per session (not stable across unlocks); was sha256 before the kdbx-core adoption */ }]
   }
 }
 
@@ -263,7 +263,7 @@ output: { ok: true, data: { value: string } }
 
 // kdbx_download_attachment
 input:  { entry_path: string, name: string }
-output: { ok: true, data: { name, size_bytes, fingerprint, base64: string } }  // fingerprint: 64 hex, keyed (was sha256)
+output: { ok: true, data: { name, size_bytes, fingerprint, base64: string } }  // fingerprint: 64 hex, keyed per session (was sha256)
 
 // kdbx_get_otp
 input:  { path: string, time_unix?: number }              // default now
@@ -800,7 +800,7 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 | Event | Level | Details |
 |---|---|---|
 | `server_started` | info | server_version, vault_path, writes_allowed, idle_timeout_seconds |
-| `vault_unlocked` | info | unlock_source ("input" \| "env" \| "cmd"), file_mtime, fingerprint_params, fingerprint_salt (added with the kdbx-core adoption: what a verifier needs to rebuild the audit key) |
+| `vault_unlocked` | info | unlock_source ("input" \| "env" \| "cmd"), file_mtime; in the audit file only, and only when an audit file is configured: fingerprint_params, fingerprint_salt (added with the kdbx-core adoption: what a verifier needs to rebuild the audit key) |
 | `vault_locked` | info | reason, pending_discarded_count |
 | `auth_failed` | error | source, error_code |
 | `write_staged` | info | tool, target_path, target_uuid, field_name (if applicable) |
@@ -808,9 +808,9 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 | `save_committed` | info | num_changes, before_mtime, after_mtime |
 | `save_refused` | warn | before_mtime, conflict_mtime, pending_changes |
 | `save_failed` | error | failure_step, error_message, pending_changes |
-| `reveal_password` | info | target_path, target_uuid, fingerprint, fingerprint_domain |
-| `reveal_protected` | info | target_path, target_uuid, field_name, fingerprint, fingerprint_domain |
-| `download_attachment` | info | target_path, target_uuid, attachment_name, size_bytes, fingerprint, fingerprint_domain |
+| `reveal_password` | info | target_path, target_uuid; audit file only: fingerprint, fingerprint_domain |
+| `reveal_protected` | info | target_path, target_uuid, field_name; audit file only: fingerprint, fingerprint_domain |
+| `download_attachment` | info | target_path, target_uuid, attachment_name, size_bytes; audit file only: fingerprint, fingerprint_domain |
 | `get_otp` | info | target_path, target_uuid (no code logged) |
 | `unlock_failed` | warn | unlock_source, reason (added 2026-10-18: `VAULT_UNREADABLE`) |
 | `writer_lock_unavailable` | warn | reason (added 2026-10-18: save without the writer lock) |
@@ -822,7 +822,9 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 These are non-negotiable:
 
 - **Never log plaintext values.** No password, no protected field, no OTP code, no attachment bytes ever appears in any log entry except at `trace` level.
-- **Reveal events log a keyed fingerprint, not the value.** Since the kdbx-core adoption: `HMAC-SHA256(K, domain || value)` (kdbx-core's `Fingerprint`, 64 hex), where `K` is derived once per unlock with Argon2id from the master key material, salted with the root group UUID, at parameters never cheaper than the vault's own KDF (floor 64 MiB x 3 passes). The original `sha256("kdbx-reveal-v1\0" || value)` was unkeyed, so a low-entropy secret could be recovered by hashing candidates (a reviewer recovered a 4-digit PIN in under 10,000 tries); the keyed form can be checked only with the vault's key material, using `diff-kdbx fingerprint`.
+- **Reveal events log a keyed fingerprint, not the value.** Since the kdbx-core adoption: `HMAC-SHA256(K, domain || value)` (kdbx-core's `Fingerprint`, 64 hex), where `K` is the stable audit key, derived once per unlock with Argon2id from the master key material, salted with the root group UUID, at parameters never cheaper than the vault's own KDF (floor 64 MiB x 3 passes). The original `sha256("kdbx-reveal-v1\0" || value)` was unkeyed, so a low-entropy secret could be recovered by hashing candidates (a reviewer recovered a 4-digit PIN in under 10,000 tries); the keyed form can be checked only with the vault's key material, using `diff-kdbx fingerprint`.
+- **The audit file is as sensitive as the vault file.** Its fingerprints, with the `fingerprint_params` and `fingerprint_salt` that `vault_unlocked` records, let someone who also knows one revealed plaintext search the master password offline at the vault's own KDF cost (the same cost as attacking the vault file, never cheaper, by kdbx-core's `DeriveParams` floor). So that material goes to the audit file only: the stderr copy of every event omits all fields derived from `K`, and without an audit file `K` is not derived at all. Protect the file like the vault.
+- **Tool-response fingerprints are session-keyed.** `kdbx_list_attachments` and `kdbx_download_attachment` fingerprint under a random key drawn at each unlock and wiped on lock, never under `K`: the client sees attachment bytes next to their fingerprint, and a stable-keyed one would hand it the offline oracle above. Session fingerprints identify content within one unlock only and are not stable across unlocks.
 - **Path segments and field names ARE logged.** They're metadata, not secrets. Users with paranoid threat models can disable info-level logging by setting `KDBX_LOG_LEVEL=warn`.
 - **Master password and unlock-command output never appear anywhere.** Specifically scrubbed in `mcp_message` capture (`password` parameter replaced with `"<redacted>"`).
 - **`KDBX_PASSWORD` env var is not logged.** `server_started` event captures vault_path and idle_timeout_seconds but no env-var-derived secrets.

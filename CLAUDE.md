@@ -62,7 +62,7 @@ Remaining for release (not v0.1 plan tasks): push `main` to `origin`, run the `d
 | Idle lock TTL | 900 seconds (15 minutes) default; configurable |
 | Write capability | Read + limited write (add_entry, update_field; no delete, no move). Gated by `KDBX_ALLOW_WRITES=true` at startup. |
 | Stage model | In-memory shadow database; diff-kdbx-as-library computes the diff; atomic temp+rename on save |
-| Audit trail | JSONL via `KDBX_LOG_FILE`; keyed fingerprints (kdbx-core, HMAC-SHA256 under an Argon2id key derived per unlock) of revealed values |
+| Audit trail | JSONL via `KDBX_LOG_FILE`; keyed fingerprints (kdbx-core, HMAC-SHA256 under an Argon2id key derived per unlock) of revealed values, in the file only; tool-response fingerprints are session-keyed |
 
 ## Workflow for any new feature
 
@@ -77,7 +77,7 @@ Remaining for release (not v0.1 plan tasks): push `main` to `origin`, run the `d
 These are non-negotiable from the spec; flag any change that violates them as a design-level concern, not just a code change.
 
 - **Bulk reads never expose protected values.** `kdbx_list_entries`, `kdbx_get_entry`, `kdbx_find_entry`, `kdbx_list_attachments` return metadata only (including the `protected: bool` flag per field). Reveal requires a separate per-call event.
-- **Reveal events log a keyed fingerprint of the value, never the value.** kdbx-core's `Fingerprint` under the session's audit key (derived at unlock from the master key material, root group UUID salt, `DeriveParams::for_header`; recorded in `vault_unlocked` so `diff-kdbx fingerprint` can verify). Never an unkeyed hash of a secret. Plaintext values appear in logs only at `trace` level (explicit opt-in, documented warning).
+- **Reveal events log a keyed fingerprint of the value, never the value.** kdbx-core's `Fingerprint` under the stable audit key (derived at unlock, only when an audit file is configured, from the master key material, root group UUID salt, `DeriveParams::for_header`; its params and salt recorded in the file's `vault_unlocked` so `diff-kdbx fingerprint` can verify). Never an unkeyed hash of a secret. Everything derived from that key goes to the audit file only, never stderr or a tool response: the file is as sensitive as the vault. Fingerprints in tool responses use a random per-session key. Plaintext values appear in logs only at `trace` level (explicit opt-in, documented warning).
 - **Master password and `KDBX_UNLOCK_CMD` output never appear in any log.** v0.1 ensures this by capping rmcp's tracing verbosity (`rmcp=warn` in `main.rs`) so the SDK never debug-logs raw JSON-RPC payloads (which carry the password and revealed secrets), and by wrapping every secret-bearing field (the password and unlock command in `Config`, unlock and write tool inputs, field values, attachment bytes, the TOTP secret and code) in `engine::secret::Secret<T>`, whose `Debug` prints `<redacted>` and whose value is zeroized on drop. `scripts/ci-audit.sh` check D enforces this structurally for every struct that derives `Debug`. The spec's `mcp_message` trace capture is deferred (see the spec's implementation notes); if it lands later, it must redact before logging.
 - **Writes default off.** `KDBX_ALLOW_WRITES` MUST be exactly `"true"` to enable; other values rejected at startup.
 - **Stage-then-commit.** Writes mutate `working_db`; nothing hits disk until `kdbx_save_pending`. Lock (any reason) discards the stage; the next tool call returns VAULT_LOCKED with the discarded summary.

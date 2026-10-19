@@ -349,6 +349,27 @@ fn list_attachments_happy_path() {
 }
 
 #[test]
+fn tool_fingerprints_are_session_keyed() {
+    // Fingerprints in tool responses use a random per-session key, so they
+    // identify content within one unlock only and give the client no oracle
+    // on the master password: the same attachment fingerprints differently
+    // after a re-unlock.
+    let mut server = unlocked("with_attachments.kdbx");
+    let listed = |server: &mut McpServer| {
+        server.call_ok(
+            "kdbx_list_attachments",
+            json!({ "entry_path": "/Document A" }),
+        )["attachments"][0]["fingerprint"]
+            .clone()
+    };
+    let first = listed(&mut server);
+    assert_eq!(first, listed(&mut server), "stable within a session");
+    server.call_ok("kdbx_lock", json!({}));
+    server.unlock_with_fixture_password();
+    assert_ne!(first, listed(&mut server), "a new session, a new key");
+}
+
+#[test]
 fn reveal_tools_happy_path() {
     let mut server = unlocked("flat.kdbx");
 

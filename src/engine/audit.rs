@@ -21,11 +21,18 @@
 //! Privacy invariants (non-negotiable, spec section 6):
 //!
 //! - Plaintext values never appear in any event. Reveal events carry a keyed
-//!   fingerprint ([`KeyedFingerprint`]: HMAC-SHA256 under the session's audit
+//!   fingerprint ([`KeyedFingerprint`]: HMAC-SHA256 under the stable audit
 //!   key, derived at unlock), never the value. An unkeyed hash of a
 //!   low-entropy secret would be a lookup oracle (a 4-digit PIN falls in
 //!   under 10,000 tries); the keyed one can be checked only by someone who
 //!   holds the vault's key material, with `diff-kdbx fingerprint`.
+//! - Everything derived from the stable audit key (the fingerprints, and the
+//!   derivation parameters and salt `vault_unlocked` records) is written to
+//!   the audit file only, never to stderr ([`Sink`]). With those and one
+//!   revealed plaintext, an offline master-password search costs exactly
+//!   what an attack on the vault file costs, so the audit file is as
+//!   sensitive as the vault; stderr, which MCP hosts often surface, carries
+//!   no such material. Without an audit file the key is not derived at all.
 //! - The master password and unlock-command output never appear anywhere.
 //!
 //! Deferred beyond v0.1: debug/trace JSON-RPC payload capture (the spec's
@@ -126,6 +133,27 @@ impl KeyedFingerprint {
     }
 }
 
+/// What the stable audit key was derived with: the inputs, besides the vault's
+/// key material, a verifier needs to rebuild it (`vault_unlocked` records
+/// them in the audit file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditKeyDerivation {
+    /// The Argon2id parameters (rendered `argon2id$v=19$m=..,t=..,p=..`).
+    pub params: DeriveParams,
+    /// The salt: the vault's root group UUID.
+    pub salt: uuid::Uuid,
+}
+
+/// Where a rendered event goes. Fields derived from the stable audit key are
+/// rendered for [`Sink::File`] only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sink {
+    /// stderr: diagnostics an MCP host may show or collect.
+    Stderr,
+    /// The `KDBX_LOG_FILE` audit log, protected like the vault.
+    File,
+}
+
 /// One audited action. Each variant carries the event-specific detail fields
 /// named in the spec's "Logged events" table (section 6).
 ///
@@ -144,15 +172,14 @@ pub enum AuditEvent {
         writes_allowed: bool,
         idle_timeout_seconds: u64,
     },
-    /// A vault was unlocked. `fingerprint_params` (rendered in its
-    /// `argon2id$v=19$m=..,t=..,p=..` form) and `fingerprint_salt` (the root
-    /// group UUID) are what a verifier needs to rebuild this session's audit
-    /// key from the vault's key material.
+    /// A vault was unlocked. When the stable audit key was derived (an audit
+    /// file is configured), the file copy also records `fingerprint_params`
+    /// and `fingerprint_salt` from `audit_key`, what a verifier needs to
+    /// rebuild the key from the vault's key material.
     VaultUnlocked {
         unlock_source: UnlockSource,
         file_mtime: String,
-        fingerprint_params: DeriveParams,
-        fingerprint_salt: uuid::Uuid,
+        audit_key: Option<AuditKeyDerivation>,
     },
     /// A vault was locked (idle, explicit, or shutdown).
     VaultLocked {
@@ -205,30 +232,31 @@ pub enum AuditEvent {
         error_message: String,
         pending_changes: u64,
     },
-    /// A password field was revealed. `fingerprint` is the keyed fingerprint
-    /// of the value (domain `kdbx-core/field/v1`).
+    /// A password field was revealed. `fingerprint` is the audit-keyed
+    /// fingerprint of the value (domain `kdbx-core/field/v1`), present when
+    /// the audit key exists and rendered to the audit file only.
     RevealPassword {
         target_path: Option<String>,
         target_uuid: String,
-        fingerprint: KeyedFingerprint,
+        fingerprint: Option<KeyedFingerprint>,
     },
     /// A non-password secret field was revealed.
     RevealProtected {
         target_path: Option<String>,
         target_uuid: String,
         field_name: String,
-        fingerprint: KeyedFingerprint,
+        fingerprint: Option<KeyedFingerprint>,
     },
-    /// An attachment was downloaded. `fingerprint` is the keyed fingerprint
-    /// of its bytes (domain `kdbx-core/attachment/v1`), the same value the
-    /// `kdbx_list_attachments` view reports. It identifies which attachment
-    /// was taken without storing its content.
+    /// An attachment was downloaded. `fingerprint` is the audit-keyed
+    /// fingerprint of its bytes (domain `kdbx-core/attachment/v1`). It
+    /// identifies which attachment was taken without storing its content.
+    /// (Tool responses carry a different, session-keyed fingerprint.)
     DownloadAttachment {
         target_path: Option<String>,
         target_uuid: String,
         attachment_name: String,
         size_bytes: u64,
-        fingerprint: KeyedFingerprint,
+        fingerprint: Option<KeyedFingerprint>,
     },
     /// A save proceeded without the inter-instance writer lock because the
     /// filesystem cannot lock (the content check still ran).
@@ -289,9 +317,54 @@ impl AuditEvent {
         }
     }
 
-    /// The event-specific `details` payload as a JSON object. Pure and
-    /// testable: it never reads the clock, the pid, or the environment.
-    pub fn details_json(&self) -> Value {
+    /// The event-specific `details` payload for `sink`, as a JSON object.
+    /// Pure and testable: it never reads the clock, the pid, or the
+    /// environment. Audit-key fields are added for [`Sink::File`] only.
+    pub fn details_json(&self, sink: Sink) -> Value {
+        let mut details = self.public_details();
+        if sink == Sink::File
+            && let (Value::Object(map), Value::Object(keyed)) =
+                (&mut details, self.audit_key_details())
+        {
+            map.extend(keyed);
+        }
+        details
+    }
+
+    /// The fields derived from the stable audit key: the fingerprint of a
+    /// revealed value with its domain, or the key's derivation inputs. An
+    /// empty object when the event has none or the key was not derived.
+    fn audit_key_details(&self) -> Value {
+        let fingerprint = |fp: &Option<KeyedFingerprint>| match fp {
+            Some(fp) => json!({
+                "fingerprint": fp.to_hex(),
+                "fingerprint_domain": fp.domain.label(),
+            }),
+            None => json!({}),
+        };
+        match self {
+            AuditEvent::VaultUnlocked {
+                audit_key: Some(derivation),
+                ..
+            } => json!({
+                "fingerprint_params": derivation.params.to_string(),
+                "fingerprint_salt": derivation.salt.to_string(),
+            }),
+            AuditEvent::RevealPassword {
+                fingerprint: fp, ..
+            }
+            | AuditEvent::RevealProtected {
+                fingerprint: fp, ..
+            }
+            | AuditEvent::DownloadAttachment {
+                fingerprint: fp, ..
+            } => fingerprint(fp),
+            _ => json!({}),
+        }
+    }
+
+    /// The fields every sink gets.
+    fn public_details(&self) -> Value {
         match self {
             AuditEvent::ServerStarted {
                 server_version,
@@ -307,13 +380,10 @@ impl AuditEvent {
             AuditEvent::VaultUnlocked {
                 unlock_source,
                 file_mtime,
-                fingerprint_params,
-                fingerprint_salt,
+                ..
             } => json!({
                 "unlock_source": unlock_source,
                 "file_mtime": file_mtime,
-                "fingerprint_params": fingerprint_params.to_string(),
-                "fingerprint_salt": fingerprint_salt.to_string(),
             }),
             AuditEvent::VaultLocked {
                 reason,
@@ -376,38 +446,32 @@ impl AuditEvent {
             AuditEvent::RevealPassword {
                 target_path,
                 target_uuid,
-                fingerprint,
+                ..
             } => json!({
                 "target_path": target_path,
                 "target_uuid": target_uuid,
-                "fingerprint": fingerprint.to_hex(),
-                "fingerprint_domain": fingerprint.domain.label(),
             }),
             AuditEvent::RevealProtected {
                 target_path,
                 target_uuid,
                 field_name,
-                fingerprint,
+                ..
             } => json!({
                 "target_path": target_path,
                 "target_uuid": target_uuid,
                 "field_name": field_name,
-                "fingerprint": fingerprint.to_hex(),
-                "fingerprint_domain": fingerprint.domain.label(),
             }),
             AuditEvent::DownloadAttachment {
                 target_path,
                 target_uuid,
                 attachment_name,
                 size_bytes,
-                fingerprint,
+                ..
             } => json!({
                 "target_path": target_path,
                 "target_uuid": target_uuid,
                 "attachment_name": attachment_name,
                 "size_bytes": size_bytes,
-                "fingerprint": fingerprint.to_hex(),
-                "fingerprint_domain": fingerprint.domain.label(),
             }),
             AuditEvent::WriterLockUnavailable { reason } => json!({ "reason": reason }),
             AuditEvent::UnlockFailed {
@@ -434,13 +498,13 @@ impl AuditEvent {
     /// Build the full envelope with an injected `timestamp` (RFC3339 string)
     /// and `pid`. Keeping these as arguments makes the rendering deterministic
     /// in tests; the runtime path supplies the real clock and pid.
-    pub fn envelope(&self, timestamp: &str, pid: u32) -> Value {
+    pub fn envelope(&self, timestamp: &str, pid: u32, sink: Sink) -> Value {
         json!({
             "timestamp": timestamp,
             "level": self.level(),
             "event": self.event(),
             "pid": pid,
-            "details": self.details_json(),
+            "details": self.details_json(sink),
         })
     }
 }
@@ -468,7 +532,14 @@ impl AuditLog {
         }
     }
 
-    /// Render `event` to a single JSONL line and emit it.
+    /// Whether an audit file is configured: only then is the stable audit
+    /// key worth deriving, since its fingerprints are written nowhere else.
+    pub fn has_file(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Render `event` once per sink and emit it: the stderr rendering to
+    /// stderr, the file rendering (with the audit-key fields) to the file.
     ///
     /// The timestamp is stamped here as `chrono::Utc::now()` in RFC3339 form
     /// and the pid as `std::process::id()`. Tests that need determinism call
@@ -476,20 +547,13 @@ impl AuditLog {
     pub fn write(&self, event: &AuditEvent) {
         let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let pid = std::process::id();
-        let envelope = event.envelope(&timestamp, pid);
-        let line = envelope.to_string();
-        self.emit_line(&line);
-    }
-
-    /// Write one already-rendered line (plus newline) to stderr and the file.
-    fn emit_line(&self, line: &str) {
         // stderr first so the record is visible even if the file write fails.
         let mut stderr = std::io::stderr();
-        let _ = writeln!(stderr, "{line}");
+        let _ = writeln!(stderr, "{}", event.envelope(&timestamp, pid, Sink::Stderr));
         if let Some(file) = &self.file
             && let Ok(mut handle) = file.lock()
         {
-            let _ = writeln!(handle, "{line}");
+            let _ = writeln!(handle, "{}", event.envelope(&timestamp, pid, Sink::File));
         }
     }
 }
@@ -526,10 +590,10 @@ mod tests {
                 AuditEvent::VaultUnlocked {
                     unlock_source: UnlockSource::Env,
                     file_mtime: "2026-05-08T10:00:00Z".to_string(),
-                    fingerprint_params: DeriveParams::FLOOR,
-                    fingerprint_salt: uuid::Uuid::from_u128(
-                        0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
-                    ),
+                    audit_key: Some(AuditKeyDerivation {
+                        params: DeriveParams::FLOOR,
+                        salt: uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+                    }),
                 },
                 "vault_unlocked",
                 Level::Info,
@@ -600,7 +664,7 @@ mod tests {
                 AuditEvent::RevealPassword {
                     target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
-                    fingerprint: fixed(Domain::Field),
+                    fingerprint: Some(fixed(Domain::Field)),
                 },
                 "reveal_password",
                 Level::Info,
@@ -610,7 +674,7 @@ mod tests {
                     target_path: Some("/Web/GitHub".to_string()),
                     target_uuid: "abcd".to_string(),
                     field_name: "RecoveryKey".to_string(),
-                    fingerprint: fixed(Domain::Field),
+                    fingerprint: Some(fixed(Domain::Field)),
                 },
                 "reveal_protected",
                 Level::Info,
@@ -621,7 +685,7 @@ mod tests {
                     target_uuid: "abcd".to_string(),
                     attachment_name: "key.pem".to_string(),
                     size_bytes: 2048,
-                    fingerprint: fixed(Domain::Attachment),
+                    fingerprint: Some(fixed(Domain::Attachment)),
                 },
                 "download_attachment",
                 Level::Info,
@@ -682,10 +746,75 @@ mod tests {
         assert_eq!(events.len(), PINNED_ENVELOPES.len());
         for ((event, name, _), pinned) in events.iter().zip(PINNED_ENVELOPES) {
             assert_eq!(
-                event.envelope("2026-01-01T00:00:00Z", 42).to_string(),
+                event
+                    .envelope("2026-01-01T00:00:00Z", 42, Sink::File)
+                    .to_string(),
                 *pinned,
                 "{name} drifted from the pinned audit format"
             );
+        }
+    }
+
+    /// The stderr renderings of the events that carry audit-key fields: the
+    /// same envelopes minus every such field, pinned like the file ones.
+    const PINNED_STDERR: &[(&str, &str)] = &[
+        (
+            "vault_unlocked",
+            r#"{"details":{"file_mtime":"2026-05-08T10:00:00Z","unlock_source":"env"},"event":"vault_unlocked","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        ),
+        (
+            "reveal_password",
+            r#"{"details":{"target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_password","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        ),
+        (
+            "reveal_protected",
+            r#"{"details":{"field_name":"RecoveryKey","target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"reveal_protected","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        ),
+        (
+            "download_attachment",
+            r#"{"details":{"attachment_name":"key.pem","size_bytes":2048,"target_path":"/Web/GitHub","target_uuid":"abcd"},"event":"download_attachment","level":"info","pid":42,"timestamp":"2026-01-01T00:00:00Z"}"#,
+        ),
+    ];
+
+    #[test]
+    fn stderr_never_carries_audit_key_material() {
+        for (event, name, _) in all_events() {
+            let stderr = event
+                .envelope("2026-01-01T00:00:00Z", 42, Sink::Stderr)
+                .to_string();
+            assert!(!stderr.contains("fingerprint"), "{name}: {stderr}");
+            assert!(!stderr.contains("argon2id"), "{name}: {stderr}");
+            assert!(!stderr.contains("01234567-89ab"), "{name}: {stderr}");
+            match PINNED_STDERR.iter().find(|(n, _)| *n == name) {
+                Some((_, pinned)) => assert_eq!(stderr, *pinned, "{name} stderr drifted"),
+                // Every other event renders the same for both sinks.
+                None => assert_eq!(
+                    stderr,
+                    event
+                        .envelope("2026-01-01T00:00:00Z", 42, Sink::File)
+                        .to_string(),
+                    "{name}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn without_an_audit_key_the_file_gets_no_fingerprint_fields() {
+        let reveal = AuditEvent::RevealPassword {
+            target_path: None,
+            target_uuid: "u".to_string(),
+            fingerprint: None,
+        };
+        let unlocked = AuditEvent::VaultUnlocked {
+            unlock_source: UnlockSource::Env,
+            file_mtime: String::new(),
+            audit_key: None,
+        };
+        for event in [reveal, unlocked] {
+            let file = event.details_json(Sink::File);
+            assert_eq!(file, event.details_json(Sink::Stderr));
+            assert!(!file.to_string().contains("fingerprint"));
         }
     }
 
@@ -721,7 +850,7 @@ mod tests {
     #[test]
     fn envelope_has_all_five_top_level_fields() {
         let (event, name, level) = all_events().into_iter().next().unwrap();
-        let env = event.envelope("2026-05-08T10:00:00Z", 12345);
+        let env = event.envelope("2026-05-08T10:00:00Z", 12345, Sink::File);
         let obj = env.as_object().unwrap();
         // Exactly the five envelope fields from spec section 6, no more.
         assert_eq!(obj.len(), 5);
@@ -735,7 +864,7 @@ mod tests {
     #[test]
     fn every_variant_renders_the_envelope_shape() {
         for (event, name, level) in all_events() {
-            let env = event.envelope("2026-05-08T10:00:00Z", 999);
+            let env = event.envelope("2026-05-08T10:00:00Z", 999, Sink::Stderr);
             assert_eq!(env["timestamp"], json!("2026-05-08T10:00:00Z"));
             assert_eq!(env["level"], json!(level));
             assert_eq!(env["event"], json!(name));
@@ -756,7 +885,7 @@ mod tests {
             target_uuid: "uuid-1".to_string(),
             field_name: None,
         };
-        let d = staged.details_json();
+        let d = staged.details_json(Sink::File);
         assert_eq!(d["tool"], json!("kdbx_add_entry"));
         assert_eq!(d["target_path"], json!("/Web/New"));
         assert_eq!(d["target_uuid"], json!("uuid-1"));
@@ -766,9 +895,9 @@ mod tests {
             target_path: Some("/Web/X".to_string()),
             target_uuid: "uuid-2".to_string(),
             field_name: "Secret".to_string(),
-            fingerprint: fixed(Domain::Field),
+            fingerprint: Some(fixed(Domain::Field)),
         };
-        let d = reveal.details_json();
+        let d = reveal.details_json(Sink::File);
         assert_eq!(d["field_name"], json!("Secret"));
         assert_eq!(d["fingerprint"], json!(FIXED_HEX));
         assert_eq!(d["fingerprint_domain"], json!(Domain::Field.label()));
@@ -780,7 +909,7 @@ mod tests {
             requested_time_unix: Some(0),
             time_unix: 1_699_999_970,
         };
-        let d = otp.details_json();
+        let d = otp.details_json(Sink::File);
         // No code field: the OTP value is never logged. The requested and the
         // effective (clamped) evaluation times are.
         assert!(d.get("code").is_none());
