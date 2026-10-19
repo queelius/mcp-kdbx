@@ -22,7 +22,7 @@ full test suite are done, and the server now adopts the shared `kdbx-core`
 crate: paths, visibility, field names and TOTP come from it, the stage diff
 uses diff-kdbx's snapshot API, the read views are built from a sealed
 snapshot, and the audit trail logs keyed fingerprints instead of unkeyed
-hashes. 270 tests pass (213 library, 41 protocol-conformance against the
+hashes. 271 tests pass (214 library, 41 protocol-conformance against the
 real binary over stdio, 16 integration); `cargo fmt --check` and `cargo
 clippy --all-targets --all-features -- -D warnings` are clean, and the
 source security audit (`scripts/ci-audit.sh`) passes. Not yet published to

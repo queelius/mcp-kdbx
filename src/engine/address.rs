@@ -148,6 +148,8 @@ impl EntryAddress {
             EntryAddress::Path(path) => path
                 .resolve_entry(view.snapshot())
                 .map_err(|e| not_found(path, &e)),
+            // One lookup per call: a single walk (Snapshot::find_entry) is
+            // cheaper than building a NodeIndex for it.
             EntryAddress::Uuid(uuid) => view
                 .snapshot()
                 .find_entry(*uuid)

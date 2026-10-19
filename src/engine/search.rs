@@ -107,6 +107,9 @@ pub fn find_entry<'v>(view: &'v View, query: &str, fields: &[Field]) -> SearchRe
         fields
     };
     let needle = query.to_lowercase();
+    // One walk to index the nodes, then a constant-time parent lookup per
+    // match (not a tree walk per match).
+    let nodes = view.nodes();
 
     let mut matches: Vec<SearchMatch> = view
         .snapshot()
@@ -120,7 +123,7 @@ pub fn find_entry<'v>(view: &'v View, query: &str, fields: &[Field]) -> SearchRe
         .map(|entry| SearchMatch {
             entry,
             title: entry.title().unwrap_or("").to_string(),
-            group_path: view.parent_path_string(entry.uuid),
+            group_path: view.parent_path_string(&nodes, entry.uuid),
         })
         .collect();
 

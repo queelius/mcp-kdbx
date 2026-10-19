@@ -36,7 +36,7 @@ use crate::engine::view::{View, ephemeral_key};
 use diff_kdbx::{Change, DiffOptions, NodeStatus, Property, PropertyChange, Shown};
 use kdbx_core::fields::StandardField;
 use kdbx_core::fingerprint::{Domain, FingerprintKey};
-use kdbx_core::model::Value as SnapValue;
+use kdbx_core::model::{NodeIndex, Value as SnapValue};
 use kdbx_core::visibility::{is_address, is_secret};
 use keepass::Database;
 use keepass::db::{EntryId, GroupId, Value};
@@ -611,6 +611,9 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
     let after = View::capture(working, &key);
     let change_set =
         diff_kdbx::compute(before.snapshot(), after.snapshot(), &DiffOptions::default());
+    // One walk of the working snapshot, then a constant-time lookup per
+    // changed record.
+    let nodes = after.nodes();
 
     let mut added: Vec<AddedEntry> = Vec::new();
     let mut modified: Vec<ModifiedEntry> = Vec::new();
@@ -622,14 +625,14 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
         };
         match &node.status {
             NodeStatus::Added => {
-                if let Some(entry) = map_added_entry(&after, node.uuid) {
+                if let Some(entry) = map_added_entry(&after, &nodes, node.uuid) {
                     added.push(entry);
                 }
             }
             // `moved_from` is not mapped: no v0.1 tool moves an entry, so a
             // stage cannot hold a move.
             NodeStatus::Modified { changes, .. } => {
-                if let Some(entry) = map_modified_entry(&after, &key, node.uuid, changes) {
+                if let Some(entry) = map_modified_entry(&after, &nodes, &key, node.uuid, changes) {
                     modified.push(entry);
                 }
             }
@@ -648,7 +651,7 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
     modified.sort_by_cached_key(|m| {
         let group_path = uuid::Uuid::parse_str(&m.uuid)
             .ok()
-            .and_then(|u| after.parent_path_string(u));
+            .and_then(|u| after.parent_path_string(&nodes, u));
         (group_path, m.title.clone(), m.uuid.clone())
     });
 
@@ -669,15 +672,15 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
 /// Build an [`AddedEntry`] for the entry `uuid` from the working db's
 /// [`View`], `after` (the same source the read views use, so the two agree on
 /// paths and on `has_otp`).
-fn map_added_entry(after: &View, uuid: uuid::Uuid) -> Option<AddedEntry> {
-    let entry = after.snapshot().find_entry(uuid)?;
+fn map_added_entry(after: &View, nodes: &NodeIndex<'_>, uuid: uuid::Uuid) -> Option<AddedEntry> {
+    let entry = nodes.entry(uuid)?;
     Some(AddedEntry {
         // Both paths are None for a record with no addressable path. There is
         // no fallback string: a placeholder like "/" would alias the root.
         path: after.path_string(uuid),
         uuid: uuid.hyphenated().to_string(),
         title: entry.title().unwrap_or("").to_string(),
-        group_path: after.parent_path_string(uuid),
+        group_path: after.parent_path_string(nodes, uuid),
         field_count: entry.fields.len(),
         has_attachments: !entry.attachments.is_empty(),
         has_otp: after.has_otp(uuid),
@@ -690,11 +693,12 @@ fn map_added_entry(after: &View, uuid: uuid::Uuid) -> Option<AddedEntry> {
 /// v0.1 diff surface.
 fn map_modified_entry(
     after: &View,
+    nodes: &NodeIndex<'_>,
     key: &FingerprintKey,
     uuid: uuid::Uuid,
     changes: &[PropertyChange],
 ) -> Option<ModifiedEntry> {
-    let entry = after.snapshot().find_entry(uuid)?;
+    let entry = nodes.entry(uuid)?;
     let path = after.path_string(uuid);
     let title = entry.title().unwrap_or("").to_string();
 

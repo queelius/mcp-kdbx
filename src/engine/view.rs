@@ -21,11 +21,12 @@
 
 use kdbx_core::capture::keepass_0_12::capture;
 use kdbx_core::fingerprint::FingerprintKey;
+use kdbx_core::model::NodeIndex;
 use kdbx_core::model::{Sealing, Snapshot};
 use kdbx_core::path::{PathIndex, VaultPath};
 use keepass::Database;
 use keepass::db::{EntryId, GroupId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -35,10 +36,6 @@ pub struct View {
     snapshot: Snapshot,
     paths: PathIndex,
     with_otp: HashSet<Uuid>,
-    /// Each node's containing group, built in the same capture pass, so a
-    /// parent lookup is O(1) instead of a tree walk per call (the snapshot's
-    /// own `parent_of` walks).
-    parents: HashMap<Uuid, Uuid>,
 }
 
 impl View {
@@ -51,19 +48,10 @@ impl View {
             .filter(|entry| crate::engine::otp::has_otp(entry))
             .map(|entry| entry.id().uuid())
             .collect();
-        let mut parents = HashMap::new();
-        for (node, parent) in snapshot.walk() {
-            if let Some(parent) = parent {
-                // First occurrence wins, as in Snapshot::parent_of and the
-                // path index, should a UUID repeat.
-                parents.entry(node.uuid()).or_insert(parent.uuid);
-            }
-        }
         View {
             snapshot,
             paths,
             with_otp,
-            parents,
         }
     }
 
@@ -96,11 +84,20 @@ impl View {
         self.with_otp.contains(&uuid)
     }
 
+    /// A [`NodeIndex`] of the snapshot: one linear walk, then constant-time
+    /// node and parent lookups. A caller doing many lookups (the search, the
+    /// stage diff) builds one per call and passes it on; it borrows the
+    /// snapshot, so it is not stored in the view.
+    pub fn nodes(&self) -> NodeIndex<'_> {
+        NodeIndex::new(&self.snapshot)
+    }
+
     /// The canonical path of the group that holds node `uuid`, as a string
     /// (`None` for the root, an unknown node, or a group with no addressable
-    /// path). O(1): an index lookup, not a tree walk.
-    pub fn parent_path_string(&self, uuid: Uuid) -> Option<String> {
-        self.path_string(*self.parents.get(&uuid)?)
+    /// path). `nodes` is this view's [`nodes`](Self::nodes); the lookup is
+    /// constant-time.
+    pub fn parent_path_string(&self, nodes: &NodeIndex<'_>, uuid: Uuid) -> Option<String> {
+        self.path_string(nodes.parent(uuid)?.uuid)
     }
 }
 
@@ -149,6 +146,40 @@ mod tests {
     }
 
     #[test]
+    fn parent_paths_from_the_node_index_agree_with_the_snapshot_walk() {
+        let mut db = Database::new();
+        let web = db
+            .root_mut()
+            .add_group()
+            .edit(|g| g.name = "Web".to_string())
+            .id();
+        let unnamed = db.group_mut(web).unwrap().add_group().id();
+        for group in [web, unnamed] {
+            db.group_mut(group).unwrap().add_entry().edit(|e| {
+                e.set_unprotected(fields::TITLE, "Mail");
+            });
+        }
+        db.root_mut()
+            .add_entry()
+            .edit(|e| e.set_unprotected(fields::TITLE, "Top"));
+        let view = View::capture_ephemeral(&db);
+        let nodes = view.nodes();
+        for (node, _) in view.snapshot().walk() {
+            let walked = view
+                .snapshot()
+                .parent_of(node.uuid())
+                .and_then(|p| view.path_string(p.uuid));
+            assert_eq!(view.parent_path_string(&nodes, node.uuid()), walked);
+        }
+        // The root has no parent; an entry under an unnamed group has a
+        // parent with no addressable path.
+        assert_eq!(
+            view.parent_path_string(&nodes, view.snapshot().root.uuid),
+            None
+        );
+    }
+
+    #[test]
     fn view_paths_name_live_records_and_seal_secrets() {
         let mut db = Database::new();
         let web = db
@@ -173,7 +204,8 @@ mod tests {
             Some("/")
         );
         assert_eq!(
-            view.parent_path_string(entry.uuid()).as_deref(),
+            view.parent_path_string(&view.nodes(), entry.uuid())
+                .as_deref(),
             Some("/Web/")
         );
         assert_eq!(entry_id(&db, entry.uuid()), Some(entry));
