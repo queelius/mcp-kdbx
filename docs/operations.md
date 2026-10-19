@@ -141,6 +141,14 @@ vault. `vault_unlocked` records the parameters (`fingerprint_params`) and the
 salt (`fingerprint_salt`), and the key is dropped (and wiped) on lock. An
 unlock with an audit file therefore costs one extra Argon2 run.
 
+That run happens at the vault's own Argon2 parameters (memory, passes and
+lanes), but single-threaded: argon2 0.5, the implementation kdbx-core uses,
+computes the lanes one after another. KeePassXC computes them in parallel,
+so a vault with several lanes takes several times its own KDF time to unlock
+with an audit file: a vault tuned to 1 s over 4 lanes adds roughly 4 s. The
+unlock call runs it off the async worker, so other requests are not stalled,
+but the `kdbx_unlock` reply waits for it.
+
 **The audit file is as sensitive as the vault file.** Someone holding the log
 and one revealed plaintext (a value they saw, or guessed) can test
 master-password guesses offline: derive a key from a guess with the logged
@@ -154,9 +162,10 @@ Three rules keep that material in the log and nowhere else:
 - Everything derived from the stable key (fingerprints, `fingerprint_params`,
   `fingerprint_salt`) is written to the audit file only. The copy of each
   event on stderr, which MCP hosts often show or collect, omits those fields.
-- Without `KDBX_LOG_FILE` (or when the file cannot be opened) the stable key
-  is not derived at all: no Argon2 run, and audit events carry no
-  fingerprint.
+- Without `KDBX_LOG_FILE` (or when the file cannot be opened), or with a
+  `KDBX_LOG_LEVEL` that does not record reveal events (`warn` or `error`),
+  the stable key is not derived at all: no Argon2 run, and audit events
+  carry no fingerprint.
 - Fingerprints in tool responses (`kdbx_list_attachments`,
   `kdbx_download_attachment`) use a different key, drawn at random at each
   unlock and wiped on lock. They identify content within one session (a

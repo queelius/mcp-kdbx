@@ -21,7 +21,7 @@ pub mod views;
 pub mod writes;
 
 use crate::engine::address::EntryAddress;
-use crate::engine::audit::{AuditEvent, AuditLog};
+use crate::engine::audit::{AuditEvent, AuditLog, fingerprints_recorded};
 use crate::engine::config::Config;
 use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 use crate::engine::secret::Secret;
@@ -58,8 +58,9 @@ impl KdbxServer {
     /// `kdbx_unlock`.
     pub fn new(config: Config, audit: AuditLog) -> Self {
         // The stable audit key exists only for audit-file fingerprints, so it
-        // is derived (one Argon2 run per unlock) exactly when there is a file.
-        let audit_fingerprints = if audit.has_file() {
+        // is derived (one Argon2 run per unlock) exactly when an audit file is
+        // configured and the log level records the events that carry them.
+        let audit_fingerprints = if fingerprints_recorded(&audit, config.log_level) {
             AuditFingerprints::Keyed
         } else {
             AuditFingerprints::Off
@@ -335,5 +336,27 @@ mod tests {
             ..Config::default()
         };
         assert_redacted("Config", format!("{config:?}"));
+    }
+
+    #[test]
+    fn the_audit_key_is_derived_only_with_an_audit_file_that_records_reveals() {
+        use crate::adapter::KdbxServer;
+        use crate::engine::audit::{AuditLog, Level};
+        use crate::engine::vault::AuditFingerprints;
+        let keyed = |file: bool, log_level: Level| {
+            let config = Config {
+                log_level,
+                ..Config::default()
+            };
+            let audit = AuditLog::new(file.then(|| tempfile::tempfile().unwrap()));
+            let server = KdbxServer::new(config, audit);
+            let vault = server.state.try_lock().unwrap();
+            vault.audit_fingerprints()
+        };
+        assert_eq!(keyed(true, Level::Info), AuditFingerprints::Keyed);
+        assert_eq!(keyed(true, Level::Debug), AuditFingerprints::Keyed);
+        // KDBX_LOG_LEVEL=warn records no reveal event, so no Argon2 run.
+        assert_eq!(keyed(true, Level::Warn), AuditFingerprints::Off);
+        assert_eq!(keyed(false, Level::Info), AuditFingerprints::Off);
     }
 }

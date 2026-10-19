@@ -265,6 +265,11 @@ impl Vault {
         self
     }
 
+    /// Whether unlock derives the stable audit fingerprint key.
+    pub fn audit_fingerprints(&self) -> AuditFingerprints {
+        self.audit_fingerprints
+    }
+
     /// The path to the vault file.
     pub fn path(&self) -> &std::path::Path {
         &self.path

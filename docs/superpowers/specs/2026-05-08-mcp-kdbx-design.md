@@ -827,7 +827,7 @@ These are non-negotiable:
 
 - **Never log plaintext values.** No password, no protected field, no OTP code, no attachment bytes ever appears in any log entry except at `trace` level.
 - **Reveal events log a keyed fingerprint, not the value.** Since the kdbx-core adoption: `HMAC-SHA256(K, domain || value)` (kdbx-core's `Fingerprint`, 64 hex), where `K` is the stable audit key, derived once per unlock with Argon2id from the master key material, salted with the root group UUID, at parameters never cheaper than the vault's own KDF (floor 64 MiB x 3 passes). The original `sha256("kdbx-reveal-v1\0" || value)` was unkeyed, so a low-entropy secret could be recovered by hashing candidates (a reviewer recovered a 4-digit PIN in under 10,000 tries); the keyed form can be checked only with the vault's key material, using `diff-kdbx fingerprint`.
-- **The audit file is as sensitive as the vault file.** Its fingerprints, with the `fingerprint_params` and `fingerprint_salt` that `vault_unlocked` records, let someone who also knows one revealed plaintext search the master password offline at the vault's own KDF cost (the same cost as attacking the vault file, never cheaper, by kdbx-core's `DeriveParams` floor). So that material goes to the audit file only: the stderr copy of every event omits all fields derived from `K`, and without an audit file `K` is not derived at all. Protect the file like the vault.
+- **The audit file is as sensitive as the vault file.** Its fingerprints, with the `fingerprint_params` and `fingerprint_salt` that `vault_unlocked` records, let someone who also knows one revealed plaintext search the master password offline at the vault's own KDF cost (the same cost as attacking the vault file, never cheaper, by kdbx-core's `DeriveParams` floor). So that material goes to the audit file only: the stderr copy of every event omits all fields derived from `K`, and without an audit file, or with a log level that records no reveal event, `K` is not derived at all. Protect the file like the vault.
 - **Tool-response fingerprints are session-keyed.** `kdbx_list_attachments` and `kdbx_download_attachment` fingerprint under a random key drawn at each unlock and wiped on lock, never under `K`: the client sees attachment bytes next to their fingerprint, and a stable-keyed one would hand it the offline oracle above. Session fingerprints identify content within one unlock only and are not stable across unlocks.
 - **Path segments and field names ARE logged.** They're metadata, not secrets. Users with paranoid threat models can disable info-level logging by setting `KDBX_LOG_LEVEL=warn`.
 - **Master password and unlock-command output never appear anywhere.** Specifically scrubbed in `mcp_message` capture (`password` parameter replaced with `"<redacted>"`).
@@ -1460,7 +1460,10 @@ audit and threat model, amended as follows.
   different after every unlock. The stable audit key (Argon2id over the
   password and key file bytes, salted with the root group UUID,
   `DeriveParams::for_header`) is derived at unlock only when an audit file
-  is configured and keys audit-file fingerprints only. A stable-keyed
+  is configured and the log level records reveal events, and keys
+  audit-file fingerprints only. argon2 0.5 runs the lanes sequentially, so
+  that derivation can take several times the vault's own (parallel) KDF
+  time. A stable-keyed
   fingerprint next to its plaintext is an offline master-password oracle at
   the vault's KDF cost, so it never appears in a tool response or on stderr.
 - **Audit format.** `reveal_password`, `reveal_protected` and

@@ -209,6 +209,19 @@ pub enum Sink {
     File,
 }
 
+/// The level of every event that carries an audit fingerprint (the reveal
+/// and download events). The one definition: [`AuditEvent::level`] uses it,
+/// and [`fingerprints_recorded`] decides from it whether the stable audit key
+/// is worth deriving.
+pub const FINGERPRINT_EVENT_LEVEL: Level = Level::Info;
+
+/// Whether audit fingerprints would be written anywhere: an audit file is
+/// configured and `log_level` records the events that carry them. When not,
+/// the stable audit key (one Argon2 run per unlock) is not derived.
+pub fn fingerprints_recorded(audit: &AuditLog, log_level: Level) -> bool {
+    audit.has_file() && FINGERPRINT_EVENT_LEVEL <= log_level
+}
+
 /// One audited action. Each variant carries the event-specific detail fields
 /// named in the spec's "Logged events" table (section 6).
 ///
@@ -366,9 +379,9 @@ impl AuditEvent {
             AuditEvent::SaveCommitted { .. } => Level::Info,
             AuditEvent::SaveRefused { .. } => Level::Warn,
             AuditEvent::SaveFailed { .. } => Level::Error,
-            AuditEvent::RevealPassword { .. } => Level::Info,
-            AuditEvent::RevealProtected { .. } => Level::Info,
-            AuditEvent::DownloadAttachment { .. } => Level::Info,
+            AuditEvent::RevealPassword { .. }
+            | AuditEvent::RevealProtected { .. }
+            | AuditEvent::DownloadAttachment { .. } => FINGERPRINT_EVENT_LEVEL,
             AuditEvent::GetOtp { .. } => Level::Info,
             AuditEvent::WriterLockUnavailable { .. } => Level::Warn,
         }
@@ -872,6 +885,27 @@ mod tests {
             let file = event.details_json(Sink::File);
             assert_eq!(file, event.details_json(Sink::Stderr));
             assert!(!file.to_string().contains("fingerprint"));
+        }
+    }
+
+    #[test]
+    fn fingerprints_are_recorded_only_with_a_file_and_a_level_that_keeps_reveals() {
+        let file = AuditLog::new(Some(tempfile::tempfile().unwrap()));
+        let none = AuditLog::stderr_only();
+        assert!(fingerprints_recorded(&file, Level::Info));
+        assert!(fingerprints_recorded(&file, Level::Trace));
+        assert!(!fingerprints_recorded(&file, Level::Warn));
+        assert!(!fingerprints_recorded(&file, Level::Error));
+        assert!(!fingerprints_recorded(&none, Level::Info));
+        // Every event that carries a fingerprint is at that level.
+        for (event, name, _) in all_events() {
+            if event
+                .audit_key_details()
+                .as_object()
+                .is_some_and(|m| m.contains_key("fingerprint"))
+            {
+                assert_eq!(event.level(), FINGERPRINT_EVENT_LEVEL, "{name}");
+            }
         }
     }
 
