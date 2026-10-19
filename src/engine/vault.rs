@@ -21,7 +21,7 @@
 //! which is what discards the pending stage: there is no separate stage data
 //! structure to clear.
 
-use crate::engine::audit::{AuditKeyDerivation, KeyedFingerprint};
+use crate::engine::audit::{AuditKey, AuditKeyDerivation, KeyedFingerprint};
 use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 use crate::engine::vault_file::{FileFingerprint, read_with_fingerprint};
 use crate::engine::view::{View, ephemeral_key};
@@ -142,13 +142,6 @@ pub enum AuditFingerprints {
     Off,
 }
 
-/// The stable audit key and what it was derived with. Opaque: the key never
-/// leaves the vault.
-pub struct AuditKey {
-    key: FingerprintKey,
-    derivation: AuditKeyDerivation,
-}
-
 /// Derive the stable audit fingerprint key from the key material that just
 /// opened `db`: `FingerprintKey::derive` (Argon2id) over the password
 /// bytes and the raw key file bytes, salted with the root group UUID, with
@@ -172,7 +165,7 @@ fn derive_audit_key(
     let params = DeriveParams::for_header(Some(&header(db)));
     let salt = db.root().id().uuid();
     let material = KeyMaterial::new(Some(password.as_bytes()), keyfile);
-    let key = FingerprintKey::derive(&material, salt, &params).map_err(|e| {
+    AuditKey::derive(&material, salt, params).map_err(|e| {
         CoreError::new(ErrorCode::VaultUnreadable)
             .with_message(format!(
                 "the vault opened, but its KDF parameters cannot derive the audit key: {e}"
@@ -180,10 +173,6 @@ fn derive_audit_key(
             .with_details(
                 serde_json::json!({ "reason": UnreadableReason::KdfParametersUnsupported }),
             )
-    })?;
-    Ok(AuditKey {
-        key,
-        derivation: AuditKeyDerivation { params, salt },
     })
 }
 
@@ -504,12 +493,9 @@ impl Vault {
         bytes: &[u8],
     ) -> CoreResult<Option<KeyedFingerprint>> {
         match &self.state {
-            VaultState::Unlocked { audit_key, .. } => {
-                Ok(audit_key.as_ref().map(|audit| KeyedFingerprint {
-                    domain,
-                    fingerprint: audit.key.fingerprint(domain, bytes),
-                }))
-            }
+            VaultState::Unlocked { audit_key, .. } => Ok(audit_key
+                .as_ref()
+                .map(|audit| audit.fingerprint(domain, bytes))),
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
         }
     }
@@ -521,7 +507,7 @@ impl Vault {
     pub fn audit_key_derivation(&self) -> CoreResult<Option<AuditKeyDerivation>> {
         match &self.state {
             VaultState::Unlocked { audit_key, .. } => {
-                Ok(audit_key.as_ref().map(|audit| audit.derivation))
+                Ok(audit_key.as_ref().map(AuditKey::derivation))
             }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
         }
@@ -1123,7 +1109,7 @@ mod tests {
                 .audit_fingerprint(Domain::Field, b"hunter2")
                 .unwrap()
                 .expect("keyed");
-            assert_eq!(logged.domain, Domain::Field);
+            assert_eq!(logged.domain(), Domain::Field);
             // A verifier with the password, the params and the salt rebuilds
             // the same key (what `diff-kdbx fingerprint` does).
             let verifier = FingerprintKey::derive(
@@ -1133,12 +1119,13 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                logged.fingerprint,
+                logged.fingerprint(),
                 verifier.fingerprint(Domain::Field, b"hunter2")
             );
             let tool = vault.fingerprint(Domain::Field, b"hunter2").unwrap();
             assert_ne!(
-                tool, logged.fingerprint,
+                tool,
+                logged.fingerprint(),
                 "tool responses never use the audit key"
             );
             // The cached view seals under the session key, not the audit key.
@@ -1148,7 +1135,7 @@ mod tests {
                 entry.field("Password").unwrap().value,
                 kdbx_core::model::Value::Sealed(tool)
             );
-            audit.push(logged.fingerprint);
+            audit.push(logged.fingerprint());
             session.push(tool);
             vault.lock(LockReason::Manual);
             assert_eq!(

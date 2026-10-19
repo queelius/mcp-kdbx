@@ -46,7 +46,9 @@ use crate::engine::error::ErrorCode;
 use crate::engine::unlock::UnlockSource;
 use crate::engine::vault::{LockReason, UnreadableReason};
 use crate::engine::vault_file::{LockUnavailable, SaveStep};
-use kdbx_core::fingerprint::{DeriveParams, Domain, Fingerprint};
+use kdbx_core::fingerprint::{
+    DeriveParams, Domain, Fingerprint, FingerprintKey, KdfError, KeyMaterial,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::File;
@@ -112,22 +114,75 @@ pub enum StageDiscardReason {
     Manual,
 }
 
-/// A keyed fingerprint together with the kdbx-core domain it was computed in.
+/// The stable audit fingerprint key, with what it was derived with.
 ///
-/// Built only by `Vault::fingerprint`, which owns the session's audit key, so
-/// the recorded domain is the one actually used. An event renders it as
-/// `fingerprint` (64 lowercase hex) and `fingerprint_domain` (the domain's
-/// versioned label, `kdbx-core/field/v1` or `kdbx-core/attachment/v1`).
+/// The only way to build one is [`AuditKey::derive`], which runs Argon2id
+/// over the vault's key material, and the only way to build a
+/// [`KeyedFingerprint`] (what an audit event carries) is
+/// [`AuditKey::fingerprint`]. So an audit event cannot carry a fingerprint
+/// computed under the random session key, and a session-keyed
+/// [`Fingerprint`] (what tool responses carry) cannot be passed where an
+/// audit fingerprint is expected. Opaque: the key never leaves this value,
+/// and it is zeroized on drop.
+pub struct AuditKey {
+    key: FingerprintKey,
+    derivation: AuditKeyDerivation,
+}
+
+impl AuditKey {
+    /// Derive the key with `FingerprintKey::derive` (Argon2id) from
+    /// `material`, salted with `salt`, at `params`. Runs the KDF.
+    pub fn derive(
+        material: &KeyMaterial<'_>,
+        salt: uuid::Uuid,
+        params: DeriveParams,
+    ) -> Result<AuditKey, KdfError> {
+        Ok(AuditKey {
+            key: FingerprintKey::derive(material, salt, &params)?,
+            derivation: AuditKeyDerivation { params, salt },
+        })
+    }
+
+    /// What the key was derived with (for `vault_unlocked`'s file copy).
+    pub fn derivation(&self) -> AuditKeyDerivation {
+        self.derivation
+    }
+
+    /// The audit fingerprint of `bytes` in `domain`.
+    pub fn fingerprint(&self, domain: Domain, bytes: &[u8]) -> KeyedFingerprint {
+        KeyedFingerprint {
+            domain,
+            fingerprint: self.key.fingerprint(domain, bytes),
+        }
+    }
+}
+
+/// A fingerprint under the stable audit key, together with the kdbx-core
+/// domain it was computed in.
+///
+/// Built only by [`AuditKey::fingerprint`] (the fields are private), so the
+/// key is always the audit key and the recorded domain is the one actually
+/// used. An event renders it, in the audit file only, as `fingerprint` (64
+/// lowercase hex) and `fingerprint_domain` (the domain's versioned label,
+/// `kdbx-core/field/v1` or `kdbx-core/attachment/v1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyedFingerprint {
-    /// The domain the fingerprint separates (field value, attachment bytes).
-    pub domain: Domain,
-    /// The fingerprint.
-    pub fingerprint: Fingerprint,
+    domain: Domain,
+    fingerprint: Fingerprint,
 }
 
 impl KeyedFingerprint {
-    /// The 64-character lowercase hex form, as logged and as tools report it.
+    /// The domain the fingerprint separates (field value, attachment bytes).
+    pub fn domain(&self) -> Domain {
+        self.domain
+    }
+
+    /// The fingerprint itself.
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    /// The 64-character lowercase hex form, as logged.
     pub fn to_hex(&self) -> String {
         self.fingerprint.to_hex()
     }
@@ -186,8 +241,10 @@ pub enum AuditEvent {
         reason: LockReason,
         pending_discarded_count: u64,
     },
-    /// An unlock failed before any key was checked: the vault file is not a
-    /// readable KDBX database (`VAULT_UNREADABLE`). Distinct from
+    /// An unlock failed with `VAULT_UNREADABLE`: the vault file is not a
+    /// readable KDBX database (found before any key was checked), or, with
+    /// `reason` `kdf_parameters_unsupported`, the key was right but the
+    /// vault's KDF parameters cannot derive the audit key. Distinct from
     /// `auth_failed`, which is a wrong key. `reason` is null only if the
     /// error carried none, which the vault never does.
     UnlockFailed {

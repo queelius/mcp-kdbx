@@ -332,9 +332,10 @@ output: { ok: true, data: { discarded: true, num_dropped: number } }
 | `GROUP_NOT_FOUND` | Path doesn't resolve to a group |
 | `ENTRY_NOT_FOUND` | Path doesn't resolve to an entry |
 | `FIELD_NOT_FOUND` | Entry has no field by that name |
-| `FIELD_NOT_PROTECTED` | Reveal called on a non-protected field |
+| `FIELD_NOT_PROTECTED` | `kdbx_reveal_protected` called on a field that is not a secret. Since the kdbx-core adoption "secret" is kdbx-core's `is_secret` (protected, or a Password; never the Title): an unprotected Password is revealable, a protected Title is refused with this code |
 | `ATTACHMENT_NOT_FOUND` | Entry has no attachment by that name |
-| `NO_OTP_CONFIGURED` | Entry has no `otp` field or no valid TOTP URI |
+| `NO_OTP_CONFIGURED` | Entry has no OTP source at all (no `otp` URI, no KeePass 2 `TimeOtp-*` fields, no legacy `TOTP Seed`) |
+| `OTP_INVALID` | An OTP source is present but does not resolve to a usable configuration. `details.source` is `uri`, `keepass_native` or `legacy`; `details.reason` is kdbx-core's `MalformedReason` (for example `invalid_secret`, `unsupported_algorithm`, or `{"missing_field": "TOTP Seed"}`) (implementation notes, kdbx-core adoption) |
 | `WRITES_DISABLED` | Write tool called when `KDBX_ALLOW_WRITES != true` |
 | `NO_PENDING_CHANGES` | `kdbx_save_pending` called with empty stage |
 | `WRITE_FAILED` | Disk write failed |
@@ -342,8 +343,8 @@ output: { ok: true, data: { discarded: true, num_dropped: number } }
 | `ENTRY_TITLE_INVALID` | Title is empty or contains literal `/` |
 | `FIELD_NAME_INVALID` | Field name is empty or has reserved characters |
 | `INVALID_INPUT` | A supplied value is malformed in a way no other code names (see implementation notes) |
-| `PATH_INVALID` | A path is malformed: no leading `/`, an empty `//` segment, a dangling `\` escape, or a `:0` ordinal (implementation notes, 2026-10-18) |
-| `VAULT_UNREADABLE` | The vault file fails before any key check: `details.reason` is `not_kdbx`, `unsupported_version`, `truncated`, or `corrupt_header` (implementation notes, 2026-10-18) |
+| `PATH_INVALID` | A path is malformed: no leading `/`, an empty `//` segment, a dangling `\` escape, an unknown escape (escapes are strict since the kdbx-core adoption: `\/`, `\\`, `\:`, `\n`, `\t`, `\r` and `\u{XXXX}` only), or a `:0` ordinal. The message leads with kdbx-core's reason (implementation notes, 2026-10-18 and kdbx-core adoption) |
+| `VAULT_UNREADABLE` | The vault cannot be used. `details.reason` is `not_kdbx`, `unsupported_version`, `truncated` or `corrupt_header`, all found before any key check (implementation notes, 2026-10-18), or `kdf_parameters_unsupported`: found after the key was checked, when the vault's KDF parameters cannot derive the audit fingerprint key. That reason tells the caller nothing beyond what they already know, having supplied the password (implementation notes, kdbx-core adoption) |
 
 ## Versioning
 
