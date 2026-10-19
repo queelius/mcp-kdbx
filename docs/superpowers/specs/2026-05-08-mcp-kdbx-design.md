@@ -1385,3 +1385,94 @@ integration tests assert them.
   (except `kdbx_list_groups`), or a malformed uuid is `INVALID_INPUT`; an
   unknown uuid is `GROUP_NOT_FOUND`. A group under an unnamed group, whose
   path is null, is reachable this way.
+
+# Implementation notes (kdbx-core adoption, 2026-10-18)
+
+Branch `adopt/kdbx-core`, plan `docs/superpowers/plans/2026-10-18-mcp-kdbx-kdbx-core-adoption.md`,
+design in `~/github/kdbx/kdbx-core/docs/superpowers/specs/2026-10-18-kdbx-core-design.md`
+(sections 3, 5 and 9). mcp-kdbx stops carrying its own copies of the
+ecosystem rules; this spec stays canonical for the protocol surface, auth,
+audit and threat model, amended as follows.
+
+- **Dependencies.** `kdbx-core` (feature `keepass-0_12`, default `kdf`) and
+  the rebuilt `diff-kdbx` library (a pure function of two kdbx-core
+  snapshots, no keepass type in its API), both path dependencies until
+  published. keepass floor 0.12.9. The internal module `kdbx_core` is now
+  `engine`, so `kdbx_core::` always means the shared crate. `totp-lite`,
+  `base32` and `url` are gone.
+- **Snapshots and the view.** `engine::view::View` is a kdbx-core snapshot
+  of a keepass database, captured under `Sealing::Fingerprint` (no secret
+  plaintext is copied), with its `PathIndex` and the set of entries whose
+  TOTP resolves (computed from the live entries at capture, since the
+  snapshot seals the OTP secret). The vault caches one `View` of the working
+  db per generation; every mutable access to the working db, a discard, a
+  save, a lock and an unlock drop it. The read tools
+  (`kdbx_list_groups`, `kdbx_list_entries`, `kdbx_get_entry`,
+  `kdbx_find_entry`, `kdbx_list_attachments`) are built from the view alone,
+  so they cannot emit a secret by construction; the reveal and write tools
+  use the live database. Listings come in the snapshot's order (UUID order
+  on keepass 0.12) rather than hash-set order.
+- **Paths.** One grammar, kdbx-core's `VaultPath`. Group paths now format
+  with a trailing `/` (`/Personal/Finance/`, the diff's `group_path` `/Web/`),
+  so an emitted group path never re-resolves as an entry. Escapes are strict:
+  an unknown escape (`\q`) is `PATH_INVALID`, and `\n`, `\t`, `\r`,
+  `\u{XXXX}` name control characters (they used to decode to the bare letter).
+  `PathError` maps to `PATH_INVALID` (kdbx-core's reason leads the message);
+  `ResolveError::GroupNotFound` to `GROUP_NOT_FOUND` and `EntryNotFound` to
+  `ENTRY_NOT_FOUND`, both with `{path, segment, ordinal}` details; a
+  group-shaped entry path stays `ENTRY_NOT_FOUND`. Write tools resolve
+  against a fresh capture of the working db.
+- **Visibility.** One secret predicate, `kdbx_core::visibility::is_secret`
+  (protected, or a Password; never the Title). A Password whose protection
+  flag is off is now a secret everywhere: hidden from bulk reads, search and
+  the stage diff, and revealable through `kdbx_reveal_protected` (which now
+  accepts exactly the secret fields and answers `FIELD_NOT_PROTECTED` for the
+  rest, including a protected Title). Field names come from
+  `kdbx_core::fields::StandardField`.
+- **TOTP.** kdbx-core's `otp`: the OTP fields come from the live entry
+  (`capture::keepass_0_12::otp_fields`) and resolve with `resolve_fields`.
+  New error code `OTP_INVALID` for a configuration that is present but
+  unusable, with `details.source` (`uri`, `keepass_native`, `legacy`) and
+  `details.reason` (kdbx-core's `MalformedReason`, for example
+  `invalid_secret` or `{"missing_field": "TOTP Seed"}`); `NO_OTP_CONFIGURED`
+  now means no source is present at all. `has_otp` is true only for a
+  configuration that resolves. Steam codes are supported; a malformed
+  `period` or `digits` in a URI, and unknown algorithms or encoders, are
+  rejected rather than defaulted.
+- **Stage diff.** `kdbx_diff_pending` captures canonical and working under
+  one random key per call and calls `diff_kdbx::compute`; the response shape
+  is unchanged. A field change shows values only when both sides are plain
+  (a sealed side means a secret), so protected UserName or custom-field
+  changes are `modified` with no value, and no fingerprint ever reaches the
+  agent. `moved_from` is not mapped (no tool moves an entry); attachment
+  change kinds are typed (same `added`/`removed`/`modified` wire).
+- **Fingerprints: two keys.** A random per-session key (OS RNG, drawn at
+  unlock, wiped on lock) seals the view and keys every fingerprint a tool
+  returns: `kdbx_list_attachments` and `kdbx_download_attachment` report
+  `fingerprint` (64 hex) instead of `sha256`, equal within a session and
+  different after every unlock. The stable audit key (Argon2id over the
+  password and key file bytes, salted with the root group UUID,
+  `DeriveParams::for_header`) is derived at unlock only when an audit file
+  is configured and keys audit-file fingerprints only. A stable-keyed
+  fingerprint next to its plaintext is an offline master-password oracle at
+  the vault's KDF cost, so it never appears in a tool response or on stderr.
+- **Audit format.** `reveal_password`, `reveal_protected` and
+  `download_attachment` replace `sha256` with `fingerprint` and
+  `fingerprint_domain` (`kdbx-core/field/v1` or `kdbx-core/attachment/v1`);
+  `vault_unlocked` gains `fingerprint_params` (the `DeriveParams` display
+  form) and `fingerprint_salt`. Every field derived from the audit key is
+  rendered for the audit file only; the stderr copy omits them. The spec's
+  section 5 proposal of a `fingerprint_v` field is realized as the versioned
+  `fingerprint_domain` label. `diff-kdbx fingerprint --params --salt --field
+  --entry` reproduces a logged field fingerprint (docs/operations.md).
+- **Unlock failure.** A vault whose KDF parameters cannot derive the audit
+  key (Argon2 rejects them or their memory cannot be allocated) fails to
+  unlock with `VAULT_UNREADABLE`, reason `kdf_parameters_unsupported`. There
+  is no cheaper fallback, since the key may never cost less than the vault's
+  own KDF. Unlike the other reasons this one is found after the key check.
+- **Tests and audit.** The pinned JSONL test covers both sinks; a test shows
+  the fixture PIN matches no unkeyed digest of any 4-digit candidate; others
+  show tool fingerprints change across unlocks while audit fingerprints are
+  stable and verifiable, and that stderr carries no audit-key material.
+  `scripts/ci-audit.sh` check C requires keyed fingerprints in the reveal
+  handlers, and check G allows SHA-256 only for the vault-file identity hash.

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "feat/**"]
+    branches: [main, "feat/**", "adopt/**"]
   pull_request:
 
 # Cancel superseded runs on the same ref.
@@ -21,19 +21,34 @@ jobs:
       run:
         working-directory: mcp-kdbx
     steps:
-      # diff-kdbx is a path dependency (../diff-kdbx). Lay the two repos out as
-      # siblings under the workspace so the path dep resolves. This is the v0.1
-      # stopgap until diff-kdbx is published to crates.io; CI tracks diff-kdbx's
-      # default branch, which must carry the API mcp-kdbx builds against.
+      # kdbx-core and diff-kdbx are path dependencies (../kdbx-core,
+      # ../diff-kdbx). Lay the three repos out as siblings under the workspace
+      # so the path deps resolve, until both crates are published to crates.io
+      # and Cargo.toml switches to versions.
+      #
+      # TODO(before the first push of adopt/kdbx-core): pin both sibling
+      # checkouts with `ref: <commit SHA>`. queelius/kdbx-core does not exist
+      # on GitHub yet (the owner approves creating it), and diff-kdbx's
+      # snapshot API lives on its unpushed redesign/snapshot branch, so a
+      # default-branch checkout of diff-kdbx builds the old API and fails.
+      # Pin each to the SHA of the commit mcp-kdbx was built against, not to
+      # a branch name.
       - name: Check out mcp-kdbx
         uses: actions/checkout@v4
         with:
           path: mcp-kdbx
+      - name: Check out kdbx-core (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: queelius/kdbx-core
+          path: kdbx-core
+          # TODO: ref: <kdbx-core commit SHA> (see the note above)
       - name: Check out diff-kdbx (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: queelius/diff-kdbx
           path: diff-kdbx
+          # TODO: ref: <diff-kdbx commit SHA with the snapshot API>
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -61,15 +76,23 @@ jobs:
       run:
         working-directory: mcp-kdbx
     steps:
+      # Same sibling layout as rust-test (and the same TODO: pin both refs).
       - name: Check out mcp-kdbx
         uses: actions/checkout@v4
         with:
           path: mcp-kdbx
+      - name: Check out kdbx-core (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: queelius/kdbx-core
+          path: kdbx-core
+          # TODO: ref: <kdbx-core commit SHA> (see the note in rust-test)
       - name: Check out diff-kdbx (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: queelius/diff-kdbx
           path: diff-kdbx
+          # TODO: ref: <diff-kdbx commit SHA with the snapshot API>
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo build

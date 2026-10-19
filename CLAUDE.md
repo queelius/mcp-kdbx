@@ -12,7 +12,9 @@ User-facing summary: `README.md`. Full v0.1 design (motivation, protocol surface
 
 **All five v0.1 phases complete (the full server, its automated test suite, CI gates, and docs). Merged to `main` locally (merge commit, `feat/v0.1` deleted); `main` is ahead of `origin/main` and not yet pushed. v0.1 is feature-complete, pending a crates.io release.**
 
-The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). 308 tests pass (260 library unit tests, 36 protocol-conformance, 12 integration); `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the source security audit (`bash scripts/ci-audit.sh`) are clean. The server runs: all 17 tools register and respond over real stdio MCP.
+The v0.1 implementation plan landed at `docs/superpowers/plans/2026-05-09-mcp-kdbx-v0.1.md` (26 tasks, 5 phases). After the kdbx-core adoption (below), 264 tests pass (209 library unit tests, 40 protocol-conformance, 15 integration); `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the source security audit (`bash scripts/ci-audit.sh`, checks A to G) are clean. The server runs: all 17 tools register and respond over real stdio MCP.
+
+**kdbx-core adoption (2026-10-18, branch `adopt/kdbx-core`, plan `docs/superpowers/plans/2026-10-18-mcp-kdbx-kdbx-core-adoption.md`).** mcp-kdbx no longer carries its own copies of the ecosystem rules. Architecture now: `src/engine/` (renamed from `kdbx_core`, so `kdbx_core::` always means the shared crate) holds `view` (a `View` is a fingerprint-sealed kdbx-core snapshot of a keepass db plus its `PathIndex` and OTP availability; the vault caches one per working-db generation), `address` (path or uuid, resolved against a view: `resolve_in` to the snapshot record for reads, `resolve` to the live keepass id for reveals and writes), `otp` (kdbx-core's `otp` over the live entry's `otp_fields`, typed `OTP_INVALID`), `search` (over the snapshot), `stage` (diff via `diff_kdbx::compute` on two snapshots), `audit`, `vault`, and the rest unchanged. Paths, visibility (`is_secret`), field names, TOTP and fingerprints all come from kdbx-core; `engine::path`, `engine::visibility` and `engine::totp` are deleted. The read views are built from the cached snapshot alone; reveals and writes use the live db. Two fingerprint keys: a random per-session key for every fingerprint in a tool response, and the Argon2-derived stable audit key (only when an audit file is configured) for audit-file fingerprints, whose fields never reach stderr. User-visible changes: group paths keep their trailing `/`, escapes are strict, an unprotected Password is a secret, `OTP_INVALID`, Steam TOTP, attachment `fingerprint` instead of `sha256`, and the audit JSONL fields. Details: the spec's "Implementation notes (kdbx-core adoption, 2026-10-18)".
 
 Phase 1 (tasks 1 to 9), the `engine` foundation: `error`, `config`, `audit`, `totp`, `path`, `search`, `unlock`, `vault`.
 
@@ -32,24 +34,26 @@ Review fix batch (2026-10-18, branch `fix/review-batch`): paths can no longer al
 
 Two error codes are not reachable from a black-box protocol test and stay covered by `engine` unit tests: `VAULT_NOT_FOUND` (the config layer refuses to start without a readable vault path) and `WRITE_FAILED` (needs a mid-save filesystem failure).
 
-Phase 5 (tasks 23 to 26): `.github/workflows/ci.yml` (rust-test, protocol-conformance, and source-audit jobs; checks out the sibling `diff-kdbx` so the path dep resolves), `scripts/ci-audit.sh` (seven source-invariant grep checks), `docs/operations.md` (config, secret managers, audit log, posture), and the README polish (status, quick start, CI badge). The CI gate runs `cargo fmt --check`, `cargo test --all-features`, and `cargo clippy --all-targets --all-features -- -D warnings` (the `--all-features` is needed to lint the `cli`-gated `gen-fixtures` helper).
+Phase 5 (tasks 23 to 26): `.github/workflows/ci.yml` (rust-test, protocol-conformance, and source-audit jobs; checks out the sibling `kdbx-core` and `diff-kdbx` so the path deps resolve), `scripts/ci-audit.sh` (source-invariant grep checks, A to G since the kdbx-core adoption), `docs/operations.md` (config, secret managers, audit log, posture), and the README polish (status, quick start, CI badge). The CI gate runs `cargo fmt --check`, `cargo test --all-features`, and `cargo clippy --all-targets --all-features -- -D warnings` (the `--all-features` is needed to lint the `cli`-gated `gen-fixtures` helper).
 
-Remaining for release (not v0.1 plan tasks): push `main` to `origin`, run the `docs/manual-testing.md` smoke against a real host, then migrate the `diff-kdbx` path dependency to a crates.io (or git) version and publish. The CI currently checks out `diff-kdbx`'s default branch as a sibling, so it depends on that branch carrying the API mcp-kdbx builds against (the local `diff-kdbx` HEAD with the needed API may be ahead of its pushed `main`; pushing diff-kdbx or pinning the CI checkout removes the risk before the first CI run).
+Remaining for release (not plan tasks): create `queelius/kdbx-core` on GitHub and push diff-kdbx's snapshot API, then pin both sibling checkouts in `.github/workflows/ci.yml` to commit SHAs (the TODOs there); push; run the `docs/manual-testing.md` smoke against a real host; then switch the `kdbx-core` and `diff-kdbx` path dependencies to crates.io versions and publish.
 
 ## Position in the ecosystem
 
 | Member | Role | Relation to mcp-kdbx |
 |---|---|---|
-| `keepass-rs` | Substrate library | Direct dependency. Provides parsing, encryption, write API. |
-| `diff-kdbx` | Sibling CLI | Library dependency for `kdbx_diff_pending` (semantic-diff between canonical and working_db). |
-| `web-kdbx` | Sibling browser UI | Independent. Both consume `keepass-rs`. Different consumer (browser users vs LLM agents). |
+| `keepass-rs` | Substrate library | Direct dependency (0.12). Provides parsing, encryption, write API. |
+| `kdbx-core` | Shared crate | Direct dependency (`keepass-0_12` capture, `kdf`). Owns the snapshot model, path grammar, visibility rule, field schema, keyed fingerprints, text escaping and TOTP. Bumping keepass means switching its capture feature. |
+| `diff-kdbx` | Sibling CLI | Library dependency for `kdbx_diff_pending`: `compute` over two kdbx-core snapshots, independent of mcp-kdbx's keepass version. Its `fingerprint` subcommand verifies audit fingerprints. |
+| `web-kdbx` | Sibling browser UI | Independent. Shares kdbx-core. Different consumer (browser users vs LLM agents). |
 | `hugo-kdbx`, `arkiv-kdbx`, `longecho-kdbx` | Bridges, planned | Out of scope for v0.1. |
 
 ## Key cross-repo references
 
 - `~/github/kdbx/CLAUDE.md`: ecosystem-level conventions for all `*-kdbx` repos.
 - `~/github/kdbx/web-kdbx/`: the most mature sibling. Its spec/plan pair (`2026-04-29-web-kdbx-design.md` + `2026-04-29-web-kdbx.md`, plus `2026-05-06-web-kdbx-l1-storage-design.md` + `2026-05-06-web-kdbx-l1.md`) is the canonical example of the workflow.
-- `~/github/kdbx/diff-kdbx/`: path dependency (see Cargo.toml) used by `engine::stage` for the `kdbx_diff_pending` semantic diff. Read its CLAUDE.md and spec to understand its public Rust API.
+- `~/github/kdbx/kdbx-core/`: path dependency; its spec (`docs/superpowers/specs/2026-10-18-kdbx-core-design.md`, section 9 wins) and CLAUDE.md define the shared rules. Do not re-implement any of them here; report gaps upstream.
+- `~/github/kdbx/diff-kdbx/`: path dependency (see Cargo.toml) used by `engine::stage` for the `kdbx_diff_pending` semantic diff. Read its CLAUDE.md to understand its public Rust API (`compute`, `ChangeSet`; `#[non_exhaustive]` everywhere, so match with wildcard arms).
 - `~/github/bugfixes/track1-issues/keepass-rs/`: local fork used for upstream contributions.
 
 ## Architectural decisions (settled in the v0.1 spec)
@@ -61,7 +65,7 @@ Remaining for release (not v0.1 plan tasks): push `main` to `origin`, run the `d
 | Auth | env-var password + optional shell-out to secret manager (`KDBX_PASSWORD` and `KDBX_UNLOCK_CMD`) |
 | Idle lock TTL | 900 seconds (15 minutes) default; configurable |
 | Write capability | Read + limited write (add_entry, update_field; no delete, no move). Gated by `KDBX_ALLOW_WRITES=true` at startup. |
-| Stage model | In-memory shadow database; diff-kdbx-as-library computes the diff; atomic temp+rename on save |
+| Stage model | In-memory shadow database; diff-kdbx-as-library computes the diff over two kdbx-core snapshots; atomic temp+rename on save |
 | Audit trail | JSONL via `KDBX_LOG_FILE`; keyed fingerprints (kdbx-core, HMAC-SHA256 under an Argon2id key derived per unlock) of revealed values, in the file only; tool-response fingerprints are session-keyed |
 
 ## Workflow for any new feature
