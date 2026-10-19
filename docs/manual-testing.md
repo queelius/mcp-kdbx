@@ -129,7 +129,9 @@ expected result.
       unprotected field (`/Server`, `Port`) returns `FIELD_NOT_PROTECTED`.
 - [ ] **Audit (if `KDBX_LOG_FILE` set).** The log records `vault_unlocked` and
       `reveal_password`, and the revealed value does not appear in plaintext
-      (only a `sha256`).
+      (only a keyed `fingerprint`, which `diff-kdbx fingerprint` reproduces
+      from the `vault_unlocked` event's `fingerprint_params` and
+      `fingerprint_salt`; see `docs/operations.md`).
 - [ ] **Writes disabled path.** With writes off, `kdbx_add_entry` returns
       `WRITES_DISABLED`.
 - [ ] **Writes enabled path (separate run with `KDBX_ALLOW_WRITES=true`, on a

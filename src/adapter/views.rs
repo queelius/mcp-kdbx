@@ -1,31 +1,31 @@
-//! View builders: turn keepass records into the read-tool JSON shapes.
+//! View builders: turn snapshot records into the read-tool JSON shapes.
 //!
 //! These produce the exact payloads the spec defines for `kdbx_list_groups`,
 //! `kdbx_list_entries`, `kdbx_get_entry`, `kdbx_find_entry`, and
 //! `kdbx_list_attachments` (spec section 1). They are metadata-only: no
 //! protected value, no attachment bytes, and no OTP code ever crosses through
-//! here. Protected fields are reported by name with a `protected: true` flag;
-//! revealing a value is a separate, consent-gated tool.
+//! here. Every field is reported by name with two flags, `protected` (the
+//! stored KDBX flag) and `secret` (the value is withheld); revealing a value
+//! is a separate, consent-gated tool.
 //!
-//! Protection is read from each field's stored flag, not assumed from its name.
-//! A standard field (UserName, URL, Notes) that the user marked protected is
-//! emitted as `null` under its own key and flagged `protected: true` in
-//! `standard_field_names`, exactly as a protected custom field is flagged in
-//! `custom_field_names`. Which values may be emitted is decided by
-//! [`metadata_value`], the rule search shares. Title is the one exception: it is
-//! the entry's address in a path, so it is shown even when protected.
-//!
-//! Each builder takes the database and a record id and returns `None` when the
-//! id does not resolve, which the calling tool maps to `ENTRY_NOT_FOUND` or
-//! `GROUP_NOT_FOUND`.
+//! Every builder reads a [`View`]: the vault's kdbx-core snapshot of the
+//! working db, captured under fingerprint sealing, plus its path index and
+//! OTP availability. A secret value (protected, or a Password; never the
+//! Title, per kdbx-core's `visibility::is_secret`) is a fingerprint in that
+//! snapshot, so the views cannot emit it by construction, and the values they
+//! do emit go through `kdbx_core::visibility::metadata_value`, the rule search
+//! shares. A standard field (UserName, URL, Notes) that the user marked
+//! protected is emitted as `null` under its own key and flagged
+//! `protected: true, secret: true` in `standard_field_names`, exactly as a
+//! protected custom field is flagged in `custom_field_names`. Title is the one
+//! exception: it is the entry's address in a path, so it is shown even when
+//! protected (`protected: true, secret: false`).
 
-use crate::kdbx_core::path::{vault_path_to_entry, vault_path_to_group};
-use crate::kdbx_core::visibility::{STANDARD_FIELDS, is_standard_field, metadata_value};
-use chrono::NaiveDateTime;
-use keepass::Database;
-use keepass::db::{EntryId, GroupId, fields};
+use crate::engine::view::View;
+use kdbx_core::fields::StandardField;
+use kdbx_core::model::{Entry, Field, Group, Timestamp};
+use kdbx_core::visibility::{is_secret, metadata_value};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 
 /// The longer of an entry's notes shown in a list view (spec: first 200 chars).
@@ -33,147 +33,132 @@ const NOTES_PREVIEW_CHARS: usize = 200;
 
 /// Build the list-view summary of an entry (the `kdbx_list_entries` and
 /// `kdbx_find_entry` element shape). Metadata only.
-pub fn entry_summary(db: &Database, entry_id: EntryId) -> Option<Value> {
-    let entry = db.entry(entry_id)?;
-    let notes_preview = metadata_value(&entry, fields::NOTES).map(|n| {
-        let preview: String = n.chars().take(NOTES_PREVIEW_CHARS).collect();
-        preview
-    });
-    Some(json!({
-        "title": entry.get_title().unwrap_or(""),
-        "path": entry_path(db, entry_id),
-        "uuid": entry.id().uuid().to_string(),
-        "username": metadata_value(&entry, fields::USERNAME),
-        "url": metadata_value(&entry, fields::URL),
+pub fn entry_summary(view: &View, entry: &Entry) -> Value {
+    let notes_preview = visible(entry, StandardField::Notes)
+        .map(|n| n.chars().take(NOTES_PREVIEW_CHARS).collect::<String>());
+    json!({
+        "title": entry.title().unwrap_or(""),
+        "path": view.path_string(entry.uuid),
+        "uuid": entry.uuid.to_string(),
+        "username": visible(entry, StandardField::UserName),
+        "url": visible(entry, StandardField::Url),
         "notes_preview": notes_preview,
-        "standard_field_names": standard_field_names(&entry),
-        "custom_field_names": custom_field_names(&entry),
-        "has_attachments": has_attachments(&entry),
-        "has_otp": has_otp(&entry),
+        "standard_field_names": standard_field_names(entry),
+        "custom_field_names": custom_field_names(entry),
+        "has_attachments": !entry.attachments.is_empty(),
+        "has_otp": view.has_otp(entry.uuid),
         "modified_at": format_time(entry.times.last_modification),
-    }))
+    })
 }
 
 /// Build the full detail view of an entry (the `kdbx_get_entry` shape): full
 /// notes and the three timestamps, still without any protected value or
 /// attachment bytes.
-pub fn entry_detail(db: &Database, entry_id: EntryId) -> Option<Value> {
-    let entry = db.entry(entry_id)?;
-    Some(json!({
-        "title": entry.get_title().unwrap_or(""),
-        "path": entry_path(db, entry_id),
-        "uuid": entry.id().uuid().to_string(),
-        "username": metadata_value(&entry, fields::USERNAME),
-        "url": metadata_value(&entry, fields::URL),
-        "notes": metadata_value(&entry, fields::NOTES),
-        "standard_field_names": standard_field_names(&entry),
-        "custom_field_names": custom_field_names(&entry),
-        "has_attachments": has_attachments(&entry),
-        "has_otp": has_otp(&entry),
+pub fn entry_detail(view: &View, entry: &Entry) -> Value {
+    json!({
+        "title": entry.title().unwrap_or(""),
+        "path": view.path_string(entry.uuid),
+        "uuid": entry.uuid.to_string(),
+        "username": visible(entry, StandardField::UserName),
+        "url": visible(entry, StandardField::Url),
+        "notes": visible(entry, StandardField::Notes),
+        "standard_field_names": standard_field_names(entry),
+        "custom_field_names": custom_field_names(entry),
+        "has_attachments": !entry.attachments.is_empty(),
+        "has_otp": view.has_otp(entry.uuid),
         "created_at": format_time(entry.times.creation),
         "modified_at": format_time(entry.times.last_modification),
         "accessed_at": format_time(entry.times.last_access),
-    }))
+    })
 }
 
 /// Build the summary of a group (the `kdbx_list_groups` element shape).
-pub fn group_summary(db: &Database, group_id: GroupId) -> Option<Value> {
-    let group = db.group(group_id)?;
-    Some(json!({
-        "name": group.name.clone(),
-        "path": group_path(db, group_id),
-        "uuid": group.id().uuid().to_string(),
-        "num_entries": group.entries().count(),
-        "num_subgroups": group.groups().count(),
-        "notes": group.notes.clone(),
-    }))
+pub fn group_summary(view: &View, group: &Group) -> Value {
+    json!({
+        "name": group.name,
+        "path": view.path_string(group.uuid),
+        "uuid": group.uuid.to_string(),
+        "num_entries": group.entries.len(),
+        "num_subgroups": group.groups.len(),
+        "notes": group.notes,
+    })
 }
 
 /// Build the attachment list for an entry (the `kdbx_list_attachments` shape):
-/// name, size in bytes, and the hex SHA-256 of the content. No bytes returned;
-/// downloading bytes is the consent-gated `kdbx_download_attachment`.
-pub fn attachment_list(db: &Database, entry_id: EntryId) -> Option<Value> {
-    let entry = db.entry(entry_id)?;
+/// name, size in bytes, and the keyed fingerprint of the content, in name
+/// order. No bytes returned; downloading bytes is the consent-gated
+/// `kdbx_download_attachment`.
+///
+/// The snapshot never holds attachment bytes: each attachment is already a
+/// fingerprint there, computed under the random session key, so it equals
+/// the fingerprint a download of the same bytes returns in this session, and
+/// gives the client nothing to test master-password guesses against.
+pub fn attachment_list(entry: &Entry) -> Value {
     let attachments: Vec<Value> = entry
-        .attachments_named()
-        .map(|(name, attachment)| {
-            let bytes = attachment.get();
+        .attachments
+        .iter()
+        .map(|(name, info)| {
             json!({
-                "name": name.to_string(),
-                "size_bytes": bytes.len(),
-                "sha256": sha256_hex(bytes),
+                "name": name,
+                "size_bytes": info.size,
+                "fingerprint": info.fingerprint.to_hex(),
             })
         })
         .collect();
-    Some(json!({ "attachments": attachments }))
+    json!({ "attachments": attachments })
+}
+
+/// The value of the standard field `field` when kdbx-core's visibility rule
+/// lets it out as metadata; `None` for an absent field and for any secret.
+fn visible(entry: &Entry, field: StandardField) -> Option<&str> {
+    metadata_value(entry, field.kdbx_name())
 }
 
 /// The standard fields present on an entry, each with its protected flag, in
 /// canonical order (Title, UserName, Password, URL, Notes). The same
 /// `{name, protected}` shape as [`custom_field_names`]: together the two lists
-/// inventory every field, and a `protected: true` record tells the agent the
+/// inventory every field, and a `secret: true` record tells the agent the
 /// value is withheld here and must be read with a reveal tool
 /// (`kdbx_reveal_password` for Password, `kdbx_reveal_protected` otherwise).
-fn standard_field_names(entry: &keepass::db::EntryRef<'_>) -> Vec<Value> {
-    STANDARD_FIELDS
+fn standard_field_names(entry: &Entry) -> Vec<Value> {
+    StandardField::ALL
         .iter()
-        .filter_map(|name| entry.fields.get(*name).map(|value| field_flag(name, value)))
+        .filter_map(|f| {
+            entry
+                .standard(*f)
+                .map(|field| field_flag(f.kdbx_name(), field))
+        })
         .collect()
 }
 
-/// The custom (non-standard) fields of an entry, each with its protected flag.
-fn custom_field_names(entry: &keepass::db::EntryRef<'_>) -> Vec<Value> {
-    let mut fields: Vec<Value> = entry
+/// The custom (non-standard) fields of an entry, each with its protected flag,
+/// in name order (the snapshot keeps fields in a sorted map).
+fn custom_field_names(entry: &Entry) -> Vec<Value> {
+    entry
         .fields
         .iter()
-        .filter(|(name, _)| !is_standard_field(name))
-        .map(|(name, value)| field_flag(name, value))
-        .collect();
-    // Stable order so list output is deterministic across the HashMap iteration.
-    fields.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    fields
+        .filter(|(name, _)| StandardField::from_kdbx_name(name).is_none())
+        .map(|(name, field)| field_flag(name, field))
+        .collect()
 }
 
-/// The `{name, protected}` record both field lists use.
-fn field_flag(name: &str, value: &keepass::db::Value<String>) -> Value {
-    json!({ "name": name, "protected": value.is_protected() })
-}
-
-/// Whether the entry references any attachment.
-fn has_attachments(entry: &keepass::db::EntryRef<'_>) -> bool {
-    entry.attachments_named().next().is_some()
-}
-
-/// Whether the entry has a usable TOTP source. Uses the same resolver as
-/// `kdbx_get_otp`, so the `has_otp` flag is true exactly when a code could be
-/// produced, from any source `totp::resolve_for_entry` knows.
-fn has_otp(entry: &keepass::db::EntryRef<'_>) -> bool {
-    crate::kdbx_core::totp::resolve_for_entry(entry).is_some()
-}
-
-/// The canonical path string of an entry, or null when it cannot be built.
-fn entry_path(db: &Database, entry_id: EntryId) -> Option<String> {
-    vault_path_to_entry(db, entry_id).map(|p| p.format())
-}
-
-/// The canonical path string of a group, or null when it cannot be built.
-fn group_path(db: &Database, group_id: GroupId) -> Option<String> {
-    vault_path_to_group(db, group_id).map(|p| p.format())
+/// The `{name, protected, secret}` record both field lists use: `protected`
+/// is the stored KDBX flag, `secret` is kdbx-core's `is_secret` (protected,
+/// or a Password; never the Title), true exactly when the value is withheld
+/// here and must be read with a reveal tool. They differ for an unprotected
+/// Password (secret, not protected) and a protected Title (protected, shown).
+/// The stage diff's field changes carry the same two flags.
+fn field_flag(name: &str, field: &Field) -> Value {
+    json!({
+        "name": name,
+        "protected": field.protected,
+        "secret": is_secret(name, field.protected),
+    })
 }
 
 /// Format an optional KDBX timestamp as `YYYY-MM-DDTHH:MM:SSZ`, or null.
-fn format_time(time: Option<NaiveDateTime>) -> Option<String> {
-    time.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-}
-
-/// Lowercase hex SHA-256 of `bytes`. Used for attachment content fingerprints
-/// (metadata, not a reveal), so it is a plain digest with no domain prefix. The
-/// single definition the adapter shares: the read views and the
-/// `kdbx_download_attachment` reveal both report the same fingerprint, so they
-/// cannot drift.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+fn format_time(time: Option<Timestamp>) -> Option<String> {
+    time.map(|t| t.to_string())
 }
 
 /// Format a `SystemTime` as `YYYY-MM-DDTHH:MM:SSZ` (UTC). The single definition
@@ -189,7 +174,28 @@ pub(crate) fn format_system_time(time: SystemTime) -> String {
 mod tests {
     use super::*;
     use keepass::Database;
-    use keepass::db::fields;
+    use keepass::db::{EntryId, GroupId, fields};
+
+    /// The summary view of the entry `id` of `db`, through a fresh view.
+    fn summary(db: &Database, id: EntryId) -> Option<Value> {
+        let view = View::capture_ephemeral(db);
+        let entry = view.snapshot().find_entry(id.uuid())?;
+        Some(entry_summary(&view, entry))
+    }
+
+    /// The detail view of the entry `id` of `db`, through a fresh view.
+    fn detail(db: &Database, id: EntryId) -> Option<Value> {
+        let view = View::capture_ephemeral(db);
+        let entry = view.snapshot().find_entry(id.uuid())?;
+        Some(entry_detail(&view, entry))
+    }
+
+    /// The group summary of the group `id` of `db`, through a fresh view.
+    fn group(db: &Database, id: GroupId) -> Option<Value> {
+        let view = View::capture_ephemeral(db);
+        let group = view.snapshot().find_group(id.uuid())?;
+        Some(group_summary(&view, group))
+    }
 
     /// Build a database with one entry under a nested group, carrying standard
     /// fields, a custom protected field, and a custom plain field.
@@ -221,7 +227,7 @@ mod tests {
     #[test]
     fn entry_summary_is_metadata_only_with_path_and_customs() {
         let (db, id, _) = db_with_entry();
-        let v = entry_summary(&db, id).expect("entry exists");
+        let v = summary(&db, id).expect("entry exists");
         assert_eq!(v["title"], json!("MyBank"));
         assert_eq!(v["path"], json!("/Web/MyBank"));
         assert_eq!(v["username"], json!("alice"));
@@ -245,7 +251,7 @@ mod tests {
     #[test]
     fn entry_detail_has_full_notes_and_timestamps() {
         let (db, id, _) = db_with_entry();
-        let v = entry_detail(&db, id).expect("entry exists");
+        let v = detail(&db, id).expect("entry exists");
         assert_eq!(v["notes"], json!("a note"));
         assert!(v.get("created_at").is_some());
         assert!(v.get("modified_at").is_some());
@@ -305,7 +311,7 @@ mod tests {
     #[test]
     fn entry_summary_nulls_and_marks_protected_standard_fields() {
         let (db, id) = db_with_protected_standard_fields();
-        let v = entry_summary(&db, id).expect("entry exists");
+        let v = summary(&db, id).expect("entry exists");
         assert_eq!(v["username"], Value::Null);
         assert_eq!(v["url"], Value::Null);
         assert_eq!(v["notes_preview"], Value::Null);
@@ -321,7 +327,7 @@ mod tests {
     #[test]
     fn entry_detail_nulls_and_marks_protected_standard_fields() {
         let (db, id) = db_with_protected_standard_fields();
-        let v = entry_detail(&db, id).expect("entry exists");
+        let v = detail(&db, id).expect("entry exists");
         assert_eq!(v["username"], Value::Null);
         assert_eq!(v["url"], Value::Null);
         assert_eq!(v["notes"], Value::Null);
@@ -335,8 +341,8 @@ mod tests {
     fn unprotected_standard_fields_are_unchanged_and_listed_unprotected() {
         let (db, id, _) = db_with_entry();
         for v in [
-            entry_summary(&db, id).expect("entry exists"),
-            entry_detail(&db, id).expect("entry exists"),
+            summary(&db, id).expect("entry exists"),
+            detail(&db, id).expect("entry exists"),
         ] {
             assert_eq!(v["username"], json!("alice"));
             assert_eq!(v["url"], json!("https://bank.example"));
@@ -353,9 +359,9 @@ mod tests {
                 .collect();
             assert_eq!(names, ["Title", "UserName", "Password", "URL", "Notes"]);
         }
-        let summary = entry_summary(&db, id).unwrap();
+        let summary = summary(&db, id).unwrap();
         assert_eq!(summary["notes_preview"], json!("a note"));
-        let detail = entry_detail(&db, id).unwrap();
+        let detail = detail(&db, id).unwrap();
         assert_eq!(detail["notes"], json!("a note"));
     }
 
@@ -369,13 +375,13 @@ mod tests {
             e.edit(|e| e.set_unprotected(fields::TITLE, "Bare"));
             id
         };
-        let v = entry_summary(&db, id).expect("entry exists");
+        let v = summary(&db, id).expect("entry exists");
         assert_eq!(v["username"], Value::Null);
         assert_eq!(v["url"], Value::Null);
         assert_eq!(v["notes_preview"], Value::Null);
         assert_eq!(
             v["standard_field_names"],
-            json!([{ "name": "Title", "protected": false }])
+            json!([{ "name": "Title", "protected": false, "secret": false }])
         );
     }
 
@@ -389,25 +395,84 @@ mod tests {
             e.edit(|e| e.set_protected(fields::TITLE, "Addressed"));
             id
         };
-        for v in [
-            entry_summary(&db, id).unwrap(),
-            entry_detail(&db, id).unwrap(),
-        ] {
+        for v in [summary(&db, id).unwrap(), detail(&db, id).unwrap()] {
             assert_eq!(v["title"], json!("Addressed"));
             assert!(
                 v["path"].as_str().unwrap().ends_with("/Addressed"),
                 "path still built from the title: {v}"
             );
             assert_eq!(standard_field(&v, "Title")["protected"], json!(true));
+            assert_eq!(standard_field(&v, "Title")["secret"], json!(false));
         }
+    }
+
+    #[test]
+    fn an_unprotected_password_never_reaches_a_view() {
+        // kdbx-core's is_secret: the Password is a secret whatever its flag.
+        let mut db = Database::new();
+        let id = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| {
+                e.set_unprotected(fields::TITLE, "Open");
+                e.set_unprotected(fields::PASSWORD, "flag-off-secret");
+            })
+            .id();
+        for v in [summary(&db, id).unwrap(), detail(&db, id).unwrap()] {
+            assert!(!v.to_string().contains("flag-off-secret"), "{v}");
+            // The field list reports the stored flag as metadata, and that
+            // the value is a secret all the same.
+            assert_eq!(standard_field(&v, "Password")["protected"], json!(false));
+            assert_eq!(standard_field(&v, "Password")["secret"], json!(true));
+        }
+    }
+
+    #[test]
+    fn otp_and_attachments_come_from_the_view_without_secrets() {
+        let mut db = Database::new();
+        let id = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| {
+                e.set_unprotected(fields::TITLE, "Two Factor");
+                e.set_protected("otp", "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP");
+                e.add_attachment(
+                    "key.pem",
+                    keepass::db::Value::protected(b"attachment-bytes-0x61".to_vec()),
+                );
+            })
+            .id();
+        let view = View::capture_ephemeral(&db);
+        let entry = view.snapshot().find_entry(id.uuid()).unwrap();
+        let summary = entry_summary(&view, entry);
+        assert_eq!(summary["has_otp"], json!(true));
+        assert_eq!(summary["has_attachments"], json!(true));
+        let listed = attachment_list(entry);
+        assert_eq!(listed["attachments"][0]["name"], json!("key.pem"));
+        assert_eq!(
+            listed["attachments"][0]["size_bytes"],
+            json!("attachment-bytes-0x61".len())
+        );
+        assert_eq!(
+            listed["attachments"][0]["fingerprint"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        let all = format!("{summary}{listed}");
+        assert!(
+            !all.contains("attachment-bytes") && !all.contains("JBSWY3DP"),
+            "{all}"
+        );
     }
 
     #[test]
     fn group_summary_counts_children() {
         let (db, _, web) = db_with_entry();
-        let v = group_summary(&db, web).expect("group exists");
+        let v = group(&db, web).expect("group exists");
         assert_eq!(v["name"], json!("Web"));
-        assert_eq!(v["path"], json!("/Web"));
+        assert_eq!(v["path"], json!("/Web/"));
         assert_eq!(v["num_entries"], json!(1));
         assert_eq!(v["num_subgroups"], json!(0));
     }
@@ -422,7 +487,7 @@ mod tests {
                 .edit(|e| e.set_unprotected(fields::TITLE, "x"));
             d.iter_all_entries().next().unwrap().id()
         };
-        assert!(entry_summary(&db, other).is_none());
-        assert!(entry_detail(&db, other).is_none());
+        assert!(summary(&db, other).is_none());
+        assert!(detail(&db, other).is_none());
     }
 }

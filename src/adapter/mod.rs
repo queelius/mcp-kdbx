@@ -1,10 +1,10 @@
-//! The MCP adapter: wraps `kdbx_core` and speaks MCP over stdio via rmcp.
+//! The MCP adapter: wraps `engine` and speaks MCP over stdio via rmcp.
 //!
 //! This is the only layer that knows about MCP. It owns the shared vault state
 //! and the audit log, defines the tool surface, converts tool inputs into core
 //! calls, and wraps core results in the `{ ok, data } | { ok, error }` envelope
 //! (see [`responses`]). The dependency direction is one way: the adapter
-//! depends on `kdbx_core`, never the reverse, so a future HTTP adapter could
+//! depends on `engine`, never the reverse, so a future HTTP adapter could
 //! reuse the core unchanged.
 //!
 //! The 17 tools are split by category across submodules, each a
@@ -20,12 +20,14 @@ pub mod reveals;
 pub mod views;
 pub mod writes;
 
-use crate::kdbx_core::address::EntryAddress;
-use crate::kdbx_core::audit::{AuditEvent, AuditLog};
-use crate::kdbx_core::config::Config;
-use crate::kdbx_core::error::{CoreError, ErrorCode};
-use crate::kdbx_core::secret::Secret;
-use crate::kdbx_core::vault::Vault;
+use crate::engine::address::EntryAddress;
+use crate::engine::audit::{AuditEvent, AuditLog, fingerprints_recorded};
+use crate::engine::config::Config;
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::secret::Secret;
+use crate::engine::vault::{AuditFingerprints, Vault};
+use crate::engine::view::View;
+use keepass::Database;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool_handler};
@@ -55,7 +57,16 @@ impl KdbxServer {
     /// `audit`. The vault starts locked; no file is read until the first
     /// `kdbx_unlock`.
     pub fn new(config: Config, audit: AuditLog) -> Self {
-        let vault = Vault::new(config.vault_path.clone());
+        // The stable audit key exists only for audit-file fingerprints, so it
+        // is derived (one Argon2 run per unlock) exactly when an audit file is
+        // configured and the log level records the events that carry them.
+        let audit_fingerprints = if fingerprints_recorded(&audit, config.log_level) {
+            AuditFingerprints::Keyed
+        } else {
+            AuditFingerprints::Off
+        };
+        let vault =
+            Vault::new(config.vault_path.clone()).with_audit_fingerprints(audit_fingerprints);
         Self {
             // Combine the per-category routers into one. Each submodule's
             // `#[tool_router(router = ..._router)]` block contributes its tools.
@@ -142,7 +153,7 @@ impl KdbxServer {
             tokio::time::sleep(interval).await;
             let mut vault = self.state.lock().await;
             if vault.should_lock(Instant::now(), timeout) {
-                let reason = crate::kdbx_core::vault::LockReason::IdleTimeout;
+                let reason = crate::engine::vault::LockReason::IdleTimeout;
                 let dropped = vault.lock(reason);
                 // Drop the guard before emitting so the audit write is off the
                 // lock.
@@ -166,14 +177,34 @@ protected fields and attachments require a separate consent-gated reveal. Writes
 enabled) are staged in memory and committed atomically with kdbx_save_pending.\n\n\
 Paths: every path has a leading '/' (the root group is '/'), and '/' separates group names \
 from the entry title, as in /Web/Banking/MyBank. Inside a name, write a literal '/' as \\/, \
-a literal backslash as \\\\, and a literal ':' before digits as \\:. When siblings share a \
-name, ':N' picks the Nth (1-based), as in /Web/MyBank:2. A trailing '/' names a group, never \
-an entry. Copy paths verbatim from tool output; ordinals can shift between sessions, so \
+a literal backslash as \\\\, and a literal ':' before digits as \\:; a control character \
+appears as \\n, \\t, \\r or \\u{XXXX}, and any other backslash escape is invalid. When \
+siblings share a name, ':N' picks the Nth (1-based), as in /Web/MyBank:2. A trailing '/' \
+names a group, never an entry, and group paths in tool output always end in '/'. Copy paths verbatim from tool output; ordinals can shift between sessions, so \
 for a stable reference pass the entry's or group's uuid (every read returns it) instead of \
 its path. A record whose path is null has no addressable path: use its uuid.\n\n\
 Unlocking: call kdbx_unlock with no arguments; the server reads the master password from \
 its configured KDBX_PASSWORD or KDBX_UNLOCK_CMD. Do not ask the user to type the master \
 password into the chat.";
+
+/// The vault's cached [`View`] of the working db. When it must be captured
+/// first, the capture runs in `block_in_place`: it fingerprints every
+/// attachment, which takes a while for large ones, and must not stall the
+/// async worker. A cached view returns directly.
+pub(crate) fn view_of(vault: &Vault) -> CoreResult<&View> {
+    if vault.has_cached_view() {
+        vault.view()
+    } else {
+        tokio::task::block_in_place(|| vault.view())
+    }
+}
+
+/// The working db and its [`View`] (see [`view_of`]), for tools that resolve
+/// an address against the view and then read the live record.
+pub(crate) fn working_db_and_view_of(vault: &Vault) -> CoreResult<(&Database, &View)> {
+    let view = view_of(vault)?;
+    Ok((vault.working_db()?, view))
+}
 
 /// Locate the entry an entry-targeting tool names, by vault path or by UUID
 /// (exactly one; see [`EntryAddress::from_parts`]). `path_param` is the tool's
@@ -183,11 +214,12 @@ password into the chat.";
 /// addressing behave identically across reads, reveals, and writes.
 pub(crate) fn locate_entry<'a>(
     db: &'a keepass::Database,
+    view: &View,
     path: Option<&str>,
     uuid: Option<&str>,
     path_param: &str,
 ) -> Result<keepass::db::EntryRef<'a>, CoreError> {
-    let id = EntryAddress::from_parts(path, uuid, path_param)?.resolve(db)?;
+    let id = EntryAddress::from_parts(path, uuid, path_param)?.resolve(db, view)?;
     db.entry(id)
         .ok_or_else(|| CoreError::new(ErrorCode::EntryNotFound))
 }
@@ -196,15 +228,15 @@ pub(crate) fn locate_entry<'a>(
 /// path. Audit events and responses report this rather than echoing the
 /// caller's input, so they name the record actually touched.
 pub(crate) fn canonical_entry_path(
-    db: &keepass::Database,
+    view: &View,
     entry: &keepass::db::EntryRef<'_>,
 ) -> Option<String> {
-    crate::kdbx_core::path::vault_path_to_entry(db, entry.id()).map(|p| p.format())
+    view.path_string(entry.id().uuid())
 }
 
 /// Tool inputs wrap secret values in [`Secret`]; their JSON Schema is the inner
 /// type's, unchanged, so the wire contract an MCP host sees does not move.
-/// (Implemented here, not in `kdbx_core`, which stays free of the rmcp/schemars
+/// (Implemented here, not in `engine`, which stays free of the rmcp/schemars
 /// dependency.)
 impl<T> rmcp::schemars::JsonSchema for Secret<T>
 where
@@ -244,7 +276,8 @@ impl ServerHandler for KdbxServer {
 
 #[cfg(test)]
 mod tests {
-    use crate::kdbx_core::{config::Config, stage, totp::TotpConfig};
+    use crate::engine::{config::Config, stage};
+    use kdbx_core::otp::TotpConfig;
 
     /// A value that must never appear in any Debug rendering below.
     const MARK: &str = "SECRET-MARK-7f3a";
@@ -292,16 +325,38 @@ mod tests {
             }],
         };
         assert_redacted("EntryInput", format!("{entry:?}"));
-        let totp = TotpConfig::parse("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP").unwrap();
+        let totp = TotpConfig::from_uri("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP").unwrap();
         let rendered = format!("{totp:?}");
         assert!(rendered.contains("<redacted>"), "TotpConfig: {rendered}");
-        let code = totp.compute_at(59);
-        assert!(!format!("{code:?}").contains(code.code.expose().as_str()));
+        let code = totp.code_at(59);
+        assert!(!format!("{code:?}").contains(code.code()));
         let config = Config {
             password: Some(MARK.to_string().into()),
             unlock_cmd: Some(MARK.to_string().into()),
             ..Config::default()
         };
         assert_redacted("Config", format!("{config:?}"));
+    }
+
+    #[test]
+    fn the_audit_key_is_derived_only_with_an_audit_file_that_records_reveals() {
+        use crate::adapter::KdbxServer;
+        use crate::engine::audit::{AuditLog, Level};
+        use crate::engine::vault::AuditFingerprints;
+        let keyed = |file: bool, log_level: Level| {
+            let config = Config {
+                log_level,
+                ..Config::default()
+            };
+            let audit = AuditLog::new(file.then(|| tempfile::tempfile().unwrap()));
+            let server = KdbxServer::new(config, audit);
+            let vault = server.state.try_lock().unwrap();
+            vault.audit_fingerprints()
+        };
+        assert_eq!(keyed(true, Level::Info), AuditFingerprints::Keyed);
+        assert_eq!(keyed(true, Level::Debug), AuditFingerprints::Keyed);
+        // KDBX_LOG_LEVEL=warn records no reveal event, so no Argon2 run.
+        assert_eq!(keyed(true, Level::Warn), AuditFingerprints::Off);
+        assert_eq!(keyed(false, Level::Info), AuditFingerprints::Off);
     }
 }

@@ -1,10 +1,10 @@
 //! Substring entry search across configurable fields (spec section 3, "Search
 //! semantics").
 //!
-//! [`find_entry`] walks every entry depth-first from the database root, tracking
-//! the group path as it descends, and returns the entries whose requested fields
-//! contain the query as a plain substring. The match is plain substring only:
-//! no regex, no boolean operators, no globs.
+//! [`find_entry`] walks every entry of a [`View`] (a kdbx-core snapshot of the
+//! working db) and returns the entries whose requested fields contain the
+//! query as a plain substring. The match is plain substring only: no regex,
+//! no boolean operators, no globs.
 //!
 //! Matching is case-insensitive via [`str::to_lowercase`], which is
 //! Unicode-aware (it maps, for example, the German sharp S and accented Latin
@@ -15,26 +15,26 @@
 //! way a full case-fold would. KDBX titles are short Latin strings in practice,
 //! so this is acceptable for now and can be revisited if it bites.
 //!
-//! Protected values are never compared. A field is read through
-//! [`crate::kdbx_core::visibility::metadata_value`], the same rule the read
-//! views use, so a field is searchable exactly when the views would show it.
-//! Without this, repeated substring queries against a protected UserName, URL,
-//! or Notes would recover the value with no reveal and no audit event.
-//!
-//! Besides that rule, this module depends only on `keepass` and `std`. It
-//! builds the group path inline during the walk rather than going through
-//! `crate::kdbx_core::path`, since tracking the path as we recurse is simpler
-//! and matches the shape that the read tooling (Phase 3) needs.
+//! Secret values are never compared. A field is read through
+//! `kdbx_core::visibility::metadata_value`, the same rule the read views use,
+//! so a field is searchable exactly when the views would show it. Without this,
+//! repeated substring queries against a protected UserName, URL, or Notes
+//! would recover the value with no reveal and no audit event. (The snapshot
+//! holds only a fingerprint for such a value anyway, so the rule is also
+//! structural.)
 
-use crate::kdbx_core::visibility::metadata_value;
+use crate::engine::view::View;
+use kdbx_core::fields::StandardField;
+use kdbx_core::model::Entry;
+use kdbx_core::visibility::metadata_value;
 
 /// One field of an entry that a search may look at.
 ///
 /// This enum is also the tool input type: it deserializes from the lowercase
 /// variant name (`title`, `username`, `url`, `notes`) and anything else is a
 /// deserialization error, and its JSON Schema enumerates exactly those values.
-/// The keepass field each variant reads comes from `keepass::db::fields`.
-/// Adding a searchable field is one variant plus one arm in `keepass_name`.
+/// Each variant reads one KDBX standard field ([`Field::standard`]). Adding a
+/// searchable field is one variant plus one arm there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Field {
@@ -45,14 +45,13 @@ pub enum Field {
 }
 
 impl Field {
-    /// The keepass standard field this variant reads.
-    fn keepass_name(&self) -> &'static str {
-        use keepass::db::fields;
+    /// The KDBX standard field this variant reads.
+    fn standard(self) -> StandardField {
         match self {
-            Field::Title => fields::TITLE,
-            Field::Username => fields::USERNAME,
-            Field::Url => fields::URL,
-            Field::Notes => fields::NOTES,
+            Field::Title => StandardField::Title,
+            Field::Username => StandardField::UserName,
+            Field::Url => StandardField::Url,
+            Field::Notes => StandardField::Notes,
         }
     }
 }
@@ -66,30 +65,26 @@ const DEFAULT_FIELDS: &[Field] = &[Field::Title, Field::Username, Field::Url];
 /// [`SearchResults::truncated`] is set.
 const MAX_RESULTS: usize = 100;
 
-/// One entry that matched the query. Carries enough for the Phase 3 read
-/// adapter to build the `list_entries`-shaped response: the entry's UUID and
-/// title, the group path it lives under, and the keepass `EntryId` for any
-/// follow-up resolution.
+/// One entry that matched the query: the snapshot entry itself (the read
+/// views render it directly), its title, and the canonical path of the group
+/// that holds it (`None` when that group has no addressable path).
 #[derive(Debug, Clone)]
-pub struct SearchMatch {
-    /// The entry UUID, formatted as a hyphenated string.
-    pub uuid: String,
+pub struct SearchMatch<'v> {
+    /// The matching entry, in the view's snapshot.
+    pub entry: &'v Entry,
     /// The entry title, or the empty string when it has none.
     pub title: String,
-    /// The path of the group that holds the entry, like `/Web/Banking`. The
-    /// root group is the leading `/`.
-    pub group_path: String,
-    /// The keepass handle for the entry, for later resolution.
-    pub entry_id: keepass::db::EntryId,
+    /// The canonical path of the containing group, like `/Web/Banking/`.
+    pub group_path: Option<String>,
 }
 
 /// The result of a search: the (capped, sorted) matches, how many entries
 /// matched in total, and whether the returned list was cut short.
 #[derive(Debug, Clone)]
-pub struct SearchResults {
+pub struct SearchResults<'v> {
     /// The matches, stable-sorted by `(group_path, title)` and capped at
     /// [`MAX_RESULTS`].
-    pub entries: Vec<SearchMatch>,
+    pub entries: Vec<SearchMatch<'v>>,
     /// How many entries matched across the whole database, before the cap.
     pub matched_count: usize,
     /// True when more than [`MAX_RESULTS`] entries matched, so `entries` holds
@@ -97,25 +92,42 @@ pub struct SearchResults {
     pub truncated: bool,
 }
 
-/// Find entries whose requested `fields` contain `query` as a substring.
+/// Find entries of `view` whose requested `fields` contain `query` as a
+/// substring.
 ///
 /// When `fields` is empty the default set (title, username, url) is used. The
 /// query and each field value are lowercased before comparison, so the match is
-/// case-insensitive. Matches are stable-sorted by `(group_path, title)` and
-/// capped at 100, with `truncated` set when more matched.
-pub fn find_entry(db: &keepass::Database, query: &str, fields: &[Field]) -> SearchResults {
+/// case-insensitive. Matches are stable-sorted by `(group_path, title)` (the
+/// group path from the view's path index) and capped at 100, with `truncated`
+/// set when more matched.
+pub fn find_entry<'v>(view: &'v View, query: &str, fields: &[Field]) -> SearchResults<'v> {
     let active_fields: &[Field] = if fields.is_empty() {
         DEFAULT_FIELDS
     } else {
         fields
     };
     let needle = query.to_lowercase();
+    // One walk to index the nodes, then a constant-time parent lookup per
+    // match (not a tree walk per match).
+    let nodes = view.nodes();
 
-    let mut matches: Vec<SearchMatch> = Vec::new();
-    let root_id = db.root().id();
-    collect_matches(db, root_id, "", &needle, active_fields, &mut matches);
+    let mut matches: Vec<SearchMatch> = view
+        .snapshot()
+        .entries()
+        .filter(|entry| {
+            active_fields.iter().any(|f| {
+                metadata_value(entry, f.standard().kdbx_name())
+                    .is_some_and(|v| v.to_lowercase().contains(&needle))
+            })
+        })
+        .map(|entry| SearchMatch {
+            entry,
+            title: entry.title().unwrap_or("").to_string(),
+            group_path: view.parent_path_string(&nodes, entry.uuid),
+        })
+        .collect();
 
-    // Stable sort keeps insertion (depth-first) order among entries that share a
+    // Stable sort keeps walk order among entries that share a
     // (group_path, title) key, so the result is deterministic.
     matches.sort_by(|a, b| {
         a.group_path
@@ -134,65 +146,6 @@ pub fn find_entry(db: &keepass::Database, query: &str, fields: &[Field]) -> Sear
         matched_count,
         truncated,
     }
-}
-
-/// Recurse from `group_id`, appending a [`SearchMatch`] for every entry under it
-/// (directly or in a descendant group) that matches `needle` on one of
-/// `fields`. `path_so_far` is the group path built from ancestors; the empty
-/// string means we are entering the root.
-///
-/// This mirrors `find_entry_with_path` in web-kdbx: the root group becomes the
-/// leading `/`, and each level appends `/Name`.
-fn collect_matches(
-    db: &keepass::Database,
-    group_id: keepass::db::GroupId,
-    path_so_far: &str,
-    needle: &str,
-    fields: &[Field],
-    out: &mut Vec<SearchMatch>,
-) {
-    let group = match db.group(group_id) {
-        Some(g) => g,
-        None => return,
-    };
-
-    let here = if path_so_far.is_empty() {
-        format!("/{}", group.name)
-    } else {
-        format!("{}/{}", path_so_far, group.name)
-    };
-
-    // Entries directly in this group.
-    let entry_ids: Vec<keepass::db::EntryId> = group.entry_ids().collect();
-    for eid in entry_ids {
-        if let Some(er) = db.entry(eid)
-            && entry_matches(&er, needle, fields)
-        {
-            out.push(SearchMatch {
-                uuid: er.id().uuid().to_string(),
-                title: er.get_title().unwrap_or("").to_string(),
-                group_path: here.clone(),
-                entry_id: er.id(),
-            });
-        }
-    }
-
-    // Recurse into child groups.
-    let child_ids: Vec<keepass::db::GroupId> = group.group_ids().collect();
-    for child_id in child_ids {
-        collect_matches(db, child_id, &here, needle, fields, out);
-    }
-}
-
-/// True when any requested field's lowercased value contains `needle`. `needle`
-/// is assumed already lowercased by the caller. A protected field (other than
-/// the Title address) has no metadata value and so never matches.
-fn entry_matches(entry: &keepass::db::EntryRef<'_>, needle: &str, fields: &[Field]) -> bool {
-    fields.iter().any(|f| {
-        metadata_value(entry, f.keepass_name())
-            .map(|v| v.to_lowercase().contains(needle))
-            .unwrap_or(false)
-    })
 }
 
 #[cfg(test)]
@@ -223,11 +176,42 @@ mod tests {
     }
 
     #[test]
-    fn field_reads_the_keepass_standard_field_constants() {
-        assert_eq!(Field::Title.keepass_name(), fields::TITLE);
-        assert_eq!(Field::Username.keepass_name(), fields::USERNAME);
-        assert_eq!(Field::Url.keepass_name(), fields::URL);
-        assert_eq!(Field::Notes.keepass_name(), fields::NOTES);
+    fn field_reads_the_kdbx_standard_fields() {
+        assert_eq!(Field::Title.standard().kdbx_name(), fields::TITLE);
+        assert_eq!(Field::Username.standard().kdbx_name(), fields::USERNAME);
+        assert_eq!(Field::Url.standard().kdbx_name(), fields::URL);
+        assert_eq!(Field::Notes.standard().kdbx_name(), fields::NOTES);
+    }
+
+    /// Search `db` through a fresh view, as the adapter searches the vault's.
+    /// Owned results (titles and group paths), since the view is temporary.
+    fn find_entry(db: &Database, query: &str, fields: &[Field]) -> Found {
+        let view = View::capture_ephemeral(db);
+        let results = super::find_entry(&view, query, fields);
+        Found {
+            entries: results
+                .entries
+                .iter()
+                .map(|m| Hit {
+                    title: m.title.clone(),
+                    group_path: m.group_path.clone(),
+                })
+                .collect(),
+            matched_count: results.matched_count,
+            truncated: results.truncated,
+        }
+    }
+
+    /// [`SearchResults`] without the borrowed entries.
+    struct Found {
+        entries: Vec<Hit>,
+        matched_count: usize,
+        truncated: bool,
+    }
+
+    struct Hit {
+        title: String,
+        group_path: Option<String>,
     }
 
     /// A field to set on a seeded entry: (keepass field name, value).
@@ -402,30 +386,21 @@ mod tests {
         let order: Vec<(&str, &str)> = results
             .entries
             .iter()
-            .map(|m| (m.group_path.as_str(), m.title.as_str()))
+            .map(|m| (m.group_path.as_deref().unwrap(), m.title.as_str()))
             .collect();
 
-        // Root group path is "/NewDatabase" style: the keepass default root
-        // name. We assert relative ordering rather than the exact root name:
-        // entries are grouped by path, and within "/.../Web" alpha precedes
-        // zeta.
-        let web_alpha = order
-            .iter()
-            .position(|(p, t)| p.ends_with("/Web") && *t == "alpha acct")
-            .expect("Web/alpha present");
-        let web_zeta = order
-            .iter()
-            .position(|(p, t)| p.ends_with("/Web") && *t == "zeta acct")
-            .expect("Web/zeta present");
-        let apps_mid = order
-            .iter()
-            .position(|(p, t)| p.ends_with("/Apps") && *t == "mid acct")
-            .expect("Apps/mid present");
-
-        // Within the same group, sort is by title.
-        assert!(web_alpha < web_zeta, "alpha must precede zeta within /Web");
-        // "/.../Apps" sorts before "/.../Web" lexicographically (A < W).
-        assert!(apps_mid < web_alpha, "Apps group must precede Web group");
+        // Group paths are canonical vault paths (the root's name is never
+        // part of one), so the order is exact: the root "/" first, then
+        // "/Apps/", then "/Web/", titles ascending within a group.
+        assert_eq!(
+            order,
+            [
+                ("/", "root acct"),
+                ("/Apps/", "mid acct"),
+                ("/Web/", "alpha acct"),
+                ("/Web/", "zeta acct"),
+            ]
+        );
     }
 
     #[test]
@@ -535,10 +510,6 @@ mod tests {
         let results = find_entry(&db, "mybank", &[]);
         assert_eq!(results.matched_count, 1);
         let m = &results.entries[0];
-        assert!(
-            m.group_path.ends_with("/Web/Banking"),
-            "group_path was {}",
-            m.group_path
-        );
+        assert_eq!(m.group_path.as_deref(), Some("/Web/Banking/"));
     }
 }

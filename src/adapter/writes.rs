@@ -6,7 +6,7 @@
 //! `WRITES_DISABLED` before touching the vault, then requires an unlocked vault
 //! (`VAULT_LOCKED`). Writes mutate the working db only; nothing reaches disk
 //! until `kdbx_save_pending`. The actual mutation, diffing, and atomic save live
-//! in `kdbx_core::stage`; this module is the thin adapter that converts the MCP
+//! in `engine::stage`; this module is the thin adapter that converts the MCP
 //! tool inputs into core calls, emits the right audit event, and wraps results
 //! in the `{ ok, data } | { ok, error }` envelope.
 //!
@@ -17,14 +17,13 @@
 //! stage module takes raw bytes, not base64).
 
 use crate::adapter::views::format_system_time;
-use crate::adapter::{KdbxServer, responses};
-use crate::kdbx_core::address::{EntryAddress, GroupAddress};
-use crate::kdbx_core::audit::{AuditEvent, StageDiscardReason, WriteTool};
-use crate::kdbx_core::error::{CoreError, ErrorCode};
-use crate::kdbx_core::path::vault_path_to_entry;
-use crate::kdbx_core::secret::Secret;
-use crate::kdbx_core::stage;
-use crate::kdbx_core::vault_file::SaveStep;
+use crate::adapter::{KdbxServer, responses, view_of, working_db_and_view_of};
+use crate::engine::address::{EntryAddress, GroupAddress};
+use crate::engine::audit::{AuditEvent, StageDiscardReason, WriteTool};
+use crate::engine::error::{CoreError, ErrorCode};
+use crate::engine::secret::Secret;
+use crate::engine::stage;
+use crate::engine::vault_file::SaveStep;
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
@@ -160,26 +159,39 @@ impl KdbxServer {
             attachments.push(stage::AttachmentInput { name, bytes });
         }
 
-        let input = stage::EntryInput {
+        let input = match (stage::EntryInput {
             title: params.title,
             fields,
             attachments,
+        })
+        .validate()
+        {
+            Ok(input) => input,
+            Err(e) => return responses::err(&e),
         };
 
+        // Resolve the group against the cached view (no capture of its own),
+        // after validating the input, then mutate the working db.
+        let group_id =
+            match working_db_and_view_of(&vault).and_then(|(db, view)| group.resolve(db, view)) {
+                Ok(id) => id,
+                Err(e) => return responses::err(&e),
+            };
         let working = match vault.working_db_mut() {
             Ok(db) => db,
             Err(e) => return responses::err(&e),
         };
-
-        let entry_id = match stage::add_entry(working, &group, &input) {
+        let entry_id = match stage::add_entry(working, group_id, &input) {
             Ok(id) => id,
             Err(e) => return responses::err(&e),
         };
 
-        // Capture the audit data into owned values before returning. The new
-        // entry's path is built from the working db (None only when its group
-        // has no addressable path); the uuid comes off the id.
-        let path = vault_path_to_entry(working, entry_id).map(|p| p.format());
+        // The new entry's path (None only when its group has no addressable
+        // path) comes from the one capture of the changed working db, which
+        // the next read reuses; the uuid comes off the id.
+        let path = view_of(&vault)
+            .ok()
+            .and_then(|view| view.path_string(entry_id.uuid()));
         let uuid = entry_id.uuid().to_string();
 
         self.emit(AuditEvent::WriteStaged {
@@ -220,25 +232,36 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let working = match vault.working_db_mut() {
-            Ok(db) => db,
-            Err(e) => return responses::err(&e),
-        };
-
-        let entry_id = match stage::update_field(
-            working,
-            &target,
+        let write = match stage::FieldWrite::new(
             &params.field_name,
             params.value.expose(),
             params.protected,
         ) {
-            Ok(id) => id,
+            Ok(write) => write,
             Err(e) => return responses::err(&e),
         };
 
-        // Report the canonical path of the entry actually written (re-derived
-        // after the write, since a Title change moves it) and its uuid.
-        let path = vault_path_to_entry(working, entry_id).map(|p| p.format());
+        // Resolve the target against the cached view (no capture of its own),
+        // after validating the write, then mutate the working db.
+        let entry_id =
+            match working_db_and_view_of(&vault).and_then(|(db, view)| target.resolve(db, view)) {
+                Ok(id) => id,
+                Err(e) => return responses::err(&e),
+            };
+        let working = match vault.working_db_mut() {
+            Ok(db) => db,
+            Err(e) => return responses::err(&e),
+        };
+        if let Err(e) = stage::update_field(working, entry_id, &write) {
+            return responses::err(&e);
+        }
+
+        // Report the canonical path of the entry actually written, from the
+        // one capture of the changed working db (a Title change moves it),
+        // which the next read reuses.
+        let path = view_of(&vault)
+            .ok()
+            .and_then(|view| view.path_string(entry_id.uuid()));
         let uuid = entry_id.uuid().to_string();
         self.emit(AuditEvent::WriteStaged {
             tool: WriteTool::KdbxUpdateField,
@@ -260,7 +283,7 @@ impl KdbxServer {
     /// This is a read of the stage, so it emits no audit event. Protected field
     /// values are redacted.
     #[tool(
-        description = "Show the pending changes staged in memory: added and modified entries with a per-field diff. Requires writes to be enabled and the vault unlocked. Protected field values are never shown, only that they changed. This does not write anything."
+        description = "Show the pending changes staged in memory: added and modified entries with a per-field diff. Requires writes to be enabled and the vault unlocked. Each field change reports secret (values withheld: a protected field or any Password), protected (the stored flag), value_changed and protection_changed; before and after appear only when secret is false. This does not write anything."
     )]
     async fn kdbx_diff_pending(&self) -> String {
         if !self.writes_allowed() {
@@ -277,7 +300,9 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
-        let diff = stage::diff_pending(canonical, working);
+        // Two fresh captures (canonical and working, under one per-call key),
+        // each fingerprinting every attachment: run them off the async worker.
+        let diff = tokio::task::block_in_place(|| stage::diff_pending(canonical, working));
         responses::ok(diff)
     }
 
@@ -392,7 +417,10 @@ impl KdbxServer {
         // collected, so the mutable discard borrow that follows does not
         // conflict.
         let summary: Vec<String> = match vault.canonical_and_working() {
-            Ok((canonical, working)) => stage::diff_pending(canonical, working).entry_labels(),
+            Ok((canonical, working)) => {
+                tokio::task::block_in_place(|| stage::diff_pending(canonical, working))
+                    .entry_labels()
+            }
             Err(_) => Vec::new(),
         };
 

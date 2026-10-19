@@ -2,17 +2,17 @@
 //!
 //! These manage the locked/unlocked transition and report status. `kdbx_unlock`
 //! is the only tool that handles the master password; it resolves the password
-//! through `kdbx_core::unlock` (tool input, then `KDBX_PASSWORD`, then
+//! through `engine::unlock` (tool input, then `KDBX_PASSWORD`, then
 //! `KDBX_UNLOCK_CMD`), never logs it, and emits `vault_unlocked` or
 //! `auth_failed` to the audit trail.
 
 use crate::adapter::views::format_system_time;
 use crate::adapter::{KEEPASS_RS_VERSION, KdbxServer, responses};
-use crate::kdbx_core::audit::AuditEvent;
-use crate::kdbx_core::error::{CoreError, ErrorCode};
-use crate::kdbx_core::secret::Secret;
-use crate::kdbx_core::unlock::resolve_unlock_source;
-use crate::kdbx_core::vault::{LockReason, UnreadableReason};
+use crate::engine::audit::AuditEvent;
+use crate::engine::error::{CoreError, ErrorCode};
+use crate::engine::secret::Secret;
+use crate::engine::unlock::resolve_unlock_source;
+use crate::engine::vault::{LockReason, UnreadableReason};
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
@@ -110,7 +110,7 @@ impl KdbxServer {
                     // before returning one, so label it "cmd" (the only
                     // source that can fail with AUTH_FAILED here).
                     self.emit(AuditEvent::AuthFailed {
-                        source: crate::kdbx_core::unlock::UnlockSource::Cmd,
+                        source: crate::engine::unlock::UnlockSource::Cmd,
                         error_code: e.code_enum(),
                     });
                 }
@@ -145,9 +145,16 @@ impl KdbxServer {
                     .ok()
                     .map(format_system_time)
                     .unwrap_or_default();
+                // The audit key's derivation inputs go to the audit file
+                // only (the stderr copy omits them); None without a file.
+                let audit_key = match vault.audit_key_derivation() {
+                    Ok(derivation) => derivation,
+                    Err(e) => return responses::err(&e),
+                };
                 self.emit(AuditEvent::VaultUnlocked {
                     unlock_source: source,
                     file_mtime,
+                    audit_key,
                 });
                 let vault_name = vault
                     .working_db()
@@ -217,7 +224,7 @@ impl KdbxServer {
 /// keeps the audit emission in the tool body next to the password path.
 fn resolve_keyfile_bytes(
     params: &UnlockParams,
-    config: &crate::kdbx_core::config::Config,
+    config: &crate::engine::config::Config,
 ) -> Result<Option<Vec<u8>>, CoreError> {
     if let Some(encoded) = params.keyfile_bytes.as_ref().map(|k| k.expose()) {
         return base64::engine::general_purpose::STANDARD

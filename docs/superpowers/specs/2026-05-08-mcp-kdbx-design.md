@@ -200,8 +200,8 @@ output: {
       username: string | null,                            // null if absent or protected
       url: string | null,                                 // null if absent or protected
       notes_preview: string | null,                       // first 200 chars; null if absent or protected
-      standard_field_names: { name: string, protected: boolean }[],  // present standard fields, canonical order
-      custom_field_names: { name: string, protected: boolean }[],
+      standard_field_names: { name: string, protected: boolean, secret: boolean }[],  // present standard fields, canonical order
+      custom_field_names: { name: string, protected: boolean, secret: boolean }[],     // protected: stored flag; secret: value withheld (kdbx-core adoption)
       has_attachments: boolean,
       has_otp: boolean,
       modified_at: string                                 // ISO 8601
@@ -214,7 +214,7 @@ input:  { entry_path: string }
 output: {
   ok: true,
   data: {
-    attachments: [{ name: string, size_bytes: number, sha256: string /* hex */ }]
+    attachments: [{ name: string, size_bytes: number, fingerprint: string /* 64 hex, keyed per session (not stable across unlocks); was sha256 before the kdbx-core adoption */ }]
   }
 }
 
@@ -224,8 +224,8 @@ output: {
   ok: true,
   data: {
     title, path, uuid, username, url, notes,              // notes full, not preview; null if absent or protected
-    standard_field_names: { name: string, protected: boolean }[],
-    custom_field_names: { name: string, protected: boolean }[],
+    standard_field_names: { name: string, protected: boolean, secret: boolean }[],
+    custom_field_names: { name: string, protected: boolean, secret: boolean }[],
     has_attachments: boolean,
     has_otp: boolean,
     created_at: string,
@@ -263,7 +263,7 @@ output: { ok: true, data: { value: string } }
 
 // kdbx_download_attachment
 input:  { entry_path: string, name: string }
-output: { ok: true, data: { name, size_bytes, sha256, base64: string } }
+output: { ok: true, data: { name, size_bytes, fingerprint, base64: string } }  // fingerprint: 64 hex, keyed per session (was sha256)
 
 // kdbx_get_otp
 input:  { path: string, time_unix?: number }              // default now
@@ -301,8 +301,10 @@ output: {
     modified: [{
       path, uuid, title,
       field_changes: [
-        { field_name, before, after, protected: false } |
-        { field_name, changed: true, protected: true }    // protected fields redacted
+        // Since the kdbx-core adoption. secret: values withheld (kdbx-core's
+        // is_secret on either side); protected: the stored flag after the
+        // change (before, if removed). before/after present iff !secret.
+        { field_name, secret, protected, protection_changed, value_changed, before?, after? }
       ],
       attachment_changes: [{ name, change: "added" | "removed" | "modified" }]
     }],
@@ -332,9 +334,10 @@ output: { ok: true, data: { discarded: true, num_dropped: number } }
 | `GROUP_NOT_FOUND` | Path doesn't resolve to a group |
 | `ENTRY_NOT_FOUND` | Path doesn't resolve to an entry |
 | `FIELD_NOT_FOUND` | Entry has no field by that name |
-| `FIELD_NOT_PROTECTED` | Reveal called on a non-protected field |
+| `FIELD_NOT_PROTECTED` | `kdbx_reveal_protected` called on a field that is not a secret. Since the kdbx-core adoption "secret" is kdbx-core's `is_secret` (protected, or a Password; never the Title): an unprotected Password is revealable, a protected Title is refused with this code |
 | `ATTACHMENT_NOT_FOUND` | Entry has no attachment by that name |
-| `NO_OTP_CONFIGURED` | Entry has no `otp` field or no valid TOTP URI |
+| `NO_OTP_CONFIGURED` | Entry has no OTP source at all (no `otp` URI, no KeePass 2 `TimeOtp-*` fields, no legacy `TOTP Seed`) |
+| `OTP_INVALID` | An OTP source is present but does not resolve to a usable configuration. `details.source` is `uri`, `keepass_native` or `legacy`; `details.reason` is kdbx-core's `MalformedReason` (for example `invalid_secret`, `unsupported_algorithm`, or `{"missing_field": "TOTP Seed"}`) (implementation notes, kdbx-core adoption) |
 | `WRITES_DISABLED` | Write tool called when `KDBX_ALLOW_WRITES != true` |
 | `NO_PENDING_CHANGES` | `kdbx_save_pending` called with empty stage |
 | `WRITE_FAILED` | Disk write failed |
@@ -342,8 +345,8 @@ output: { ok: true, data: { discarded: true, num_dropped: number } }
 | `ENTRY_TITLE_INVALID` | Title is empty or contains literal `/` |
 | `FIELD_NAME_INVALID` | Field name is empty or has reserved characters |
 | `INVALID_INPUT` | A supplied value is malformed in a way no other code names (see implementation notes) |
-| `PATH_INVALID` | A path is malformed: no leading `/`, an empty `//` segment, a dangling `\` escape, or a `:0` ordinal (implementation notes, 2026-10-18) |
-| `VAULT_UNREADABLE` | The vault file fails before any key check: `details.reason` is `not_kdbx`, `unsupported_version`, `truncated`, or `corrupt_header` (implementation notes, 2026-10-18) |
+| `PATH_INVALID` | A path is malformed: no leading `/`, an empty `//` segment, a dangling `\` escape, an unknown escape (escapes are strict since the kdbx-core adoption: `\/`, `\\`, `\:`, `\n`, `\t`, `\r` and `\u{XXXX}` only), or a `:0` ordinal. The message leads with kdbx-core's reason (implementation notes, 2026-10-18 and kdbx-core adoption) |
+| `VAULT_UNREADABLE` | The vault cannot be used. `details.reason` is `not_kdbx`, `unsupported_version`, `truncated` or `corrupt_header`, all found before any key check (implementation notes, 2026-10-18), or `kdf_parameters_unsupported`: found after the key was checked, when the vault's KDF parameters cannot derive the audit fingerprint key. That reason tells the caller nothing beyond what they already know, having supplied the password (implementation notes, kdbx-core adoption) |
 
 ## Versioning
 
@@ -584,7 +587,7 @@ KDBX deduplicates attachments at the database level. Entries reference attachmen
 
 `kdbx_add_entry` with attachments: decode base64, compute SHA-256, insert into database (let keepass-rs handle dedup), link to entry under the input-provided name.
 
-`kdbx_download_attachment`: resolve entry, find attachment by name, fetch bytes, return `{ name, size_bytes, sha256, base64 }`. No hard size cap (KDBX is unlimited; we accept what KDBX accepts). Sizes above 10MB get a `warn` log entry but are not rejected.
+`kdbx_download_attachment`: resolve entry, find attachment by name, fetch bytes, return `{ name, size_bytes, fingerprint, base64 }` (the keyed fingerprint; see "Implementation notes (kdbx-core adoption)"). No hard size cap (KDBX is unlimited; we accept what KDBX accepts). Sizes above 10MB get a `warn` log entry but are not rejected.
 
 ## Save atomicity
 
@@ -617,8 +620,7 @@ If steps 4-7 fail: temp file unlinked, no changes to vault, working_db preserved
     "modified": [{
       "path", "uuid", "title",
       "field_changes": [
-        { "field_name", "before", "after", "protected": false } |
-        { "field_name", "changed": true, "protected": true }
+        { "field_name", "secret", "protected", "protection_changed", "value_changed", "before"?, "after"? }
       ],
       "attachment_changes": [{ "name", "change": "added" | "removed" | "modified" }]
     }],
@@ -628,7 +630,9 @@ If steps 4-7 fail: temp file unlinked, no changes to vault, working_db preserved
 }
 ```
 
-**Protected-field redaction:** for `protected: true` fields, `before` and `after` are NOT included; only `{ field_name, changed: true, protected: true }`. Bulk diff queries don't reveal secrets even when secrets have changed.
+**Secret-field redaction:** for `secret: true` changes, `before` and `after` are NOT included; only the flags. Bulk diff queries don't reveal secrets even when secrets have changed. (Since the kdbx-core adoption the redaction keys on `secret`, kdbx-core's `is_secret`: protected, or a Password, never the Title. `protected` is now the stored KDBX flag, the same meaning as in the read views, so an unprotected Password's change is `secret: true, protected: false` and a protected Title's is shown. The original shape, `{ field_name, before, after, protected: false } | { field_name, changed: true, protected: true }`, used `protected` to mean "redacted".)
+
+**What changed:** `value_changed` and `protection_changed` (at least one is true). A protection toggle on an unchanged value is `protection_changed: true, value_changed: false`. Values are compared as fingerprints under the diff's one per-call key, so a sealed side and a plain side holding the same text compare equal without either being shown.
 
 **Stable ordering:** entries within each list sorted by `(group_path, title)`.
 
@@ -800,7 +804,7 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 | Event | Level | Details |
 |---|---|---|
 | `server_started` | info | server_version, vault_path, writes_allowed, idle_timeout_seconds |
-| `vault_unlocked` | info | unlock_source ("input" \| "env" \| "cmd"), file_mtime |
+| `vault_unlocked` | info | unlock_source ("input" \| "env" \| "cmd"), file_mtime; in the audit file only, and only when an audit file is configured: fingerprint_params, fingerprint_salt (added with the kdbx-core adoption: what a verifier needs to rebuild the audit key) |
 | `vault_locked` | info | reason, pending_discarded_count |
 | `auth_failed` | error | source, error_code |
 | `write_staged` | info | tool, target_path, target_uuid, field_name (if applicable) |
@@ -808,9 +812,9 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 | `save_committed` | info | num_changes, before_mtime, after_mtime |
 | `save_refused` | warn | before_mtime, conflict_mtime, pending_changes |
 | `save_failed` | error | failure_step, error_message, pending_changes |
-| `reveal_password` | info | target_path, target_uuid, sha256 |
-| `reveal_protected` | info | target_path, target_uuid, field_name, sha256 |
-| `download_attachment` | info | target_path, target_uuid, attachment_name, size_bytes, sha256 |
+| `reveal_password` | info | target_path, target_uuid; audit file only: fingerprint, fingerprint_domain |
+| `reveal_protected` | info | target_path, target_uuid, field_name; audit file only: fingerprint, fingerprint_domain |
+| `download_attachment` | info | target_path, target_uuid, attachment_name, size_bytes; audit file only: fingerprint, fingerprint_domain |
 | `get_otp` | info | target_path, target_uuid (no code logged) |
 | `unlock_failed` | warn | unlock_source, reason (added 2026-10-18: `VAULT_UNREADABLE`) |
 | `writer_lock_unavailable` | warn | reason (added 2026-10-18: save without the writer lock) |
@@ -822,7 +826,9 @@ No log rotation in v0.1 (use `logrotate` or similar externally).
 These are non-negotiable:
 
 - **Never log plaintext values.** No password, no protected field, no OTP code, no attachment bytes ever appears in any log entry except at `trace` level.
-- **Reveal events log SHA-256 hash, not value.** Hash computed as `sha256("kdbx-reveal-v1\0" || value)` for domain-separation against rainbow-table attacks.
+- **Reveal events log a keyed fingerprint, not the value.** Since the kdbx-core adoption: `HMAC-SHA256(K, domain || value)` (kdbx-core's `Fingerprint`, 64 hex), where `K` is the stable audit key, derived once per unlock with Argon2id from the master key material, salted with the root group UUID, at parameters never cheaper than the vault's own KDF (floor 64 MiB x 3 passes). The original `sha256("kdbx-reveal-v1\0" || value)` was unkeyed, so a low-entropy secret could be recovered by hashing candidates (a reviewer recovered a 4-digit PIN in under 10,000 tries); the keyed form can be checked only with the vault's key material, using `diff-kdbx fingerprint`.
+- **The audit file is as sensitive as the vault file.** Its fingerprints, with the `fingerprint_params` and `fingerprint_salt` that `vault_unlocked` records, let someone who also knows one revealed plaintext search the master password offline at the vault's own KDF cost (the same cost as attacking the vault file, never cheaper, by kdbx-core's `DeriveParams` floor). So that material goes to the audit file only: the stderr copy of every event omits all fields derived from `K`, and without an audit file, or with a log level that records no reveal event, `K` is not derived at all. Protect the file like the vault.
+- **Tool-response fingerprints are session-keyed.** `kdbx_list_attachments` and `kdbx_download_attachment` fingerprint under a random key drawn at each unlock and wiped on lock, never under `K`: the client sees attachment bytes next to their fingerprint, and a stable-keyed one would hand it the offline oracle above. Session fingerprints identify content within one unlock only and are not stable across unlocks.
 - **Path segments and field names ARE logged.** They're metadata, not secrets. Users with paranoid threat models can disable info-level logging by setting `KDBX_LOG_LEVEL=warn`.
 - **Master password and unlock-command output never appear anywhere.** Specifically scrubbed in `mcp_message` capture (`password` parameter replaced with `"<redacted>"`).
 - **`KDBX_PASSWORD` env var is not logged.** `server_started` event captures vault_path and idle_timeout_seconds but no env-var-derived secrets.
@@ -861,7 +867,7 @@ A misbehaving or hostile LLM agent. Defenses:
 - **Bulk reads metadata-only.** `kdbx_list_entries`, `kdbx_get_entry`, `kdbx_find_entry`, `kdbx_list_attachments` never include protected values, attachment bytes, or OTP codes.
 - **Per-call consent-gated reveals.** Each `kdbx_reveal_*` and `kdbx_download_attachment` is a separate audited event. The MCP host can show a confirm UI per call.
 - **Minimal write surface.** No delete or move tools. Writes require `KDBX_ALLOW_WRITES=true`. Stage-then-commit pattern allows review before disk write.
-- **Audit log of every reveal and write.** sha256-hashed values let the user verify access without storing secrets.
+- **Audit log of every reveal and write.** Keyed fingerprints of revealed values let the user (who holds the vault) verify access without storing secrets, and give nobody else a dictionary oracle.
 
 ### External vault modification
 
@@ -1124,7 +1130,7 @@ against them.
   `kdbx_get_entry`, and `kdbx_find_entry` (and repeated `kdbx_find_entry`
   substring queries recovered it), bypassing the reveal tools and the audit
   trail. The fix, all derived from the stored per-field flag through one rule
-  (`kdbx_core::visibility::metadata_value`) shared by the views and search:
+  (`engine::visibility::metadata_value`) shared by the views and search:
   - A protected `UserName`, `URL`, or `Notes` is emitted as JSON `null` under
     its usual key (`username`, `url`, `notes` / `notes_preview`).
   - Every read view now carries `standard_field_names: { name, protected }[]`,
@@ -1276,7 +1282,7 @@ integration tests assert them.
   two decimal parts, so a user file like `vault.kdbx.tmp.old.bak` is never
   deleted.
 - **Secret hygiene.** Every secret-bearing field is a `Secret<T>`
-  (`kdbx_core::secret`): `Debug` prints `<redacted>`, the value is zeroized on
+  (`engine::secret`): `Debug` prints `<redacted>`, the value is zeroized on
   drop, and reading it takes an explicit `expose()`. This covers `Config`'s
   password and unlock command, `kdbx_unlock`'s inputs, `kdbx_add_entry` and
   `kdbx_update_field` values and attachment content, the staged
@@ -1383,3 +1389,100 @@ integration tests assert them.
   (except `kdbx_list_groups`), or a malformed uuid is `INVALID_INPUT`; an
   unknown uuid is `GROUP_NOT_FOUND`. A group under an unnamed group, whose
   path is null, is reachable this way.
+
+# Implementation notes (kdbx-core adoption, 2026-10-18)
+
+Branch `adopt/kdbx-core`, plan `docs/superpowers/plans/2026-10-18-mcp-kdbx-kdbx-core-adoption.md`,
+design in `~/github/kdbx/kdbx-core/docs/superpowers/specs/2026-10-18-kdbx-core-design.md`
+(sections 3, 5 and 9). mcp-kdbx stops carrying its own copies of the
+ecosystem rules; this spec stays canonical for the protocol surface, auth,
+audit and threat model, amended as follows.
+
+- **Dependencies.** `kdbx-core` (feature `keepass-0_12`, default `kdf`) and
+  the rebuilt `diff-kdbx` library (a pure function of two kdbx-core
+  snapshots, no keepass type in its API), both path dependencies until
+  published. keepass floor 0.12.9. The internal module `kdbx_core` is now
+  `engine`, so `kdbx_core::` always means the shared crate. `totp-lite`,
+  `base32` and `url` are gone.
+- **Snapshots and the view.** `engine::view::View` is a kdbx-core snapshot
+  of a keepass database, captured under `Sealing::Fingerprint` (no secret
+  plaintext is copied), with its `PathIndex` and the set of entries whose
+  TOTP resolves (computed from the live entries at capture, since the
+  snapshot seals the OTP secret). The vault caches one `View` of the working
+  db per generation; every mutable access to the working db, a discard, a
+  save, a lock and an unlock drop it. The read tools
+  (`kdbx_list_groups`, `kdbx_list_entries`, `kdbx_get_entry`,
+  `kdbx_find_entry`, `kdbx_list_attachments`) are built from the view alone,
+  so they cannot emit a secret by construction; the reveal and write tools
+  use the live database. Listings come in the snapshot's order (UUID order
+  on keepass 0.12) rather than hash-set order.
+- **Paths.** One grammar, kdbx-core's `VaultPath`. Group paths now format
+  with a trailing `/` (`/Personal/Finance/`, the diff's `group_path` `/Web/`),
+  so an emitted group path never re-resolves as an entry. Escapes are strict:
+  an unknown escape (`\q`) is `PATH_INVALID`, and `\n`, `\t`, `\r`,
+  `\u{XXXX}` name control characters (they used to decode to the bare letter).
+  `PathError` maps to `PATH_INVALID` (kdbx-core's reason leads the message);
+  `ResolveError::GroupNotFound` to `GROUP_NOT_FOUND` and `EntryNotFound` to
+  `ENTRY_NOT_FOUND`, both with `{path, segment, ordinal}` details; a
+  group-shaped entry path stays `ENTRY_NOT_FOUND`. Write tools resolve
+  against a fresh capture of the working db.
+- **Visibility.** One secret predicate, `kdbx_core::visibility::is_secret`
+  (protected, or a Password; never the Title). A Password whose protection
+  flag is off is now a secret everywhere: hidden from bulk reads, search and
+  the stage diff, and revealable through `kdbx_reveal_protected` (which now
+  accepts exactly the secret fields and answers `FIELD_NOT_PROTECTED` for the
+  rest, including a protected Title). Field names come from
+  `kdbx_core::fields::StandardField`.
+- **TOTP.** kdbx-core's `otp`: the OTP fields come from the live entry
+  (`capture::keepass_0_12::otp_fields`) and resolve with `resolve_fields`.
+  New error code `OTP_INVALID` for a configuration that is present but
+  unusable, with `details.source` (`uri`, `keepass_native`, `legacy`) and
+  `details.reason` (kdbx-core's `MalformedReason`, for example
+  `invalid_secret` or `{"missing_field": "TOTP Seed"}`); `NO_OTP_CONFIGURED`
+  now means no source is present at all. `has_otp` is true only for a
+  configuration that resolves. Steam codes are supported; a malformed
+  `period` or `digits` in a URI, and unknown algorithms or encoders, are
+  rejected rather than defaulted.
+- **Stage diff.** `kdbx_diff_pending` captures canonical and working under
+  one random key per call and calls `diff_kdbx::compute`. Field changes
+  carry `secret` (values withheld) and `protected` (the stored flag), plus
+  `value_changed` and `protection_changed`, replacing the two-shape
+  `protected`-means-redacted form; the read views' field records gain the
+  same `secret` flag beside `protected`. Protected UserName or custom-field
+  changes are withheld, a protection toggle on an unchanged Title is a
+  protection change with its value shown, and no fingerprint ever reaches
+  the agent. `moved_from` is not mapped (no tool moves an entry); attachment
+  change kinds are typed (same `added`/`removed`/`modified` wire).
+- **Fingerprints: two keys.** A random per-session key (OS RNG, drawn at
+  unlock, wiped on lock) seals the view and keys every fingerprint a tool
+  returns: `kdbx_list_attachments` and `kdbx_download_attachment` report
+  `fingerprint` (64 hex) instead of `sha256`, equal within a session and
+  different after every unlock. The stable audit key (Argon2id over the
+  password and key file bytes, salted with the root group UUID,
+  `DeriveParams::for_header`) is derived at unlock only when an audit file
+  is configured and the log level records reveal events, and keys
+  audit-file fingerprints only. argon2 0.5 runs the lanes sequentially, so
+  that derivation can take several times the vault's own (parallel) KDF
+  time. A stable-keyed
+  fingerprint next to its plaintext is an offline master-password oracle at
+  the vault's KDF cost, so it never appears in a tool response or on stderr.
+- **Audit format.** `reveal_password`, `reveal_protected` and
+  `download_attachment` replace `sha256` with `fingerprint` and
+  `fingerprint_domain` (`kdbx-core/field/v1` or `kdbx-core/attachment/v1`);
+  `vault_unlocked` gains `fingerprint_params` (the `DeriveParams` display
+  form) and `fingerprint_salt`. Every field derived from the audit key is
+  rendered for the audit file only; the stderr copy omits them. The spec's
+  section 5 proposal of a `fingerprint_v` field is realized as the versioned
+  `fingerprint_domain` label. `diff-kdbx fingerprint --params --salt --field
+  --entry` reproduces a logged field fingerprint (docs/operations.md).
+- **Unlock failure.** A vault whose KDF parameters cannot derive the audit
+  key (Argon2 rejects them or their memory cannot be allocated) fails to
+  unlock with `VAULT_UNREADABLE`, reason `kdf_parameters_unsupported`. There
+  is no cheaper fallback, since the key may never cost less than the vault's
+  own KDF. Unlike the other reasons this one is found after the key check.
+- **Tests and audit.** The pinned JSONL test covers both sinks; a test shows
+  the fixture PIN matches no unkeyed digest of any 4-digit candidate; others
+  show tool fingerprints change across unlocks while audit fingerprints are
+  stable and verifiable, and that stderr carries no audit-key material.
+  `scripts/ci-audit.sh` check C requires keyed fingerprints in the reveal
+  handlers, and check G allows SHA-256 only for the vault-file identity hash.

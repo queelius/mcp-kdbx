@@ -48,6 +48,12 @@ pub enum ErrorCode {
     /// corrupt header), so reporting it reveals nothing about the password.
     /// `details.reason` names which. A wrong key stays `AUTH_FAILED`.
     VaultUnreadable,
+    /// The entry has a TOTP configuration, but no source of it is usable (a
+    /// secret that does not decode, a zero period, an unknown algorithm or
+    /// encoder, a missing half of the legacy pair). `details.source` and
+    /// `details.reason` are kdbx-core's typed forms. Distinct from
+    /// `NO_OTP_CONFIGURED`, which means no source is present at all.
+    OtpInvalid,
 }
 
 impl ErrorCode {
@@ -74,6 +80,7 @@ impl ErrorCode {
             ErrorCode::InvalidInput => "INVALID_INPUT",
             ErrorCode::PathInvalid => "PATH_INVALID",
             ErrorCode::VaultUnreadable => "VAULT_UNREADABLE",
+            ErrorCode::OtpInvalid => "OTP_INVALID",
         }
     }
 
@@ -92,7 +99,7 @@ impl ErrorCode {
             ErrorCode::EntryNotFound => "No entry resolves at that path.",
             ErrorCode::FieldNotFound => "The entry has no field by that name.",
             ErrorCode::FieldNotProtected => {
-                "That field is not protected; read it with a list or get tool instead of a reveal."
+                "That field is not a secret (not protected, and not the Password); read it with a list or get tool instead of a reveal."
             }
             ErrorCode::AttachmentNotFound => "The entry has no attachment by that name.",
             ErrorCode::NoOtpConfigured => "The entry has no TOTP configuration.",
@@ -106,10 +113,13 @@ impl ErrorCode {
             ErrorCode::FieldNameInvalid => "The field name is invalid.",
             ErrorCode::InvalidInput => "A supplied value is invalid.",
             ErrorCode::PathInvalid => {
-                "The path is malformed. Paths start with '/', separate groups with '/', escape a literal '/' as '\\/' and '\\' as '\\\\', and may end a segment with ':N' to pick the Nth same-named sibling."
+                "The path is malformed. Paths start with '/', separate groups with '/', escape a literal '/' as '\\/', '\\' as '\\\\' and a ':' before digits as '\\:', write control characters as '\\n', '\\t', '\\r' or '\\u{XXXX}', and may end a segment with ':N' to pick the Nth same-named sibling."
             }
             ErrorCode::VaultUnreadable => {
                 "The vault file is not a readable KDBX database (see details.reason)."
+            }
+            ErrorCode::OtpInvalid => {
+                "The entry's TOTP configuration is malformed (see details.source and details.reason)."
             }
         }
     }
@@ -198,7 +208,7 @@ impl fmt::Display for CoreError {
 
 impl std::error::Error for CoreError {}
 
-/// Shorthand for the result type used throughout `kdbx_core`.
+/// Shorthand for the result type used throughout `engine`.
 pub type CoreResult<T> = Result<T, CoreError>;
 
 #[cfg(test)]
@@ -230,6 +240,7 @@ mod tests {
         (ErrorCode::InvalidInput, "INVALID_INPUT"),
         (ErrorCode::PathInvalid, "PATH_INVALID"),
         (ErrorCode::VaultUnreadable, "VAULT_UNREADABLE"),
+        (ErrorCode::OtpInvalid, "OTP_INVALID"),
     ];
 
     #[test]

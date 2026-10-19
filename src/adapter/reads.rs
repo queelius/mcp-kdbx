@@ -4,15 +4,15 @@
 //! These five tools are the bulk-read surface. Each requires an unlocked vault
 //! and returns metadata only: no protected value, no attachment bytes, and no
 //! OTP code (revealing those is a separate, consent-gated tool group). The
-//! shapes come straight from the view builders in [`crate::adapter::views`],
-//! which the spec section 1 defines. Reads are not in the spec's logged-events
+//! shapes (spec section 1) come straight from the view builders in
+//! [`crate::adapter::views`], which read only the vault's cached snapshot,
+//! never the live database. Reads are not in the spec's logged-events
 //! table, so these tools emit no audit events; they still count as activity
 //! because every call goes through [`KdbxServer::vault`].
 
-use crate::adapter::{KdbxServer, locate_entry, responses, views};
-use crate::kdbx_core::address::GroupAddress;
-use crate::kdbx_core::error::ErrorCode;
-use crate::kdbx_core::search::{self, Field};
+use crate::adapter::{KdbxServer, responses, view_of, views};
+use crate::engine::address::{EntryAddress, GroupAddress};
+use crate::engine::search::{self, Field};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
 
@@ -92,8 +92,8 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let view = match view_of(&vault) {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
         // With neither parent_path nor uuid, list the root group's children.
@@ -103,61 +103,53 @@ impl KdbxServer {
                 GroupAddress::from_parts(path.as_deref(), uuid.as_deref(), "parent_path", "uuid")
             }
         };
-        let parent_id = match parent.and_then(|p| p.resolve(db)) {
-            Ok(id) => id,
+        let parent = match parent.and_then(|p| p.resolve_in(view)) {
+            Ok(group) => group,
             Err(e) => return responses::err(&e),
         };
-        // db.group returns None only if the id vanished; resolve_group just gave
-        // it to us, so an empty child list is the worst case.
-        let child_ids: Vec<_> = match db.group(parent_id) {
-            Some(group) => group.group_ids().collect(),
-            None => Vec::new(),
-        };
-        let groups: Vec<_> = child_ids
-            .into_iter()
-            .filter_map(|id| views::group_summary(db, id))
+        let groups: Vec<_> = parent
+            .groups
+            .iter()
+            .map(|group| views::group_summary(view, group))
             .collect();
         responses::ok(serde_json::json!({ "groups": groups }))
     }
 
     /// Read: list the direct entries of a group.
     #[tool(
-        description = "List the direct entries of a group. Provide group_path or the group's uuid. Returns each entry's title, path, uuid, username, url, a notes preview, standard and custom field names with protected flags, attachment and otp flags, and the modified timestamp. Metadata only: no passwords or protected values. A username, url, or notes field marked protected is returned as null and flagged protected in standard_field_names; read it with kdbx_reveal_protected."
+        description = "List the direct entries of a group. Provide group_path or the group's uuid. Returns each entry's title, path, uuid, username, url, a notes preview, standard and custom field names (each with protected, the stored flag, and secret, true when the value is withheld), attachment and otp flags, and the modified timestamp. Metadata only: no secret values. A username, url, or notes field marked protected is returned as null and flagged secret in standard_field_names; read it with kdbx_reveal_protected."
     )]
     async fn kdbx_list_entries(&self, Parameters(params): Parameters<ListEntriesParams>) -> String {
         let mut vault = self.vault().await;
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let view = match view_of(&vault) {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
-        let group_id = match GroupAddress::from_parts(
+        let group = match GroupAddress::from_parts(
             params.group_path.as_deref(),
             params.uuid.as_deref(),
             "group_path",
             "uuid",
         )
-        .and_then(|g| g.resolve(db))
+        .and_then(|g| g.resolve_in(view))
         {
-            Ok(id) => id,
+            Ok(group) => group,
             Err(e) => return responses::err(&e),
         };
-        let entry_ids: Vec<_> = match db.group(group_id) {
-            Some(group) => group.entry_ids().collect(),
-            None => Vec::new(),
-        };
-        let entries: Vec<_> = entry_ids
-            .into_iter()
-            .filter_map(|id| views::entry_summary(db, id))
+        let entries: Vec<_> = group
+            .entries
+            .iter()
+            .map(|entry| views::entry_summary(view, entry))
             .collect();
         responses::ok(serde_json::json!({ "entries": entries }))
     }
 
-    /// Read: list the attachments of an entry (names, sizes, content hashes).
+    /// Read: list the attachments of an entry (names, sizes, fingerprints).
     #[tool(
-        description = "List the attachments of an entry. Provide entry_path. Returns each attachment's name, size in bytes, and sha256 of its content. No attachment bytes: downloading bytes is a separate consent-gated tool."
+        description = "List the attachments of an entry. Provide entry_path. Returns each attachment's name, size in bytes, and a fingerprint of its content keyed per session (equal to what kdbx_download_attachment returns for the same bytes until the next unlock; not stable across unlocks). No attachment bytes: downloading bytes is a separate consent-gated tool."
     )]
     async fn kdbx_list_attachments(
         &self,
@@ -167,48 +159,41 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let view = match view_of(&vault) {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
-        let entry_id = match locate_entry(
-            db,
+        match EntryAddress::from_parts(
             params.entry_path.as_deref(),
             params.uuid.as_deref(),
             "entry_path",
-        ) {
-            Ok(e) => e.id(),
-            Err(e) => return responses::err(&e),
-        };
-        // attachment_list returns the full { attachments: [...] } object, which
-        // is exactly the data payload. None means the id stopped resolving.
-        match views::attachment_list(db, entry_id) {
-            Some(data) => responses::ok(data),
-            None => responses::err(&ErrorCode::EntryNotFound.into()),
+        )
+        .and_then(|address| address.resolve_in(view))
+        {
+            // The full { attachments: [...] } object is the data payload.
+            Ok(entry) => responses::ok(views::attachment_list(entry)),
+            Err(e) => responses::err(&e),
         }
     }
 
     /// Read: fetch the full detail view of one entry.
     #[tool(
-        description = "Fetch the full detail of an entry. Provide path. Returns title, path, uuid, username, url, full notes, standard and custom field names with protected flags, attachment and otp flags, and the created, modified, and accessed timestamps. No password, protected values, or attachment bytes. A username, url, or notes field marked protected is returned as null and flagged protected in standard_field_names; read it with kdbx_reveal_protected."
+        description = "Fetch the full detail of an entry. Provide path. Returns title, path, uuid, username, url, full notes, standard and custom field names (each with protected, the stored flag, and secret, true when the value is withheld), attachment and otp flags, and the created, modified, and accessed timestamps. No secret values or attachment bytes. A username, url, or notes field marked protected is returned as null and flagged secret in standard_field_names; read it with kdbx_reveal_protected."
     )]
     async fn kdbx_get_entry(&self, Parameters(params): Parameters<GetEntryParams>) -> String {
         let mut vault = self.vault().await;
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let view = match view_of(&vault) {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
-        let entry_id =
-            match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
-                Ok(e) => e.id(),
-                Err(e) => return responses::err(&e),
-            };
-        match views::entry_detail(db, entry_id) {
-            Some(data) => responses::ok(data),
-            None => responses::err(&ErrorCode::EntryNotFound.into()),
+        match EntryAddress::from_parts(params.path.as_deref(), params.uuid.as_deref(), "path")
+            .and_then(|address| address.resolve_in(view))
+        {
+            Ok(entry) => responses::ok(views::entry_detail(view, entry)),
+            Err(e) => responses::err(&e),
         }
     }
 
@@ -222,8 +207,8 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let view = match view_of(&vault) {
+            Ok(view) => view,
             Err(e) => return responses::err(&e),
         };
         // The fields arrive as typed Field values (serde rejected anything
@@ -231,11 +216,11 @@ impl KdbxServer {
         // url), matching the spec's documented default.
         let fields: Vec<Field> = params.fields.unwrap_or_default();
 
-        let results = search::find_entry(db, &params.query, &fields);
+        let results = search::find_entry(view, &params.query, &fields);
         let entries: Vec<_> = results
             .entries
             .iter()
-            .filter_map(|m| views::entry_summary(db, m.entry_id))
+            .map(|m| views::entry_summary(view, m.entry))
             .collect();
         responses::ok(serde_json::json!({
             "entries": entries,

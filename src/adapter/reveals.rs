@@ -4,20 +4,29 @@
 //! These are the consent-gated tools (spec section 1, "Reveals"). Each one
 //! crosses a secret out of the vault, so each requires an unlocked vault and
 //! emits exactly one info-level audit event on success. The security invariant
-//! is that the event carries a sha256 of the revealed value, never the value
-//! itself: string secrets hash via [`hash_revealed`] (the domain-separated
-//! reveal hash), and an attachment's content sha256 is a plain digest used as a
-//! fingerprint. The TOTP secret never leaves the process; only the computed code
-//! crosses out, and the `get_otp` event logs no code and no secret.
+//! is that the event carries a keyed fingerprint of the revealed value, never
+//! the value itself: `Vault::audit_fingerprint` computes it under the stable
+//! audit key (derived at unlock when an audit file is configured, and
+//! written to that file only), in kdbx-core's field domain for string
+//! secrets and its attachment domain for attachment bytes. A fingerprint in
+//! a tool response is session-keyed instead (`Vault::fingerprint`). The TOTP secret never leaves the
+//! process; only the computed code crosses out, and the `get_otp` event logs no
+//! code and no secret.
 //!
 //! Each tool reads the value into an owned `String` (or `Vec<u8>`) before
 //! emitting and returning, so the audit emit and the response do not borrow the
 //! vault guard.
 
-use crate::adapter::{KdbxServer, canonical_entry_path, locate_entry, responses};
-use crate::kdbx_core::audit::{AuditEvent, hash_revealed};
-use crate::kdbx_core::error::{CoreError, ErrorCode};
+use crate::adapter::{
+    KdbxServer, canonical_entry_path, locate_entry, responses, working_db_and_view_of,
+};
+use crate::engine::audit::AuditEvent;
+use crate::engine::error::{CoreError, ErrorCode};
+use crate::engine::otp;
 use base64::Engine;
+use kdbx_core::fields::StandardField;
+use kdbx_core::fingerprint::Domain;
+use kdbx_core::visibility::is_secret;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
 
@@ -89,10 +98,10 @@ pub struct GetOtpParams {
 
 #[tool_router(router = reveals_router, vis = "pub(crate)")]
 impl KdbxServer {
-    /// Reveal: return an entry's `Password` field. Consent-gated; logs a sha256
-    /// of the value, never the value.
+    /// Reveal: return an entry's `Password` field. Consent-gated; logs a keyed
+    /// fingerprint of the value, never the value.
     #[tool(
-        description = "Reveal the Password field of an entry. This is a consent-gated secret access: it returns the plaintext password and records an audit event with a sha256 of the value (never the value itself). Requires an unlocked vault."
+        description = "Reveal the Password field of an entry. This is a consent-gated secret access: it returns the plaintext password and records an audit event with a keyed fingerprint of the value (never the value itself). Requires an unlocked vault."
     )]
     async fn kdbx_reveal_password(
         &self,
@@ -102,20 +111,26 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let (db, view) = match working_db_and_view_of(&vault) {
+            Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
 
-        let entry = match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+        let entry = match locate_entry(
+            db,
+            view,
+            params.path.as_deref(),
+            params.uuid.as_deref(),
+            "path",
+        ) {
             Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let target_path = canonical_entry_path(db, &entry);
+        let target_path = canonical_entry_path(view, &entry);
 
         // Read the value into an owned String before emitting and returning, so
         // we do not hold a borrow into the db across the audit emit.
-        let password = match entry.get("Password") {
+        let password = match entry.get(StandardField::Password.kdbx_name()) {
             Some(v) => v.to_string(),
             None => {
                 return responses::err(
@@ -125,11 +140,15 @@ impl KdbxServer {
             }
         };
         let target_uuid = entry.id().uuid().to_string();
+        let fingerprint = match vault.audit_fingerprint(Domain::Field, password.as_bytes()) {
+            Ok(fp) => fp,
+            Err(e) => return responses::err(&e),
+        };
 
         self.emit(AuditEvent::RevealPassword {
             target_path,
             target_uuid,
-            sha256: hash_revealed(&password),
+            fingerprint,
         });
 
         responses::ok(serde_json::json!({ "password": password }))
@@ -137,9 +156,9 @@ impl KdbxServer {
 
     /// Reveal: return a named protected field's value. A non-protected field is
     /// refused with `FIELD_NOT_PROTECTED`; the agent should read it with a list
-    /// or get tool instead. Consent-gated; logs a sha256 of the value.
+    /// or get tool instead. Consent-gated; logs a keyed fingerprint of the value.
     #[tool(
-        description = "Reveal the value of a named protected field on an entry. Refuses non-protected fields with FIELD_NOT_PROTECTED (read those with a list or get tool instead). Records an audit event with a sha256 of the value, never the value. Requires an unlocked vault."
+        description = "Reveal the value of a named secret field on an entry (a protected field, or the Password). Refuses fields that are not secret with FIELD_NOT_PROTECTED (read those with a list or get tool instead). Records an audit event with a keyed fingerprint of the value, never the value. Requires an unlocked vault."
     )]
     async fn kdbx_reveal_protected(
         &self,
@@ -149,16 +168,22 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let (db, view) = match working_db_and_view_of(&vault) {
+            Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
 
-        let entry = match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+        let entry = match locate_entry(
+            db,
+            view,
+            params.path.as_deref(),
+            params.uuid.as_deref(),
+            "path",
+        ) {
             Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let target_path = canonical_entry_path(db, &entry);
+        let target_path = canonical_entry_path(view, &entry);
 
         // Look the field up directly so we can distinguish "no such field"
         // (FIELD_NOT_FOUND) from "present but not protected" (FIELD_NOT_PROTECTED).
@@ -172,7 +197,11 @@ impl KdbxServer {
                 );
             }
         };
-        if !field.is_protected() {
+        // One secret predicate (kdbx-core): a field is revealable exactly when
+        // the bulk reads withhold it, so a Password whose protection flag is
+        // off is still a secret, and a protected Title (shown as the address)
+        // is not.
+        if !is_secret(&params.field_name, field.is_protected()) {
             return responses::err(
                 &CoreError::new(ErrorCode::FieldNotProtected)
                     .with_details(serde_json::json!({ "field_name": params.field_name })),
@@ -180,22 +209,25 @@ impl KdbxServer {
         }
         let value = field.get().to_string();
         let target_uuid = entry.id().uuid().to_string();
+        let fingerprint = match vault.audit_fingerprint(Domain::Field, value.as_bytes()) {
+            Ok(fp) => fp,
+            Err(e) => return responses::err(&e),
+        };
 
         self.emit(AuditEvent::RevealProtected {
             target_path,
             target_uuid,
             field_name: params.field_name.clone(),
-            sha256: hash_revealed(&value),
+            fingerprint,
         });
 
         responses::ok(serde_json::json!({ "value": value }))
     }
 
-    /// Reveal: return an attachment's bytes, base64-encoded, with its size and a
-    /// content sha256. Consent-gated; logs the content sha256 (a plain digest,
-    /// not the reveal hash, since this fingerprints bytes rather than a string).
+    /// Reveal: return an attachment's bytes, base64-encoded, with its size and
+    /// its keyed fingerprint. Consent-gated; logs the same fingerprint.
     #[tool(
-        description = "Download an entry's attachment by name: returns the bytes base64-encoded, plus size_bytes and a sha256 content fingerprint. There is no size cap; attachments over 10 MB are logged at warn but still returned. Records an audit event with the content sha256. Requires an unlocked vault."
+        description = "Download an entry's attachment by name: returns the bytes base64-encoded, plus size_bytes and the content fingerprint (keyed per session: the value kdbx_list_attachments reports until the next unlock, not stable across unlocks). There is no size cap; attachments over 10 MB are logged at warn but still returned. Records an audit event with the fingerprint. Requires an unlocked vault."
     )]
     async fn kdbx_download_attachment(
         &self,
@@ -205,13 +237,14 @@ impl KdbxServer {
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let (db, view) = match working_db_and_view_of(&vault) {
+            Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
 
         let entry = match locate_entry(
             db,
+            view,
             params.entry_path.as_deref(),
             params.uuid.as_deref(),
             "entry_path",
@@ -219,7 +252,7 @@ impl KdbxServer {
             Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let target_path = canonical_entry_path(db, &entry);
+        let target_path = canonical_entry_path(view, &entry);
 
         // Find the attachment by its per-entry name, reading the bytes into an
         // owned Vec so the response and emit do not borrow the db.
@@ -245,10 +278,19 @@ impl KdbxServer {
                 "downloading an attachment larger than 10 MB"
             );
         }
-        // The content sha256 is a plain digest fingerprint of the bytes (spec
-        // section 1: the download_attachment event carries the content sha256),
-        // not the domain-separated reveal hash, which is for string secrets.
-        let content_sha256 = crate::adapter::views::sha256_hex(&bytes);
+        // Two keyed fingerprints of the bytes in kdbx-core's attachment
+        // domain, never a plain digest (a lookup oracle on small files). The
+        // response carries the session-keyed one (what kdbx_list_attachments
+        // reports this session): with the bytes in hand, a stable-keyed one
+        // would let the client test master-password guesses offline. The
+        // audit file gets the stable-keyed one, for an operator to verify.
+        let (fingerprint, audit_fingerprint) = match (
+            vault.fingerprint(Domain::Attachment, &bytes),
+            vault.audit_fingerprint(Domain::Attachment, &bytes),
+        ) {
+            (Ok(session), Ok(audit)) => (session, audit),
+            (Err(e), _) | (_, Err(e)) => return responses::err(&e),
+        };
         let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
         self.emit(AuditEvent::DownloadAttachment {
@@ -256,54 +298,61 @@ impl KdbxServer {
             target_uuid: entry.id().uuid().to_string(),
             attachment_name: params.name.clone(),
             size_bytes: size_bytes as u64,
-            sha256: content_sha256.clone(),
+            fingerprint: audit_fingerprint,
         });
 
         responses::ok(serde_json::json!({
             "name": params.name,
             "size_bytes": size_bytes,
-            "sha256": content_sha256,
+            "fingerprint": fingerprint.to_hex(),
             "base64": base64,
         }))
     }
 
     /// Reveal: compute the current TOTP code for an entry, from whichever
-    /// source `totp::resolve_for_entry` finds (otpauth URI, KeePass 2 native
+    /// source kdbx-core's resolver finds (otpauth URI, KeePass 2 native
     /// `TimeOtp-*` fields, or the legacy pair). The secret never leaves the process;
     /// only the code crosses out, and the audit event logs no code.
     #[tool(
-        description = "Compute the current TOTP code for an entry. Reads the otp field (otpauth URI), the KeePass 2 TimeOtp-* fields, or the legacy TOTP Seed and TOTP Settings pair, in that order. Returns the code with its remaining validity, period, and the time_unix it was computed at (an optional time_unix is clamped to now plus or minus one period). The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
+        description = "Compute the current TOTP code for an entry. Reads the otp field (otpauth URI), the KeePass 2 TimeOtp-* fields, or the legacy TOTP Seed and TOTP Settings pair, in that order; Steam Guard codes are supported. A configuration that is present but malformed is OTP_INVALID (details name the source and reason); none at all is NO_OTP_CONFIGURED. Returns the code with its remaining validity, period, and the time_unix it was computed at (an optional time_unix is clamped to now plus or minus one period). The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
     )]
     async fn kdbx_get_otp(&self, Parameters(params): Parameters<GetOtpParams>) -> String {
         let mut vault = self.vault().await;
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
         }
-        let db = match vault.working_db() {
-            Ok(db) => db,
+        let (db, view) = match working_db_and_view_of(&vault) {
+            Ok(pair) => pair,
             Err(e) => return responses::err(&e),
         };
 
-        let entry = match locate_entry(db, params.path.as_deref(), params.uuid.as_deref(), "path") {
+        let entry = match locate_entry(
+            db,
+            view,
+            params.path.as_deref(),
+            params.uuid.as_deref(),
+            "path",
+        ) {
             Ok(e) => e,
             Err(e) => return responses::err(&e),
         };
-        let target_path = canonical_entry_path(db, &entry);
+        let target_path = canonical_entry_path(view, &entry);
 
         // Resolve a config (otpauth, KeePass native, then legacy) through
         // the shared resolver, the same one the read views use for has_otp, so
-        // the capability flag and this computation cannot drift. The config
-        // holds the secret; it stays in this scope and never crosses out.
-        let config = match crate::kdbx_core::totp::resolve_for_entry(&entry) {
-            Some(c) => c,
-            None => return responses::err(&ErrorCode::NoOtpConfigured.into()),
+        // the capability flag and this computation cannot drift. A malformed
+        // configuration is OTP_INVALID, never "no OTP". The config holds the
+        // secret; it stays in this scope and never crosses out.
+        let config = match otp::resolve(&entry) {
+            Ok(Some(c)) => c,
+            Ok(None) => return responses::err(&ErrorCode::NoOtpConfigured.into()),
+            Err(e) => return responses::err(&e),
         };
 
         // A requested time is clamped to now plus or minus one period, so only
         // the previous, current, or next code can ever cross out.
-        let time_unix =
-            config.evaluation_time(params.time_unix, crate::kdbx_core::totp::unix_now());
-        let code = config.compute_at(time_unix);
+        let time_unix = config.evaluation_time(params.time_unix, otp::unix_now());
+        let code = config.code_at(time_unix);
         let target_uuid = entry.id().uuid().to_string();
 
         // The event records the access and both times, never the code or the
@@ -316,9 +365,9 @@ impl KdbxServer {
         });
 
         responses::ok(serde_json::json!({
-            "code": code.code.expose(),
-            "valid_for_seconds": code.valid_for_seconds,
-            "period_seconds": code.period_seconds,
+            "code": code.code(),
+            "valid_for_seconds": code.valid_for_seconds(),
+            "period_seconds": code.period_seconds(),
             "time_unix": time_unix,
         }))
     }

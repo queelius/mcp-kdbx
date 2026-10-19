@@ -334,7 +334,42 @@ fn list_attachments_happy_path() {
     assert_eq!(attachments.len(), 1);
     assert_eq!(attachments[0]["name"], json!("notes.txt"));
     assert_eq!(attachments[0]["size_bytes"], json!("meeting notes\n".len()));
-    assert!(attachments[0]["sha256"].as_str().unwrap().len() == 64);
+    // A fingerprint under the random per-session key (never the stable audit
+    // key, and never a plain sha256: a plain digest of a small file would be
+    // a lookup oracle, and an audit-keyed one next to the downloaded bytes a
+    // master-password oracle).
+    assert!(attachments[0].get("sha256").is_none());
+    let listed = attachments[0]["fingerprint"].as_str().unwrap().to_string();
+    assert_eq!(listed.len(), 64);
+    // Within the session, the download reports the same fingerprint for the
+    // same bytes.
+    let downloaded = server.call_ok(
+        "kdbx_download_attachment",
+        json!({ "entry_path": "/Document A", "name": "notes.txt" }),
+    );
+    assert_eq!(downloaded["fingerprint"], json!(listed));
+    assert!(downloaded.get("sha256").is_none());
+}
+
+#[test]
+fn tool_fingerprints_are_session_keyed() {
+    // Fingerprints in tool responses use a random per-session key, so they
+    // identify content within one unlock only and give the client no oracle
+    // on the master password: the same attachment fingerprints differently
+    // after a re-unlock.
+    let mut server = unlocked("with_attachments.kdbx");
+    let listed = |server: &mut McpServer| {
+        server.call_ok(
+            "kdbx_list_attachments",
+            json!({ "entry_path": "/Document A" }),
+        )["attachments"][0]["fingerprint"]
+            .clone()
+    };
+    let first = listed(&mut server);
+    assert_eq!(first, listed(&mut server), "stable within a session");
+    server.call_ok("kdbx_lock", json!({}));
+    server.unlock_with_fixture_password();
+    assert_ne!(first, listed(&mut server), "a new session, a new key");
 }
 
 #[test]
@@ -423,6 +458,19 @@ fn write_and_stage_tools_happy_path() {
         .map(|a| a["path"].as_str().unwrap())
         .collect();
     assert!(added_paths.contains(&"/NewService"));
+    // A shown field change carries both flags and the values.
+    assert_eq!(
+        diff["modified"][0]["field_changes"],
+        json!([{
+            "field_name": "URL",
+            "secret": false,
+            "protected": false,
+            "protection_changed": false,
+            "value_changed": true,
+            "before": "https://github.com",
+            "after": "https://github.example",
+        }])
+    );
 
     // save_pending commits the stage and reports the change count.
     let saved = server.call_ok("kdbx_save_pending", json!({}));
@@ -441,7 +489,7 @@ fn write_and_stage_tools_happy_path() {
 // ---------------------------------------------------------------------------
 //
 // Two codes are not triggerable from a black-box protocol test and are covered
-// by unit tests in kdbx_core instead:
+// by unit tests in engine instead:
 //   - VAULT_NOT_FOUND: the config layer refuses to start when the vault path is
 //     missing, so a running server never reaches this from a tool call.
 //   - WRITE_FAILED: requires a filesystem write failure mid-save, which is not
@@ -533,6 +581,11 @@ fn error_path_invalid() {
         server.call_error_code("kdbx_list_entries", json!({ "group_path": "Web//x" })),
         "PATH_INVALID"
     );
+    // The ecosystem grammar (kdbx-core) is strict about escapes: an unknown
+    // escape is malformed rather than decoded to the bare character.
+    let err = server.call_error("kdbx_get_entry", json!({ "path": "/B\\q" }));
+    assert_eq!(err["code"], json!("PATH_INVALID"));
+    assert_eq!(err["details"]["path"], json!("/B\\q"));
 }
 
 #[test]
@@ -590,6 +643,40 @@ fn error_field_not_protected() {
 }
 
 #[test]
+fn an_unprotected_password_is_still_a_secret() {
+    // kdbx-core's one secret predicate: a Password is a secret whatever its
+    // protection flag. Turning the flag off must not move it into bulk reads,
+    // search, or the stage diff, and kdbx_reveal_protected treats it as a
+    // secret too.
+    let (_dir, mut server) = unlocked_writable("flat.kdbx");
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/Bank", "field_name": "Password", "value": "plain-pw-0x51", "protected": false }),
+    );
+    let bulk = [
+        server.call_ok("kdbx_list_entries", json!({ "group_path": "/" })),
+        server.call_ok("kdbx_get_entry", json!({ "path": "/Bank" })),
+        server.call_ok("kdbx_diff_pending", json!({})),
+    ];
+    for out in &bulk {
+        assert!(
+            !out.to_string().contains("plain-pw-0x51"),
+            "an unprotected Password leaked into a bulk read: {out}"
+        );
+    }
+    let found = server.call_ok(
+        "kdbx_find_entry",
+        json!({ "query": "plain-pw", "fields": ["title", "username", "url", "notes"] }),
+    );
+    assert_eq!(found["matched_count"], json!(0));
+    let revealed = server.call_ok(
+        "kdbx_reveal_protected",
+        json!({ "path": "/Bank", "field_name": "Password" }),
+    );
+    assert_eq!(revealed["value"], json!("plain-pw-0x51"));
+}
+
+#[test]
 fn error_attachment_not_found() {
     let mut server = unlocked("with_attachments.kdbx");
     assert_eq!(
@@ -607,6 +694,59 @@ fn error_no_otp_configured() {
     assert_eq!(
         server.call_error_code("kdbx_get_otp", json!({ "path": "/Bank" })),
         "NO_OTP_CONFIGURED"
+    );
+}
+
+#[test]
+fn error_otp_invalid() {
+    // A configured but malformed TOTP source is a typed error, never "no
+    // OTP": the agent learns the entry has OTP and why it cannot be used.
+    let (_dir, mut server) = unlocked_writable("flat.kdbx");
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/Bank", "field_name": "otp", "value": "otpauth://totp/x?secret=!!!" }),
+    );
+    let err = server.call_error("kdbx_get_otp", json!({ "path": "/Bank" }));
+    assert_eq!(err["code"], json!("OTP_INVALID"));
+    assert_eq!(err["details"]["source"], json!("uri"));
+    assert_eq!(err["details"]["reason"], json!("invalid_secret"));
+    // has_otp is true only for a configuration that resolves.
+    let bank = server.call_ok("kdbx_get_entry", json!({ "path": "/Bank" }));
+    assert_eq!(bank["has_otp"], json!(false));
+    // A typed reason that carries a field names it.
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/Email", "field_name": "TOTP Settings", "value": "30;6" }),
+    );
+    let err = server.call_error("kdbx_get_otp", json!({ "path": "/Email" }));
+    assert_eq!(err["code"], json!("OTP_INVALID"));
+    assert_eq!(err["details"]["source"], json!("legacy"));
+    assert_eq!(
+        err["details"]["reason"],
+        json!({ "missing_field": "TOTP Seed" })
+    );
+}
+
+#[test]
+fn steam_totp_codes_are_supported() {
+    let (_dir, mut server) = unlocked_writable("flat.kdbx");
+    server.call_ok(
+        "kdbx_update_field",
+        json!({
+            "path": "/Wifi",
+            "field_name": "otp",
+            "value": "otpauth://totp/Steam:me?secret=JBSWY3DPEHPK3PXP&encoder=steam",
+        }),
+    );
+    let wifi = server.call_ok("kdbx_get_entry", json!({ "path": "/Wifi" }));
+    assert_eq!(wifi["has_otp"], json!(true));
+    let otp = server.call_ok("kdbx_get_otp", json!({ "path": "/Wifi" }));
+    let code = otp["code"].as_str().unwrap();
+    assert_eq!(code.chars().count(), 5, "Steam codes are five characters");
+    assert!(
+        code.chars()
+            .all(|c| "23456789BCDFGHJKMNPQRTVWXY".contains(c)),
+        "{code} uses the Steam alphabet"
     );
 }
 
@@ -778,12 +918,15 @@ fn group_tools_accept_uuid_addressing() {
     let finance = server.call_ok("kdbx_list_groups", json!({ "uuid": personal["uuid"] }))["groups"]
         [0]
     .clone();
-    assert_eq!(finance["path"], json!("/Personal/Finance"));
+    // Group paths keep their trailing slash (kdbx-core's canonical form), so
+    // an emitted group path re-resolves as a group, never as an entry.
+    assert_eq!(finance["path"], json!("/Personal/Finance/"));
     let banking = server.call_ok(
         "kdbx_list_groups",
-        json!({ "parent_path": "/Personal/Finance" }),
+        json!({ "parent_path": finance["path"] }),
     )["groups"][0]
         .clone();
+    assert_eq!(banking["path"], json!("/Personal/Finance/Banking/"));
 
     let entries = server.call_ok("kdbx_list_entries", json!({ "uuid": banking["uuid"] }));
     assert_eq!(entries["entries"][0]["title"], json!("Checking Account"));
@@ -891,4 +1034,61 @@ fn roundtrip_integer_range_edges_for_otp_time_are_clamped() {
             "time {t} was evaluated at {used}, outside now +/- one period"
         );
     }
+}
+
+/// Listings come back in record-UUID order (kdbx-core's keepass 0.12 capture
+/// sorts children by UUID, since keepass 0.12 loses document order), the
+/// same on every call and across a re-unlock, instead of hash-set order.
+#[test]
+fn listings_are_in_uuid_order() {
+    let uuids = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["uuid"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let sorted = |v: &[String]| {
+        let mut s = v.to_vec();
+        s.sort();
+        s
+    };
+
+    let mut flat = unlocked("flat.kdbx");
+    let entries =
+        uuids(&flat.call_ok("kdbx_list_entries", json!({ "group_path": "/" }))["entries"]);
+    assert!(entries.len() >= 5, "{entries:?}");
+    assert_eq!(
+        entries,
+        sorted(&entries),
+        "entries are listed in uuid order"
+    );
+    flat.call_ok("kdbx_lock", json!({}));
+    flat.unlock_with_fixture_password();
+    let again = uuids(&flat.call_ok("kdbx_list_entries", json!({ "group_path": "/" }))["entries"]);
+    assert_eq!(again, entries, "the order survives a re-unlock");
+
+    // No committed fixture has sibling groups: build one with six.
+    let mut db = keepass::Database::new();
+    for name in ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"] {
+        db.root_mut().add_group().name = name.to_string();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("siblings.kdbx");
+    let mut bytes = Vec::new();
+    db.save(
+        &mut bytes,
+        keepass::DatabaseKey::new().with_password(FIXTURE_PASSWORD),
+    )
+    .unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let mut siblings = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    siblings.unlock_with_fixture_password();
+    let groups = uuids(&siblings.call_ok("kdbx_list_groups", json!({}))["groups"]);
+    assert_eq!(groups.len(), 6, "{groups:?}");
+    assert_eq!(groups, sorted(&groups), "groups are listed in uuid order");
+    siblings.call_ok("kdbx_lock", json!({}));
+    siblings.unlock_with_fixture_password();
+    let again = uuids(&siblings.call_ok("kdbx_list_groups", json!({}))["groups"]);
+    assert_eq!(again, groups, "the order survives a re-unlock");
 }

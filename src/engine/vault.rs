@@ -21,9 +21,14 @@
 //! which is what discards the pending stage: there is no separate stage data
 //! structure to clear.
 
-use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
-use crate::kdbx_core::vault_file::{FileFingerprint, read_with_fingerprint};
+use crate::engine::audit::{AuditKey, AuditKeyDerivation, KeyedFingerprint};
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::vault_file::{FileFingerprint, read_with_fingerprint};
+use crate::engine::view::{View, ephemeral_key};
+use kdbx_core::capture::keepass_0_12::header;
+use kdbx_core::fingerprint::{DeriveParams, Domain, Fingerprint, FingerprintKey, KeyMaterial};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 use zeroize::Zeroize;
 
@@ -84,6 +89,13 @@ pub enum UnreadableReason {
     Truncated,
     /// The outer header does not parse or fails its sha256 integrity check.
     CorruptHeader,
+    /// The vault opened, but its key-derivation parameters cannot be used to
+    /// derive the audit fingerprint key (Argon2 rejected them, or their
+    /// memory cost could not be allocated). The fingerprint key never costs
+    /// less than the vault's own KDF, so there is no cheaper fallback, and
+    /// without a key no reveal could be audited: the unlock fails closed.
+    /// Unlike the other reasons, this one is found after the key was checked.
+    KdfParametersUnsupported,
 }
 
 /// Classify a keepass open failure. Errors raised while reading the version
@@ -115,6 +127,53 @@ fn open_error(e: &keepass::error::DatabaseOpenError) -> CoreError {
             .with_details(serde_json::json!({ "reason": reason })),
         None => CoreError::new(ErrorCode::AuthFailed),
     }
+}
+
+/// Whether the vault derives the stable audit fingerprint key at unlock.
+///
+/// The key exists only to fingerprint revealed values in the audit file, so
+/// a server without an audit file skips it (and its Argon2 run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuditFingerprints {
+    /// Derive the stable key at every unlock (an audit file is configured).
+    Keyed,
+    /// No audit file: derive nothing; audit events carry no fingerprint.
+    #[default]
+    Off,
+}
+
+/// Derive the stable audit fingerprint key from the key material that just
+/// opened `db`: `FingerprintKey::derive` (Argon2id) over the password
+/// bytes and the raw key file bytes, salted with the root group UUID, with
+/// `DeriveParams::for_header` (the vault's own Argon2 parameters when they
+/// cost at least the 64 MiB x 3 floor, else the floor). The result is stable
+/// across processes, so a logged fingerprint can be verified later
+/// (`diff-kdbx fingerprint --params .. --salt ..`), and breaking it costs at
+/// least as much as attacking the vault itself.
+///
+/// The password is always part of the material, as it is of the keepass key
+/// mcp-kdbx opens the vault with (an empty password is an empty string, not
+/// an absent one).
+///
+/// Runs the KDF, so callers run it off the async worker, as they do the
+/// unlock it belongs to.
+fn derive_audit_key(
+    db: &keepass::Database,
+    password: &str,
+    keyfile: Option<&[u8]>,
+) -> CoreResult<AuditKey> {
+    let params = DeriveParams::for_header(Some(&header(db)));
+    let salt = db.root().id().uuid();
+    let material = KeyMaterial::new(Some(password.as_bytes()), keyfile);
+    AuditKey::derive(&material, salt, params).map_err(|e| {
+        CoreError::new(ErrorCode::VaultUnreadable)
+            .with_message(format!(
+                "the vault opened, but its KDF parameters cannot derive the audit key: {e}"
+            ))
+            .with_details(
+                serde_json::json!({ "reason": UnreadableReason::KdfParametersUnsupported }),
+            )
+    })
 }
 
 /// The two states a vault can be in.
@@ -152,6 +211,22 @@ pub enum VaultState {
         /// the last save) plus the mtime seen on that handle. The save path
         /// re-reads the file and refuses when the content differs.
         file_baseline: FileFingerprint,
+        /// A random key drawn at unlock for every fingerprint a tool returns
+        /// (the cached [`View`] is sealed under it, so attachment listings
+        /// use it; so does `kdbx_download_attachment`). Such fingerprints
+        /// identify content within this session only and give the client no
+        /// handle on the master password. Zeroized on drop, so locking (which
+        /// drops this state) wipes it.
+        session_key: FingerprintKey,
+        /// The stable, Argon2-derived key for audit-file fingerprints only
+        /// ([`AuditFingerprints::Keyed`]; `None` when off). Never used for a
+        /// value a tool returns. Wiped on lock like the session key.
+        audit_key: Option<AuditKey>,
+        /// The cached [`View`] of `working_db`, captured on first use and
+        /// dropped by every path that can change the working db
+        /// ([`Vault::working_db_mut`], a discard, a save). A lock drops it
+        /// with the rest of this state.
+        view: OnceLock<View>,
     },
 }
 
@@ -166,6 +241,8 @@ pub struct Vault {
     /// by [`lock`](Self::lock), handed back (and cleared) by a successful
     /// [`unlock`](Self::unlock) and by [`take_last_lock`](Self::take_last_lock).
     last_lock: Option<LockInfo>,
+    /// Whether unlock derives the stable audit key.
+    audit_fingerprints: AuditFingerprints,
 }
 
 impl Vault {
@@ -176,7 +253,21 @@ impl Vault {
             path,
             state: VaultState::Locked,
             last_lock: None,
+            audit_fingerprints: AuditFingerprints::Off,
         }
+    }
+
+    /// Set whether unlock derives the stable audit fingerprint key (off by
+    /// default; the server turns it on exactly when an audit file is
+    /// configured).
+    pub fn with_audit_fingerprints(mut self, audit_fingerprints: AuditFingerprints) -> Vault {
+        self.audit_fingerprints = audit_fingerprints;
+        self
+    }
+
+    /// Whether unlock derives the stable audit fingerprint key.
+    pub fn audit_fingerprints(&self) -> AuditFingerprints {
+        self.audit_fingerprints
     }
 
     /// The path to the vault file.
@@ -237,6 +328,11 @@ impl Vault {
         let canonical_db = keepass::Database::open(&mut std::io::Cursor::new(&bytes), key.clone())
             .map_err(|e| open_error(&e))?;
 
+        let audit_key = match self.audit_fingerprints {
+            AuditFingerprints::Keyed => Some(derive_audit_key(&canonical_db, password, keyfile)?),
+            AuditFingerprints::Off => None,
+        };
+
         let working_db = canonical_db.clone();
 
         self.state = VaultState::Unlocked {
@@ -245,6 +341,9 @@ impl Vault {
             key,
             last_activity: Instant::now(),
             file_baseline,
+            session_key: ephemeral_key(),
+            audit_key,
+            view: OnceLock::new(),
         };
 
         // Hand back the prior lock's discard summary (consuming it): the caller
@@ -282,7 +381,7 @@ impl Vault {
                 working_db,
                 ..
             } => {
-                let diff = crate::kdbx_core::stage::diff_pending(canonical_db, working_db);
+                let diff = crate::engine::stage::diff_pending(canonical_db, working_db);
                 let count = diff.summary.num_added + diff.summary.num_modified;
                 (count, diff.entry_labels())
             }
@@ -344,10 +443,87 @@ impl Vault {
 
     /// Mutably borrow the working db so write tools can stage changes.
     ///
+    /// Drops the cached [`View`]: the caller may change the working db, so
+    /// the next [`view`](Self::view) captures it afresh.
+    ///
     /// [`ErrorCode::VaultLocked`] when locked.
     pub fn working_db_mut(&mut self) -> CoreResult<&mut keepass::Database> {
         match &mut self.state {
-            VaultState::Unlocked { working_db, .. } => Ok(working_db),
+            VaultState::Unlocked {
+                working_db, view, ..
+            } => {
+                view.take();
+                Ok(working_db)
+            }
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// The [`View`] of the working db (its kdbx-core snapshot, sealed under
+    /// this session's fingerprint key, and its path index), captured on first
+    /// use and reused until the working db can have changed.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn view(&self) -> CoreResult<&View> {
+        match &self.state {
+            VaultState::Unlocked {
+                working_db,
+                session_key,
+                view,
+                ..
+            } => Ok(view.get_or_init(|| View::capture(working_db, session_key))),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// Whether the [`View`] of the working db is already captured, so
+    /// [`view`](Self::view) returns without capturing (which fingerprints
+    /// every attachment). False when locked.
+    pub fn has_cached_view(&self) -> bool {
+        match &self.state {
+            VaultState::Unlocked { view, .. } => view.get().is_some(),
+            VaultState::Locked => false,
+        }
+    }
+
+    /// The fingerprint of `bytes` in `domain` under the random session key:
+    /// the form every tool response uses (stable within this unlock only).
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn fingerprint(&self, domain: Domain, bytes: &[u8]) -> CoreResult<Fingerprint> {
+        match &self.state {
+            VaultState::Unlocked { session_key, .. } => Ok(session_key.fingerprint(domain, bytes)),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// The fingerprint of `bytes` in `domain` under the stable audit key, for
+    /// audit events only; `None` when the audit key is off. The key itself
+    /// never leaves the vault.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn audit_fingerprint(
+        &self,
+        domain: Domain,
+        bytes: &[u8],
+    ) -> CoreResult<Option<KeyedFingerprint>> {
+        match &self.state {
+            VaultState::Unlocked { audit_key, .. } => Ok(audit_key
+                .as_ref()
+                .map(|audit| audit.fingerprint(domain, bytes))),
+            VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
+        }
+    }
+
+    /// The derivation parameters and salt of the stable audit key, for the
+    /// `vault_unlocked` event's file copy; `None` when the audit key is off.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn audit_key_derivation(&self) -> CoreResult<Option<AuditKeyDerivation>> {
+        match &self.state {
+            VaultState::Unlocked { audit_key, .. } => {
+                Ok(audit_key.as_ref().map(AuditKey::derivation))
+            }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
         }
     }
@@ -414,7 +590,7 @@ impl Vault {
                 working_db,
                 ..
             } => {
-                let diff = crate::kdbx_core::stage::diff_pending(canonical_db, working_db);
+                let diff = crate::engine::stage::diff_pending(canonical_db, working_db);
                 diff.summary.num_added + diff.summary.num_modified
             }
             VaultState::Locked => 0,
@@ -528,9 +704,11 @@ impl Vault {
             VaultState::Unlocked {
                 canonical_db,
                 working_db,
+                view,
                 ..
             } => {
                 *working_db = canonical_db.clone();
+                view.take();
                 Ok(pending)
             }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
@@ -548,10 +726,12 @@ impl Vault {
                 canonical_db,
                 working_db,
                 file_baseline,
+                view,
                 ..
             } => {
                 *canonical_db = working_db.clone();
                 *file_baseline = written;
+                view.take();
                 Ok(())
             }
             VaultState::Locked => Err(ErrorCode::VaultLocked.into()),
@@ -871,6 +1051,130 @@ mod tests {
         db.entry_mut(id)
             .expect("entry")
             .edit(|e| e.set_unprotected(keepass::db::fields::URL, "https://example.com"));
+    }
+
+    /// The URL the cached view shows for the fixture's only entry.
+    fn viewed_url(vault: &Vault) -> Option<String> {
+        let view = vault.view().expect("unlocked");
+        let entry = view.snapshot().entries().next().expect("an entry");
+        kdbx_core::visibility::metadata_value(entry, "URL").map(str::to_owned)
+    }
+
+    #[test]
+    fn view_is_cached_until_the_working_db_can_change() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        assert_eq!(
+            vault.view().unwrap_err().code_enum(),
+            ErrorCode::VaultLocked
+        );
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        let first: *const View = vault.view().unwrap();
+        let again: *const View = vault.view().unwrap();
+        assert_eq!(first, again, "a second read reuses the captured view");
+        assert_eq!(viewed_url(&vault), None);
+
+        // Any mutable access drops the cache, so the change is visible.
+        stage_one_change(&mut vault);
+        assert_eq!(viewed_url(&vault).as_deref(), Some("https://example.com"));
+
+        // A discard drops it again.
+        vault.discard_working().expect("discard");
+        assert_eq!(viewed_url(&vault), None);
+
+        // The view is sealed: the fixture's protected password is a
+        // fingerprint, not plaintext.
+        let view = vault.view().unwrap();
+        let entry = view.snapshot().entries().next().unwrap();
+        assert!(entry.field("Password").unwrap().value.is_sealed());
+    }
+
+    #[test]
+    fn audit_key_is_stable_and_reproducible_while_tool_fingerprints_are_per_session() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path).with_audit_fingerprints(AuditFingerprints::Keyed);
+        assert_eq!(
+            vault
+                .fingerprint(Domain::Field, b"x")
+                .unwrap_err()
+                .code_enum(),
+            ErrorCode::VaultLocked
+        );
+
+        let mut audit = Vec::new();
+        let mut session = Vec::new();
+        for _ in 0..2 {
+            vault.unlock(TEST_PASSWORD, None).expect("unlock");
+            let derivation = vault.audit_key_derivation().unwrap().expect("keyed");
+            // The fixture's KDF is cheaper than the floor, so the floor applies.
+            assert_eq!(derivation.params, DeriveParams::FLOOR);
+            assert_eq!(
+                derivation.salt,
+                vault.working_db().unwrap().root().id().uuid()
+            );
+            let logged = vault
+                .audit_fingerprint(Domain::Field, b"hunter2")
+                .unwrap()
+                .expect("keyed");
+            assert_eq!(logged.domain(), Domain::Field);
+            // A verifier with the password, the params and the salt rebuilds
+            // the same key (what `diff-kdbx fingerprint` does).
+            let verifier = FingerprintKey::derive(
+                &KeyMaterial::new(Some(TEST_PASSWORD.as_bytes()), None),
+                derivation.salt,
+                &derivation.params,
+            )
+            .unwrap();
+            assert_eq!(
+                logged.fingerprint(),
+                verifier.fingerprint(Domain::Field, b"hunter2")
+            );
+            let tool = vault.fingerprint(Domain::Field, b"hunter2").unwrap();
+            assert_ne!(
+                tool,
+                logged.fingerprint(),
+                "tool responses never use the audit key"
+            );
+            // The cached view seals under the session key, not the audit key.
+            let view = vault.view().unwrap();
+            let entry = view.snapshot().entries().next().unwrap();
+            assert_eq!(
+                entry.field("Password").unwrap().value,
+                kdbx_core::model::Value::Sealed(tool)
+            );
+            audit.push(logged.fingerprint());
+            session.push(tool);
+            vault.lock(LockReason::Manual);
+            assert_eq!(
+                vault.audit_key_derivation().unwrap_err().code_enum(),
+                ErrorCode::VaultLocked
+            );
+        }
+        assert_eq!(audit[0], audit[1], "the audit key is stable across unlocks");
+        assert_ne!(
+            session[0], session[1],
+            "each unlock draws a new session key"
+        );
+    }
+
+    #[test]
+    fn without_audit_fingerprints_no_stable_key_is_derived() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        assert_eq!(vault.audit_key_derivation().unwrap(), None);
+        assert_eq!(vault.audit_fingerprint(Domain::Field, b"x").unwrap(), None);
+        assert!(vault.fingerprint(Domain::Field, b"x").is_ok());
+    }
+
+    #[test]
+    fn unreadable_reason_wire_names_are_stable() {
+        let name = |r| serde_json::to_value(r).unwrap();
+        assert_eq!(name(UnreadableReason::NotKdbx), "not_kdbx");
+        assert_eq!(
+            name(UnreadableReason::KdfParametersUnsupported),
+            "kdf_parameters_unsupported"
+        );
     }
 
     #[test]

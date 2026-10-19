@@ -1,4 +1,4 @@
-//! kdbx_core: vault logic with no MCP-protocol types.
+//! engine: vault logic with no MCP-protocol types.
 //!
 //! Audit invariant (from the v0.1 spec): nothing under this module imports
 //! MCP-specific types, so the core stays reusable by a future serv-kdbx HTTP
@@ -8,33 +8,36 @@
 //! Module map:
 //! - `error`: the typed error set and protocol-facing carrier (`CoreError`).
 //! - `config`: environment-variable configuration and validation.
-//! - `path`: `VaultPath` parsing, formatting, and resolution against a database.
+//! - `view`: `View`, a kdbx-core snapshot of a database plus its path index;
+//!   every path is parsed, formatted, and resolved through kdbx-core.
 //! - `address`: `EntryAddress`, the path-or-UUID way entry tools name an entry.
 //! - `vault`: the locked/unlocked state machine over canonical and working dbs.
 //! - `vault_file`: the file on disk: content fingerprint, writer lock, and the
 //!   atomic replace the save path uses.
 //! - `unlock`: master-password source resolution (input, env, command).
-//! - `audit`: the JSONL audit-log events and sha256 reveal hashing.
-//! - `totp`: otpauth URI parsing and TOTP code computation.
+//! - `audit`: the JSONL audit-log events, with keyed fingerprints of revealed
+//!   values.
+//! - `otp`: TOTP for a live entry through kdbx-core's `otp` (typed
+//!   `OTP_INVALID` for a malformed configuration).
 //! - `search`: substring entry search across configurable fields.
 //! - `secret`: `Secret<T>`, the redacting, zeroizing wrapper for secret fields.
 //! - `stage`: working-copy write operations, the diff-kdbx stage diff, and the
 //!   atomic save (Phase 2).
 //! - `orphan`: startup cleanup of leftover `*.tmp.*` save files (Phase 2).
-//! - `visibility`: the one rule for which field values may cross out as
-//!   metadata (unprotected, or the Title address), shared by views and search.
+//! - Visibility and the field schema are kdbx-core's (`kdbx_core::visibility`,
+//!   `kdbx_core::fields`): one secret predicate shared with every ecosystem
+//!   member.
 
 pub mod address;
 pub mod audit;
 pub mod config;
 pub mod error;
 pub mod orphan;
-pub mod path;
+pub mod otp;
 pub mod search;
 pub mod secret;
 pub mod stage;
-pub mod totp;
 pub mod unlock;
 pub mod vault;
 pub mod vault_file;
-pub mod visibility;
+pub mod view;

@@ -7,9 +7,9 @@
 //! never collide with the JSON-RPC stream on stdout.
 
 use mcp_kdbx::adapter::KdbxServer;
-use mcp_kdbx::kdbx_core::audit::AuditLog;
-use mcp_kdbx::kdbx_core::config::Config;
-use mcp_kdbx::kdbx_core::orphan;
+use mcp_kdbx::engine::audit::AuditLog;
+use mcp_kdbx::engine::config::Config;
+use mcp_kdbx::engine::orphan;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use std::time::SystemTime;
@@ -82,10 +82,10 @@ fn build_audit_log(config: &Config) -> AuditLog {
     let Some(path) = &config.log_file else {
         return AuditLog::stderr_only();
     };
-    // The audit trail holds reveal hashes, paths, and policy. Create it 0600 so
-    // it is owner-only from the first byte (mode applies only when the file is
-    // newly created; an existing file keeps its current permissions). This crate
-    // is POSIX-only per the spec, so the unix-only mode call is fine.
+    // The audit trail holds reveal fingerprints, paths, and policy. Create it
+    // 0600 so it is owner-only from the first byte (mode applies only when the
+    // file is newly created; an existing file keeps its current permissions).
+    // This crate is POSIX-only per the spec, so the unix-only mode call is fine.
     use std::os::unix::fs::OpenOptionsExt;
     match std::fs::OpenOptions::new()
         .create(true)

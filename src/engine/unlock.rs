@@ -30,8 +30,8 @@ use std::time::Duration;
 use serde_json::json;
 use zeroize::Zeroizing;
 
-use crate::kdbx_core::config::Config;
-use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::config::Config;
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 
 /// Which of the three sources actually produced the master password.
 ///

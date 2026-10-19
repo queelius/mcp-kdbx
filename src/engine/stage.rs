@@ -10,34 +10,36 @@
 //!
 //! - [`add_entry`] and [`update_field`]: stage writes onto the working db,
 //!   after validating titles and field names (spec section 3).
-//! - [`diff_pending`]: the canonical-vs-working semantic diff, computed by
-//!   `diff_kdbx::compute::compute` and mapped to the spec's `kdbx_diff_pending`
-//!   shape (spec section 4). Protected fields are redacted: the diff reports
-//!   that a protected field changed, never its before/after value.
+//! - [`diff_pending`]: the canonical-vs-working semantic diff. Both databases
+//!   are captured as kdbx-core snapshots under fingerprint sealing, compared
+//!   by `diff_kdbx::compute`, and mapped to the spec's `kdbx_diff_pending`
+//!   shape (spec section 4). Secret fields are redacted: the diff reports that
+//!   a secret field changed, never its before/after value.
 //! - [`save_pending`] and [`discard_pending`]: commit or drop the stage.
 //!
-//! ## Protected-vs-nonprotected discriminator
+//! ## Redaction is structural
 //!
-//! The diff mapping leans on one fact: `DiffOptions::default()` masks protected
-//! fields to `ValueDisplay::Masked { hash }` and leaves non-protected fields as
-//! `ValueDisplay::Plain { value }`. We never pass `show_secrets = true`, so a
-//! `Masked` value is exactly a protected field and a `Plain` value is exactly a
-//! non-protected one. That is how we decide whether to redact a field change
-//! without ever holding a protected plaintext.
+//! The snapshot holds a keyed fingerprint (`Value::Sealed`) in place of every
+//! secret value (protected, or a Password; never the Title), decided once at
+//! capture by `kdbx_core::visibility::is_secret`. A field change is shown with
+//! values only when both sides are plain, so no protected plaintext is ever
+//! held, let alone emitted, by the diff.
 
-use crate::kdbx_core::address::{EntryAddress, GroupAddress};
-use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
-use crate::kdbx_core::path::{vault_path_to_entry, vault_path_to_group};
-use crate::kdbx_core::secret::Secret;
-use crate::kdbx_core::vault::Vault;
-use crate::kdbx_core::vault_file::{
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::secret::Secret;
+use crate::engine::vault::Vault;
+use crate::engine::vault_file::{
     LockUnavailable, SaveStep, WRITER_LOCK_WAIT, WriterLock, read_with_fingerprint,
     resolve_write_target, write_atomically,
 };
-use diff_kdbx::change_set::{Change, EntryChangeKind, FieldChange, ValueChange, ValueDisplay};
-use diff_kdbx::options::DiffOptions;
+use crate::engine::view::{View, ephemeral_key};
+use diff_kdbx::{Change, DiffOptions, NodeStatus, Property, PropertyChange, Shown};
+use kdbx_core::fields::StandardField;
+use kdbx_core::fingerprint::{Domain, FingerprintKey};
+use kdbx_core::model::{NodeIndex, Value as SnapValue};
+use kdbx_core::visibility::{is_address, is_secret};
 use keepass::Database;
-use keepass::db::{EntryId, Value, fields};
+use keepass::db::{EntryId, GroupId, Value};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -96,7 +98,7 @@ pub struct DiffPending {
 ///
 /// `path` and `group_path` are `None` (JSON `null`) when the record has no
 /// addressable path (an empty title or group name, see
-/// [`vault_path_to_entry`]); `uuid` always identifies it.
+/// `kdbx_core::path::PathIndex`); `uuid` always identifies it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AddedEntry {
     pub path: Option<String>,
@@ -119,40 +121,70 @@ pub struct ModifiedEntry {
     pub attachment_changes: Vec<AttachmentChangeOut>,
 }
 
-/// One field change in a modified entry, in one of two shapes.
+/// One field change in a modified entry.
 ///
-/// `#[serde(untagged)]` makes serde pick the shape by which fields are present,
-/// so this serializes to exactly the two spec forms:
-/// - non-protected: `{ "field_name", "before", "after", "protected": false }`
-/// - protected:     `{ "field_name", "changed": true, "protected": true }`
+/// Two flags, named for what they mean:
+/// - `secret`: the values are withheld. True when either side is a secret by
+///   kdbx-core's `is_secret` (protected, or a Password; never the Title), so
+///   an unprotected Password's change is withheld and a protected Title's is
+///   shown. `before` and `after` are present exactly when it is false.
+/// - `protected`: the stored KDBX protection flag, after the change (before,
+///   for a removed field). The same meaning as `protected` in the read views'
+///   `standard_field_names` and `custom_field_names`, which carry `secret`
+///   too.
 ///
-/// The protected form carries no before/after, so a protected value never
-/// appears in a bulk diff even when it changed.
+/// `value_changed` and `protection_changed` say what changed; at least one
+/// is true. A protection toggle on an unchanged value (a protected Title made
+/// unprotected, say) is `protection_changed: true, value_changed: false`.
+/// Sealed values are compared by fingerprint, under the diff's one per-call
+/// key, so equal secrets compare equal without being held.
+///
+/// Wire shape (keys absent, not null, when not applicable):
+/// `{ field_name, secret, protected, protection_changed, value_changed,
+///   before?, after? }`, with JSON `null` for an absent side of a shown change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub enum FieldChangeOut {
-    /// A non-protected field: the before and after values are shown. An absent
-    /// side (a field added or removed) is JSON `null`.
-    Plain {
-        field_name: String,
-        before: serde_json::Value,
-        after: serde_json::Value,
-        protected: bool,
-    },
-    /// A protected field: only the fact that it changed, never the value.
-    Redacted {
-        field_name: String,
-        changed: bool,
-        protected: bool,
-    },
+pub struct FieldChangeOut {
+    pub field_name: String,
+    pub secret: bool,
+    pub protected: bool,
+    pub protection_changed: bool,
+    pub value_changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<serde_json::Value>,
 }
 
 /// An attachment change in a modified entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttachmentChangeOut {
     pub name: String,
-    /// One of "added", "removed", "modified".
-    pub change: String,
+    pub change: AttachmentChange,
+}
+
+/// What happened to an attachment, derived from which sides of the change
+/// hold it. Serializes as `"added"`, `"removed"` or `"modified"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentChange {
+    /// Only the working side has it.
+    Added,
+    /// Only the canonical side has it.
+    Removed,
+    /// Both sides have it, with different content or protection.
+    Modified,
+}
+
+impl AttachmentChange {
+    /// The kind of a change whose before and after sides are present as
+    /// given (a property change always has at least one side).
+    fn of(before: bool, after: bool) -> Self {
+        match (before, after) {
+            (false, _) => AttachmentChange::Added,
+            (_, false) => AttachmentChange::Removed,
+            _ => AttachmentChange::Modified,
+        }
+    }
 }
 
 impl DiffPending {
@@ -275,7 +307,7 @@ fn validate_field_name(name: &str) -> CoreResult<()> {
 /// write passes, so no path can store a title that `validate_title` refuses.
 fn validate_field_write(name: &str, value: &str) -> CoreResult<()> {
     validate_field_name(name)?;
-    if name == fields::TITLE {
+    if is_address(name) {
         validate_title(value)?;
     }
     Ok(())
@@ -285,11 +317,62 @@ fn validate_field_write(name: &str, value: &str) -> CoreResult<()> {
 // Write operations.
 // ---------------------------------------------------------------------------
 
-/// Stage a new entry under the group named by `group_path`.
+impl EntryInput {
+    /// Validate the input for [`add_entry`]: the title, and every field name
+    /// and value (a Title key in the fields map is refused, since the title
+    /// parameter is the one way to set it). Callers validate before they
+    /// resolve the target group, so an invalid input is reported as such even
+    /// when the group is also wrong.
+    pub fn validate(self) -> CoreResult<ValidEntryInput> {
+        validate_title(&self.title)?;
+        for f in &self.fields {
+            // A Title key in the fields map would silently override the
+            // title parameter.
+            if is_address(&f.name) {
+                return Err(CoreError::new(ErrorCode::FieldNameInvalid)
+                    .with_message("set the title with the title parameter, not in fields")
+                    .with_details(serde_json::json!({ "name": f.name })));
+            }
+            validate_field_write(&f.name, f.value.expose())?;
+        }
+        Ok(ValidEntryInput(self))
+    }
+}
+
+/// An [`EntryInput`] that passed [`EntryInput::validate`]; the only input
+/// [`add_entry`] accepts.
+#[derive(Debug, Clone)]
+pub struct ValidEntryInput(EntryInput);
+
+/// One validated field write for [`update_field`]: the name passed
+/// `validate_field_name`, and a Title value passed `validate_title`.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldWrite<'a> {
+    name: &'a str,
+    value: &'a str,
+    protected: Option<bool>,
+}
+
+impl<'a> FieldWrite<'a> {
+    /// Validate a write of `value` to field `name`. `protected = None` keeps
+    /// an existing field's protection (unprotected for a new field);
+    /// `Some(b)` forces it.
+    pub fn new(name: &'a str, value: &'a str, protected: Option<bool>) -> CoreResult<Self> {
+        validate_field_write(name, value)?;
+        Ok(FieldWrite {
+            name,
+            value,
+            protected,
+        })
+    }
+}
+
+/// Stage a new entry in the group `group_id` of `working`.
 ///
-/// Resolves the group in `working` (propagates `GROUP_NOT_FOUND`), validates
-/// the title and every field name, then creates the entry: sets Title, then
-/// each field (protected or not), then links each attachment under its name.
+/// The caller resolves the group (from the vault's cached view, so a write
+/// never captures a snapshot of its own) after validating the input. Creates
+/// the entry: sets Title, then each field (protected or not), then links each
+/// attachment under its name.
 /// Returns the new entry's id.
 ///
 /// keepass stamps a new entry's creation, modification, and access times with
@@ -298,22 +381,10 @@ fn validate_field_write(name: &str, value: &str) -> CoreResult<()> {
 /// be noise.
 pub fn add_entry(
     working: &mut Database,
-    group: &GroupAddress,
-    input: &EntryInput,
+    group_id: GroupId,
+    input: &ValidEntryInput,
 ) -> CoreResult<EntryId> {
-    validate_title(&input.title)?;
-    for f in &input.fields {
-        // The title parameter is the one way to set Title on a new entry; a
-        // Title key in the fields map would silently override it.
-        if f.name == fields::TITLE {
-            return Err(CoreError::new(ErrorCode::FieldNameInvalid)
-                .with_message("set the title with the title parameter, not in fields")
-                .with_details(serde_json::json!({ "name": f.name })));
-        }
-        validate_field_write(&f.name, f.value.expose())?;
-    }
-
-    let group_id = group.resolve(working)?;
+    let ValidEntryInput(input) = input;
 
     // Clone the inputs the closure needs. The edit closure is FnOnce and the
     // keepass write API takes owned values, so we move owned copies in.
@@ -338,7 +409,7 @@ pub fn add_entry(
     let new_id = group_mut
         .add_entry()
         .edit(|e| {
-            e.set_unprotected(fields::TITLE, title);
+            e.set_unprotected(StandardField::Title.kdbx_name(), title);
             for (name, value, protected) in field_specs {
                 let v = if protected {
                     Value::protected(value)
@@ -359,8 +430,9 @@ pub fn add_entry(
     Ok(new_id)
 }
 
-/// Update or set a single field on the entry named by `target` (a vault path or
-/// a record UUID). Returns the entry's id.
+/// Apply the validated field write `write` to the entry `entry_id` of
+/// `working` (resolved by the caller from the vault's cached view, after
+/// validating the write). Returns the entry's id.
 ///
 /// `protected = None` preserves an existing field's protection state (and
 /// defaults to unprotected for a new field); `Some(b)` forces it. An empty
@@ -369,18 +441,17 @@ pub fn add_entry(
 /// A real change snapshots the previous entry state into the entry's history
 /// and updates its modification time (KeePass edit semantics). Setting a field
 /// to the value and protection it already has is a no-op.
-/// Propagates `ENTRY_NOT_FOUND` when the target does not resolve to an entry,
-/// and validates the field name.
+/// `ENTRY_NOT_FOUND` if `entry_id` names no entry of `working`.
 pub fn update_field(
     working: &mut Database,
-    target: &EntryAddress,
-    field_name: &str,
-    value: &str,
-    protected: Option<bool>,
+    entry_id: EntryId,
+    write: &FieldWrite<'_>,
 ) -> CoreResult<EntryId> {
-    validate_field_write(field_name, value)?;
-
-    let entry_id = target.resolve(working)?;
+    let FieldWrite {
+        name: field_name,
+        value,
+        protected,
+    } = *write;
 
     // Decide the protection state before taking the mutable borrow: when the
     // caller did not force it, read the current field's state (false when the
@@ -529,54 +600,59 @@ fn maintain_history(working: &mut Database, entry_id: EntryId) {
 /// Compute the staged diff between the canonical baseline and the working db,
 /// mapped to the `kdbx_diff_pending` shape (spec section 4).
 ///
-/// Uses `DiffOptions::default()`, which masks protected fields. We only inspect
-/// `Change::Entry` changes with kind Added or Modified: v0.1 write tools add
-/// entries and update fields, nothing else. Group changes, database metadata
-/// changes, Moved entries, and Removed entries do not arise from our writes, so
-/// they are ignored. (A removed entry would need a delete tool we do not have;
-/// a moved entry, a move tool we do not have.) Tag and history field changes are
-/// likewise ignored: our writes do not intentionally create them.
+/// Both databases are captured as kdbx-core snapshots under fingerprint
+/// sealing with one [`ephemeral_key`], so no secret value is ever copied out of
+/// keepass, and `diff_kdbx::compute` compares them with the default options
+/// (timestamp noise suppressed). Only entry records are mapped: v0.1 write
+/// tools add entries and update fields, nothing else.
 pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
-    let change_set = diff_kdbx::compute::compute(canonical, working, &DiffOptions::default());
+    let key = ephemeral_key();
+    let before = View::capture(canonical, &key);
+    let after = View::capture(working, &key);
+    let change_set =
+        diff_kdbx::compute(before.snapshot(), after.snapshot(), &DiffOptions::default());
+    // One walk of the working snapshot, then a constant-time lookup per
+    // changed record.
+    let nodes = after.nodes();
 
     let mut added: Vec<AddedEntry> = Vec::new();
     let mut modified: Vec<ModifiedEntry> = Vec::new();
 
     for change in &change_set.changes {
-        let Change::Entry { uuid, kind, .. } = change else {
-            // Ignore Database and Group changes: our writes do not create them.
+        let Change::Entry(node) = change else {
+            // Database and group records do not arise from our writes.
             continue;
         };
-
-        match kind {
-            EntryChangeKind::Added => {
-                if let Some(entry) = map_added_entry(working, *uuid) {
+        match &node.status {
+            NodeStatus::Added => {
+                if let Some(entry) = map_added_entry(&after, &nodes, node.uuid) {
                     added.push(entry);
                 }
             }
-            EntryChangeKind::Modified { fields } => {
-                if let Some(entry) = map_modified_entry(working, *uuid, fields) {
+            // `moved_from` is not mapped: no v0.1 tool moves an entry, so a
+            // stage cannot hold a move.
+            NodeStatus::Modified { changes, .. } => {
+                if let Some(entry) = map_modified_entry(&after, &nodes, &key, node.uuid, changes) {
                     modified.push(entry);
                 }
             }
-            // No delete tool (Removed) and no move tool (Moved) in v0.1, so
-            // these do not arise from our writes. Leave `removed` empty.
-            EntryChangeKind::Removed | EntryChangeKind::Moved { .. } => {}
+            // No delete tool in v0.1, so `removed` stays empty. The wildcard
+            // also covers statuses a later diff-kdbx adds (`#[non_exhaustive]`).
+            _ => {}
         }
     }
 
     // Stable order: sort each list by (group_path, title), with the uuid as a
     // final tie-break so same-titled siblings order deterministically. Modified
-    // entries carry no group_path field, so derive it from the working db.
+    // entries carry no group_path field, so derive it from the working view.
     added.sort_by(|a, b| {
         (&a.group_path, &a.title, &a.uuid).cmp(&(&b.group_path, &b.title, &b.uuid))
     });
     modified.sort_by_cached_key(|m| {
-        (
-            group_path_of(working, &m.uuid),
-            m.title.clone(),
-            m.uuid.clone(),
-        )
+        let group_path = uuid::Uuid::parse_str(&m.uuid)
+            .ok()
+            .and_then(|u| after.parent_path_string(&nodes, u));
+        (group_path, m.title.clone(), m.uuid.clone())
     });
 
     let num_added = added.len();
@@ -593,103 +669,57 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
     }
 }
 
-/// The vault path of the group holding the entry whose hyphenated UUID is
-/// `uuid`, used as a sort key. `None` when the entry is gone or its group has
-/// no addressable path.
-fn group_path_of(working: &Database, uuid: &str) -> Option<String> {
-    let entry = working
-        .iter_all_entries()
-        .find(|e| e.id().uuid().hyphenated().to_string() == uuid)?;
-    containing_group_path(working, &entry)
-}
-
-/// The vault path of the group that holds `entry`, or `None` when that group
-/// has no addressable path.
-fn containing_group_path(working: &Database, entry: &keepass::db::EntryRef<'_>) -> Option<String> {
-    vault_path_to_group(working, entry.parent().id()).map(|p| p.format())
-}
-
-/// Build an [`AddedEntry`] by looking up `uuid` in the working db.
-fn map_added_entry(working: &Database, uuid: uuid::Uuid) -> Option<AddedEntry> {
-    let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
-    let eid = entry_ref.id();
-
-    // Both paths are None for a record with no addressable path. There is no
-    // fallback string: a placeholder like "/" would alias the root group.
-    let path = vault_path_to_entry(working, eid).map(|p| p.format());
-    let group_path = containing_group_path(working, &entry_ref);
-
-    let title = entry_ref.get_title().unwrap_or("").to_string();
-    let field_count = entry_ref.fields.len();
-    let has_attachments = entry_ref.attachments_named().next().is_some();
-    // Route has_otp through the same resolver the read views use
-    // (src/adapter/views.rs), so kdbx_diff_pending and kdbx_list_entries agree on
-    // whether an entry has a usable TOTP source (every source the resolver
-    // knows, not just a bare `otp` presence check).
-    let has_otp = crate::kdbx_core::totp::resolve_for_entry(&entry_ref).is_some();
-
+/// Build an [`AddedEntry`] for the entry `uuid` from the working db's
+/// [`View`], `after` (the same source the read views use, so the two agree on
+/// paths and on `has_otp`).
+fn map_added_entry(after: &View, nodes: &NodeIndex<'_>, uuid: uuid::Uuid) -> Option<AddedEntry> {
+    let entry = nodes.entry(uuid)?;
     Some(AddedEntry {
-        path,
+        // Both paths are None for a record with no addressable path. There is
+        // no fallback string: a placeholder like "/" would alias the root.
+        path: after.path_string(uuid),
         uuid: uuid.hyphenated().to_string(),
-        title,
-        group_path,
-        field_count,
-        has_attachments,
-        has_otp,
+        title: entry.title().unwrap_or("").to_string(),
+        group_path: after.parent_path_string(nodes, uuid),
+        field_count: entry.fields.len(),
+        has_attachments: !entry.attachments.is_empty(),
+        has_otp: after.has_otp(uuid),
     })
 }
 
-/// Build a [`ModifiedEntry`] by looking up `uuid` in the working db and
-/// partitioning its field changes into field-level and attachment-level lists.
+/// Build a [`ModifiedEntry`] by looking up `uuid` in the working view and
+/// partitioning its property changes into field-level and attachment-level
+/// lists. Other properties (tags, history items, icons) are not part of the
+/// v0.1 diff surface.
 fn map_modified_entry(
-    working: &Database,
+    after: &View,
+    nodes: &NodeIndex<'_>,
+    key: &FingerprintKey,
     uuid: uuid::Uuid,
-    field_changes: &[FieldChange],
+    changes: &[PropertyChange],
 ) -> Option<ModifiedEntry> {
-    let entry_ref = working.iter_all_entries().find(|e| e.id().uuid() == uuid)?;
-    let eid = entry_ref.id();
-
-    let path = vault_path_to_entry(working, eid).map(|p| p.format());
-    let title = entry_ref.get_title().unwrap_or("").to_string();
+    let entry = nodes.entry(uuid)?;
+    let path = after.path_string(uuid);
+    let title = entry.title().unwrap_or("").to_string();
 
     let mut field_out: Vec<FieldChangeOut> = Vec::new();
     let mut attachment_out: Vec<AttachmentChangeOut> = Vec::new();
 
-    for fc in field_changes {
-        match fc {
-            FieldChange::Modified { name, change } => {
-                field_out.push(map_modified_field(name, change));
+    for pc in changes {
+        match &pc.property {
+            Property::Field(name) => {
+                field_out.push(map_field_change(
+                    key,
+                    name.as_str(),
+                    pc.before.as_ref(),
+                    pc.after.as_ref(),
+                ));
             }
-            FieldChange::Added { name, value } => {
-                field_out.push(map_added_field(name, value));
-            }
-            FieldChange::Removed { name, value } => {
-                field_out.push(map_removed_field(name, value));
-            }
-            FieldChange::AttachmentAdded { name, .. } => {
-                attachment_out.push(AttachmentChangeOut {
-                    name: name.clone(),
-                    change: "added".to_string(),
-                });
-            }
-            FieldChange::AttachmentRemoved { name, .. } => {
-                attachment_out.push(AttachmentChangeOut {
-                    name: name.clone(),
-                    change: "removed".to_string(),
-                });
-            }
-            FieldChange::AttachmentModified { name, .. } => {
-                attachment_out.push(AttachmentChangeOut {
-                    name: name.clone(),
-                    change: "modified".to_string(),
-                });
-            }
-            // Tags and history: our writes do not intentionally create these,
-            // and they are not part of the v0.1 diff surface. Ignore them.
-            FieldChange::TagAdded { .. }
-            | FieldChange::TagRemoved { .. }
-            | FieldChange::HistoryGrew { .. }
-            | FieldChange::HistoryRewritten { .. } => {}
+            Property::Attachment(name) => attachment_out.push(AttachmentChangeOut {
+                name: name.clone(),
+                change: AttachmentChange::of(pc.before.is_some(), pc.after.is_some()),
+            }),
+            _ => {}
         }
     }
 
@@ -702,72 +732,97 @@ fn map_modified_entry(
     })
 }
 
-/// Map a value-to-value field change. A protected field (either side masked)
-/// is redacted; a non-protected change carries its before/after.
-fn map_modified_field(name: &str, change: &ValueChange) -> FieldChangeOut {
-    if is_masked(&change.from) || is_masked(&change.to) {
-        redacted(name)
-    } else {
-        FieldChangeOut::Plain {
-            field_name: name.to_string(),
-            before: plain_to_json(&change.from),
-            after: plain_to_json(&change.to),
-            protected: false,
-        }
+/// One present side of a field change: its stored protection flag and its
+/// value.
+struct Side<'a> {
+    protected: bool,
+    value: &'a SnapValue,
+}
+
+/// Read one side of a field change: `Ok(None)` for an absent side, `Err(())`
+/// for a kind of value this version does not know (then treated as secret).
+fn side(shown: Option<&Shown>) -> Result<Option<Side<'_>>, ()> {
+    match shown {
+        None => Ok(None),
+        Some(Shown::Field {
+            protected, value, ..
+        }) => Ok(Some(Side {
+            protected: *protected,
+            value,
+        })),
+        Some(_) => Err(()),
     }
 }
 
-/// Map a newly-added field: before is null, after is the value (or redacted if
-/// the field is protected).
-fn map_added_field(name: &str, value: &ValueDisplay) -> FieldChangeOut {
-    if is_masked(value) {
-        redacted(name)
-    } else {
-        FieldChangeOut::Plain {
-            field_name: name.to_string(),
-            before: serde_json::Value::Null,
-            after: plain_to_json(value),
-            protected: false,
+/// Map one field change (see [`FieldChangeOut`] for the flags). `key` is the
+/// one key both sides were captured under: values are compared as
+/// fingerprints under it, so a sealed side and a plain side holding the same
+/// text (protection turned off without a value change) compare equal.
+fn map_field_change(
+    key: &FingerprintKey,
+    name: &str,
+    before: Option<&Shown>,
+    after: Option<&Shown>,
+) -> FieldChangeOut {
+    let (before, after) = match (side(before), side(after)) {
+        (Ok(before), Ok(after)) => (before, after),
+        // An unknown kind of value: report only that the field changed.
+        _ => {
+            return FieldChangeOut {
+                field_name: name.to_string(),
+                secret: true,
+                protected: true,
+                protection_changed: false,
+                value_changed: true,
+                before: None,
+                after: None,
+            };
         }
-    }
-}
-
-/// Map a removed field: before is the value, after is null (or redacted if the
-/// field is protected).
-fn map_removed_field(name: &str, value: &ValueDisplay) -> FieldChangeOut {
-    if is_masked(value) {
-        redacted(name)
+    };
+    let is_secret_side = |side: &Option<Side<'_>>| {
+        side.as_ref().is_some_and(|s| {
+            is_secret(name, s.protected) || !matches!(s.value, SnapValue::Plain(_))
+        })
+    };
+    let secret = is_secret_side(&before) || is_secret_side(&after);
+    let protected = after
+        .as_ref()
+        .or(before.as_ref())
+        .is_some_and(|s| s.protected);
+    let protection_changed =
+        matches!((&before, &after), (Some(b), Some(a)) if b.protected != a.protected);
+    let fingerprint = |value: &SnapValue| match value {
+        SnapValue::Sealed(fp) => Some(*fp),
+        SnapValue::Plain(text) => Some(key.fingerprint(Domain::Field, text.as_bytes())),
+        _ => None,
+    };
+    let value_changed = match (&before, &after) {
+        (Some(b), Some(a)) => match (fingerprint(b.value), fingerprint(a.value)) {
+            (Some(b), Some(a)) => b != a,
+            // An unknown kind of value: assume it changed.
+            _ => true,
+        },
+        _ => true,
+    };
+    let shown = |side: &Option<Side<'_>>| match side {
+        None => serde_json::Value::Null,
+        Some(s) => s.value.as_plain().map_or(serde_json::Value::Null, |t| {
+            serde_json::Value::String(t.to_string())
+        }),
+    };
+    let (before_out, after_out) = if secret {
+        (None, None)
     } else {
-        FieldChangeOut::Plain {
-            field_name: name.to_string(),
-            before: plain_to_json(value),
-            after: serde_json::Value::Null,
-            protected: false,
-        }
-    }
-}
-
-/// The redacted form for a protected field change.
-fn redacted(name: &str) -> FieldChangeOut {
-    FieldChangeOut::Redacted {
+        (Some(shown(&before)), Some(shown(&after)))
+    };
+    FieldChangeOut {
         field_name: name.to_string(),
-        changed: true,
-        protected: true,
-    }
-}
-
-/// True when a `ValueDisplay` is the masked (protected) form.
-fn is_masked(v: &ValueDisplay) -> bool {
-    matches!(v, ValueDisplay::Masked { .. })
-}
-
-/// Render a non-masked `ValueDisplay` to a JSON string value. A `Masked` value
-/// should never reach here (callers redact first); it maps to null defensively
-/// so a protected plaintext can never leak through this path.
-fn plain_to_json(v: &ValueDisplay) -> serde_json::Value {
-    match v {
-        ValueDisplay::Plain { value } => serde_json::Value::String(value.clone()),
-        ValueDisplay::Masked { .. } => serde_json::Value::Null,
+        secret,
+        protected,
+        protection_changed,
+        value_changed,
+        before: before_out,
+        after: after_out,
     }
 }
 
@@ -875,8 +930,10 @@ fn absolute_path_string(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kdbx_core::path::VaultPath;
-    use crate::kdbx_core::vault::Vault;
+    use crate::engine::address::{EntryAddress, GroupAddress};
+    use crate::engine::vault::Vault;
+    use kdbx_core::path::VaultPath;
+    use keepass::db::fields;
     use keepass::{Database, DatabaseKey};
     use std::io::Write;
     use std::path::PathBuf;
@@ -910,6 +967,36 @@ mod tests {
 
     fn gaddr(s: &str) -> GroupAddress {
         GroupAddress::Path(path(s))
+    }
+
+    /// Resolve the entry path `s` in `db`, as the write tools do.
+    fn resolve(db: &Database, s: &str) -> CoreResult<EntryId> {
+        addr(s).resolve(db, &View::capture_ephemeral(db))
+    }
+
+    /// Validate, resolve against a fresh view, then stage: the order the
+    /// adapter uses (it resolves against the vault's cached view).
+    fn add_entry(
+        db: &mut Database,
+        group: &GroupAddress,
+        input: &EntryInput,
+    ) -> CoreResult<EntryId> {
+        let input = input.clone().validate()?;
+        let group_id = group.resolve(db, &View::capture_ephemeral(db))?;
+        super::add_entry(db, group_id, &input)
+    }
+
+    /// [`add_entry`]'s counterpart for a field write.
+    fn update_field(
+        db: &mut Database,
+        target: &EntryAddress,
+        field_name: &str,
+        value: &str,
+        protected: Option<bool>,
+    ) -> CoreResult<EntryId> {
+        let write = FieldWrite::new(field_name, value, protected)?;
+        let entry_id = target.resolve(db, &View::capture_ephemeral(db))?;
+        super::update_field(db, entry_id, &write)
     }
 
     fn simple_input(title: &str) -> EntryInput {
@@ -955,7 +1042,7 @@ mod tests {
         assert_eq!(entry.get_title(), Some("New Root Entry"));
         assert_eq!(entry.get("UserName"), Some("alice"));
         // Resolves by path too.
-        let resolved = path("/New Root Entry").resolve_entry(&db).expect("resolve");
+        let resolved = resolve(&db, "/New Root Entry").expect("resolve");
         assert_eq!(resolved, id);
     }
 
@@ -964,7 +1051,7 @@ mod tests {
         let mut db = build_db();
         let id =
             add_entry(&mut db, &gaddr("/Web/"), &simple_input("Nested")).expect("add into /Web");
-        let resolved = path("/Web/Nested").resolve_entry(&db).expect("resolve");
+        let resolved = resolve(&db, "/Web/Nested").expect("resolve");
         assert_eq!(resolved, id);
     }
 
@@ -1133,7 +1220,7 @@ mod tests {
         };
         let err = add_entry(&mut db, &gaddr("/"), &input).expect_err("Title in fields");
         assert_eq!(err.code_enum(), ErrorCode::FieldNameInvalid);
-        assert!(path("/Valid").resolve_entry(&db).is_err(), "nothing staged");
+        assert!(resolve(&db, "/Valid").is_err(), "nothing staged");
     }
 
     #[test]
@@ -1146,7 +1233,7 @@ mod tests {
         }
         // A valid rename works and the entry is reachable at its new path.
         update_field(&mut db, &addr("/Existing"), fields::TITLE, "Renamed", None).unwrap();
-        assert!(path("/Renamed").resolve_entry(&db).is_ok());
+        assert!(resolve(&db, "/Renamed").is_ok());
     }
 
     #[test]
@@ -1194,7 +1281,7 @@ mod tests {
             None,
         )
         .expect("update");
-        let id = path("/Existing").resolve_entry(&db).expect("resolve");
+        let id = resolve(&db, "/Existing").expect("resolve");
         let entry = db.entry(id).expect("entry");
         assert_eq!(entry.get("URL"), Some("https://new.example.com"));
     }
@@ -1206,7 +1293,7 @@ mod tests {
         // protected.
         update_field(&mut db, &addr("/Existing"), "Password", "new-secret", None)
             .expect("update password");
-        let id = path("/Existing").resolve_entry(&db).expect("resolve");
+        let id = resolve(&db, "/Existing").expect("resolve");
         let entry = db.entry(id).expect("entry");
         let pw = entry.fields.get("Password").expect("password");
         assert!(pw.is_protected(), "protection preserved when None");
@@ -1231,7 +1318,7 @@ mod tests {
         let mut db = build_db();
         update_field(&mut db, &addr("/Existing"), "URL", "secret-url", Some(true))
             .expect("force protect");
-        let id = path("/Existing").resolve_entry(&db).expect("resolve");
+        let id = resolve(&db, "/Existing").expect("resolve");
         let url = db
             .entry(id)
             .unwrap()
@@ -1246,14 +1333,14 @@ mod tests {
     fn update_field_empty_value_clears() {
         let mut db = build_db();
         update_field(&mut db, &addr("/Existing"), "URL", "", None).expect("clear");
-        let id = path("/Existing").resolve_entry(&db).expect("resolve");
+        let id = resolve(&db, "/Existing").expect("resolve");
         assert_eq!(db.entry(id).unwrap().get("URL"), Some(""));
     }
 
     /// Backdate every timestamp of the entry at `p` so a modification made
     /// now is visible at KDBX's one-second precision.
     fn backdate(db: &mut Database, p: &str) {
-        let id = path(p).resolve_entry(db).unwrap();
+        let id = resolve(db, p).unwrap();
         let old = chrono::DateTime::from_timestamp(1_600_000_000, 0)
             .unwrap()
             .naive_utc();
@@ -1266,7 +1353,7 @@ mod tests {
     fn update_field_snapshots_history_and_bumps_modification_time() {
         let mut db = build_db();
         backdate(&mut db, "/Existing");
-        let id = path("/Existing").resolve_entry(&db).unwrap();
+        let id = resolve(&db, "/Existing").unwrap();
         let (created, modified) = {
             let e = db.entry(id).unwrap();
             assert!(e.history.is_none() || e.history.as_ref().unwrap().get_entries().is_empty());
@@ -1293,7 +1380,7 @@ mod tests {
     /// The URL values held by the history snapshots of the entry at `p`, in
     /// stored order.
     fn history_urls(db: &Database, p: &str) -> Vec<String> {
-        let id = path(p).resolve_entry(db).unwrap();
+        let id = resolve(db, p).unwrap();
         db.entry(id)
             .unwrap()
             .history
@@ -1460,7 +1547,11 @@ mod tests {
         let a = &d.added[0];
         assert_eq!(a.title, "Brand New");
         assert_eq!(a.path.as_deref(), Some("/Web/Brand New"));
-        assert_eq!(a.group_path.as_deref(), Some("/Web"));
+        assert_eq!(
+            a.group_path.as_deref(),
+            Some("/Web/"),
+            "group paths keep their trailing slash"
+        );
         // Title plus the two fields.
         assert_eq!(a.field_count, 3);
         assert!(!a.has_attachments);
@@ -1485,25 +1576,24 @@ mod tests {
         let m = &d.modified[0];
         assert_eq!(m.title, "Existing");
         assert_eq!(m.path.as_deref(), Some("/Existing"));
-        // The URL field change must carry before/after, protected false.
+        // The URL field change carries before/after: not a secret.
         let fc = m
             .field_changes
             .iter()
-            .find(|f| f.field_name() == "URL")
+            .find(|f| f.field_name == "URL")
             .expect("URL field change present");
-        match fc {
-            FieldChangeOut::Plain {
-                before,
-                after,
-                protected,
-                ..
-            } => {
-                assert!(!*protected);
-                assert_eq!(before, &serde_json::json!("https://old.example.com"));
-                assert_eq!(after, &serde_json::json!("https://new.example.com"));
+        assert_eq!(
+            fc,
+            &FieldChangeOut {
+                field_name: "URL".to_string(),
+                secret: false,
+                protected: false,
+                protection_changed: false,
+                value_changed: true,
+                before: Some(serde_json::json!("https://old.example.com")),
+                after: Some(serde_json::json!("https://new.example.com")),
             }
-            FieldChangeOut::Redacted { .. } => panic!("URL is not protected"),
-        }
+        );
     }
 
     #[test]
@@ -1524,17 +1614,143 @@ mod tests {
         let fc = m
             .field_changes
             .iter()
-            .find(|f| f.field_name() == "Password")
+            .find(|f| f.field_name == "Password")
             .expect("Password field change present");
-        match fc {
-            FieldChangeOut::Redacted {
-                changed, protected, ..
-            } => {
-                assert!(*changed);
-                assert!(*protected);
-            }
-            FieldChangeOut::Plain { .. } => panic!("Password must be redacted, not shown"),
+        assert!(fc.secret && fc.protected && fc.value_changed && !fc.protection_changed);
+        assert_eq!(
+            (&fc.before, &fc.after),
+            (&None, &None),
+            "Password must be withheld"
+        );
+    }
+
+    /// A database whose entry "Covert" has a protected UserName and a
+    /// protected custom field, the reviewer's case for the snapshot diff.
+    fn covert_db() -> Database {
+        let mut db = Database::new();
+        db.root_mut().add_entry().edit(|e| {
+            e.set_unprotected(fields::TITLE, "Covert");
+            e.set_protected(fields::USERNAME, "old-user-0x7a");
+            e.set_protected("Recovery", "old-recovery-0x7b");
+        });
+        db
+    }
+
+    #[test]
+    fn diff_protected_username_and_custom_field_are_modified_without_values() {
+        let canonical = covert_db();
+        let mut working = canonical.clone();
+        for (name, value) in [
+            ("UserName", "new-user-0x7c"),
+            ("Recovery", "new-recovery-0x7d"),
+        ] {
+            update_field(&mut working, &addr("/Covert"), name, value, None).unwrap();
         }
+        let d = diff_pending(&canonical, &working);
+        assert_eq!(d.summary.num_modified, 1);
+        let m = &d.modified[0];
+        let mut names: Vec<&str> = m
+            .field_changes
+            .iter()
+            .map(|f| f.field_name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Recovery", "UserName"]);
+        for fc in &m.field_changes {
+            assert!(
+                fc.secret && fc.protected && fc.value_changed && fc.before.is_none(),
+                "{fc:?} must be a withheld modification"
+            );
+        }
+        let wire = serde_json::to_string(&d).unwrap();
+        for value in [
+            "old-user-0x7a",
+            "old-recovery-0x7b",
+            "new-user-0x7c",
+            "new-recovery-0x7d",
+        ] {
+            assert!(!wire.contains(value), "{value} leaked into {wire}");
+        }
+    }
+
+    #[test]
+    fn diff_reports_attachment_changes_by_kind_without_content() {
+        let canonical = build_db();
+        let mut working = canonical.clone();
+        let id = resolve(&working, "/Existing").unwrap();
+        working.entry_mut(id).unwrap().edit(|e| {
+            e.add_attachment("key.pem", Value::protected(b"attached-bytes-0x5e".to_vec()));
+        });
+        let d = diff_pending(&canonical, &working);
+        let m = &d.modified[0];
+        assert_eq!(
+            m.attachment_changes,
+            [AttachmentChangeOut {
+                name: "key.pem".to_string(),
+                change: AttachmentChange::Added,
+            }]
+        );
+        let wire = serde_json::to_value(&d).unwrap();
+        assert_eq!(
+            wire["modified"][0]["attachment_changes"],
+            serde_json::json!([{ "name": "key.pem", "change": "added" }])
+        );
+        assert!(!wire.to_string().contains("attached-bytes"));
+        assert_eq!(AttachmentChange::of(true, false), AttachmentChange::Removed);
+        assert_eq!(AttachmentChange::of(true, true), AttachmentChange::Modified);
+    }
+
+    #[test]
+    fn diff_never_carries_fingerprints() {
+        // The stage diff seals under a random per-call key, so a fingerprint
+        // would mean nothing to the agent: none may cross out, in any form.
+        let canonical = covert_db();
+        let mut working = canonical.clone();
+        update_field(&mut working, &addr("/Covert"), "UserName", "x", None).unwrap();
+        update_field(&mut working, &addr("/Covert"), "Recovery", "y", Some(false)).unwrap();
+        let wire = serde_json::to_value(diff_pending(&canonical, &working)).unwrap();
+        for fc in wire["modified"][0]["field_changes"].as_array().unwrap() {
+            let keys: Vec<&str> = fc.as_object().unwrap().keys().map(String::as_str).collect();
+            let flags = [
+                "field_name",
+                "protected",
+                "protection_changed",
+                "secret",
+                "value_changed",
+            ];
+            match fc["secret"].as_bool().unwrap() {
+                true => assert_eq!(keys, flags, "{fc}"),
+                false => {
+                    let mut shown = vec!["after", "before"];
+                    shown.extend(flags);
+                    assert_eq!(keys, shown, "{fc}")
+                }
+            }
+        }
+        // Turning protection off does not reveal the new value: the old one
+        // was a secret, so the change is withheld. `protected` is the stored
+        // flag after the change.
+        let recovery = &wire["modified"][0]["field_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["field_name"] == "Recovery")
+            .unwrap()
+            .clone();
+        assert_eq!(recovery["secret"], serde_json::json!(true));
+        assert_eq!(recovery["protected"], serde_json::json!(false));
+        assert_eq!(recovery["protection_changed"], serde_json::json!(true));
+        let hex_run = |s: &str| {
+            s.as_bytes()
+                .windows(8)
+                .any(|w| w.iter().all(u8::is_ascii_hexdigit))
+        };
+        // Record UUIDs are the only hex a diff may carry.
+        let text = working
+            .iter_all_entries()
+            .map(|e| e.id().uuid().hyphenated().to_string())
+            .fold(wire.to_string(), |text, uuid| text.replace(&uuid, ""));
+        assert!(!hex_run(&text), "a fingerprint-like hex run in {text}");
     }
 
     #[test]
@@ -1566,28 +1782,18 @@ mod tests {
         let fc = m
             .field_changes
             .iter()
-            .find(|f| f.field_name() == "ApiKey")
+            .find(|f| f.field_name == "ApiKey")
             .expect("ApiKey field change present");
 
-        // It must be the redacted form: changed and protected, no value.
-        match fc {
-            FieldChangeOut::Redacted {
-                changed, protected, ..
-            } => {
-                assert!(*changed);
-                assert!(*protected);
-            }
-            FieldChangeOut::Plain { .. } => {
-                panic!("a newly-added protected field must be redacted, not shown")
-            }
-        }
+        // It must be withheld: a secret, protected, value changed, no value.
+        assert!(fc.secret && fc.protected && fc.value_changed);
 
-        // Serialize the field change and assert the redacted JSON shape: the
-        // object has protected and changed true and carries no before/after.
+        // Serialize the field change and assert the withheld JSON shape: no
+        // before/after key at all.
         let fc_json = serde_json::to_value(fc).expect("serialize field change");
         let obj = fc_json.as_object().expect("field change is an object");
-        assert_eq!(obj.get("protected"), Some(&serde_json::json!(true)));
-        assert_eq!(obj.get("changed"), Some(&serde_json::json!(true)));
+        assert_eq!(obj.get("secret"), Some(&serde_json::json!(true)));
+        assert_eq!(obj.get("value_changed"), Some(&serde_json::json!(true)));
         assert!(!obj.contains_key("before"), "no before on a redacted add");
         assert!(!obj.contains_key("after"), "no after on a redacted add");
 
@@ -1602,46 +1808,49 @@ mod tests {
 
     #[test]
     fn diff_field_change_json_shapes_match_spec() {
-        // Non-protected: { field_name, before, after, protected: false }.
-        let plain = FieldChangeOut::Plain {
+        // Shown: every flag, plus before and after (null for an absent side).
+        let shown = FieldChangeOut {
             field_name: "URL".to_string(),
-            before: serde_json::json!("a"),
-            after: serde_json::json!("b"),
+            secret: false,
             protected: false,
+            protection_changed: false,
+            value_changed: true,
+            before: Some(serde_json::Value::Null),
+            after: Some(serde_json::json!("b")),
         };
-        let plain_json = serde_json::to_value(&plain).expect("serialize plain");
         assert_eq!(
-            plain_json,
+            serde_json::to_value(&shown).unwrap(),
             serde_json::json!({
                 "field_name": "URL",
-                "before": "a",
-                "after": "b",
-                "protected": false
+                "secret": false,
+                "protected": false,
+                "protection_changed": false,
+                "value_changed": true,
+                "before": null,
+                "after": "b"
             })
         );
 
-        // Protected: { field_name, changed: true, protected: true }. No before
-        // or after key at all.
-        let redacted = FieldChangeOut::Redacted {
+        // Withheld: the flags only, no before or after key at all.
+        let withheld = FieldChangeOut {
             field_name: "Password".to_string(),
-            changed: true,
+            secret: true,
             protected: true,
+            protection_changed: false,
+            value_changed: true,
+            before: None,
+            after: None,
         };
-        let redacted_json = serde_json::to_value(&redacted).expect("serialize redacted");
         assert_eq!(
-            redacted_json,
+            serde_json::to_value(&withheld).unwrap(),
             serde_json::json!({
                 "field_name": "Password",
-                "changed": true,
-                "protected": true
+                "secret": true,
+                "protected": true,
+                "protection_changed": false,
+                "value_changed": true
             })
         );
-        let obj = redacted_json.as_object().expect("object");
-        assert!(
-            !obj.contains_key("before"),
-            "no before on a redacted change"
-        );
-        assert!(!obj.contains_key("after"), "no after on a redacted change");
     }
 
     #[test]
@@ -1989,7 +2198,7 @@ mod tests {
         // The modern-otp case is covered by diff_added_entry_with_otp_sets_has_otp.
         // This pins the legacy "TOTP Seed" + "TOTP Settings" pair so the diff's
         // has_otp agrees with the read views, which also route through
-        // totp::resolve_for_entry.
+        // engine::otp::has_otp.
         let canonical = build_db();
         let mut working = canonical.clone();
         let input = EntryInput {
@@ -2021,13 +2230,71 @@ mod tests {
         );
     }
 
-    // A small test-only helper on the output type, to keep assertions readable.
-    impl FieldChangeOut {
-        fn field_name(&self) -> &str {
-            match self {
-                FieldChangeOut::Plain { field_name, .. } => field_name,
-                FieldChangeOut::Redacted { field_name, .. } => field_name,
+    #[test]
+    fn a_protection_toggle_on_an_unchanged_title_is_a_protection_change() {
+        let mut canonical = Database::new();
+        canonical.root_mut().add_entry().edit(|e| {
+            e.set_protected(fields::TITLE, "Shielded");
+            e.set_unprotected(fields::PASSWORD, "plain-flag-pw-0x3c");
+        });
+        let mut working = canonical.clone();
+        update_field(
+            &mut working,
+            &addr("/Shielded"),
+            fields::TITLE,
+            "Shielded",
+            Some(false),
+        )
+        .unwrap();
+        update_field(
+            &mut working,
+            &addr("/Shielded"),
+            fields::PASSWORD,
+            "plain-flag-pw-0x3d",
+            None,
+        )
+        .unwrap();
+        let d = diff_pending(&canonical, &working);
+        let changes = &d.modified[0].field_changes;
+        let title = changes.iter().find(|f| f.field_name == "Title").unwrap();
+        // The Title is never a secret, so its value is shown; only its
+        // protection changed.
+        assert_eq!(
+            title,
+            &FieldChangeOut {
+                field_name: "Title".to_string(),
+                secret: false,
+                protected: false,
+                protection_changed: true,
+                value_changed: false,
+                before: Some(serde_json::json!("Shielded")),
+                after: Some(serde_json::json!("Shielded")),
             }
-        }
+        );
+        // An unprotected Password is a secret: withheld, its stored flag false.
+        let password = changes.iter().find(|f| f.field_name == "Password").unwrap();
+        assert!(password.secret && !password.protected && password.value_changed);
+        assert!(password.before.is_none() && password.after.is_none());
+        assert!(!serde_json::to_string(&d).unwrap().contains("plain-flag-pw"));
+    }
+
+    #[test]
+    fn unprotecting_a_secret_without_changing_it_is_a_protection_change_only() {
+        let canonical = covert_db();
+        let mut working = canonical.clone();
+        update_field(
+            &mut working,
+            &addr("/Covert"),
+            "Recovery",
+            "old-recovery-0x7b",
+            Some(false),
+        )
+        .unwrap();
+        let d = diff_pending(&canonical, &working);
+        let fc = &d.modified[0].field_changes[0];
+        assert_eq!(fc.field_name, "Recovery");
+        // The sealed before and the plain after hold the same text: they
+        // compare equal by fingerprint, and the value stays withheld.
+        assert!(fc.secret && fc.protection_changed && !fc.value_changed && !fc.protected);
     }
 }

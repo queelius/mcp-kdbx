@@ -5,7 +5,8 @@
 //! reach:
 //!
 //! - the audit log file: an unlock and a reveal are recorded, and the revealed
-//!   value never appears in plaintext (only its domain-separated sha256),
+//!   value never appears in plaintext (only its keyed fingerprint, which a
+//!   verifier holding the vault can reproduce and nobody else can),
 //! - the stage-then-commit cycle persists across a reopen,
 //! - a manual lock discards the stage and the first locked call reports what was
 //!   dropped,
@@ -18,8 +19,9 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use mcp_kdbx::kdbx_core::audit::hash_revealed;
+use kdbx_core::fingerprint::Domain;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// Spawn against a writable temp copy of a fixture, with the given extra env,
 /// and unlock. Returns the tempdir guard (which must outlive the server), the
@@ -72,16 +74,34 @@ fn audit_log_records_unlock_and_reveal_without_plaintext() {
     assert_eq!(unlocked["details"]["unlock_source"], json!("input"));
     assert_eq!(unlocked["level"], json!("info"));
 
-    // The reveal was recorded with the domain-separated sha256, never the value.
+    // The unlock recorded what a verifier needs to rebuild the audit key:
+    // the derivation parameters (never below the 64 MiB x 3 floor) and the
+    // salt (the root group UUID).
+    assert!(
+        unlocked["details"]["fingerprint_params"]
+            .as_str()
+            .unwrap()
+            .starts_with("argon2id$v=19$m=")
+    );
+    assert!(unlocked["details"]["fingerprint_salt"].is_string());
+
+    // The reveal was recorded with the keyed fingerprint, never the value, and
+    // a verifier holding the vault reproduces it from the log.
     let reveal = events
         .iter()
         .find(|e| e["event"] == json!("reveal_password"))
         .expect("reveal_password event present");
     assert_eq!(reveal["details"]["target_path"], json!("/Bank"));
+    assert!(reveal["details"].get("sha256").is_none());
     assert_eq!(
-        reveal["details"]["sha256"],
-        json!(hash_revealed("bank-secret-456")),
-        "reveal event must log the domain-separated hash of the value"
+        reveal["details"]["fingerprint_domain"],
+        json!("kdbx-core/field/v1")
+    );
+    let key = audit_key_from_log(&events);
+    assert_eq!(
+        reveal["details"]["fingerprint"],
+        json!(fingerprint_hex(&key, Domain::Field, b"bank-secret-456")),
+        "reveal event must log the keyed fingerprint of the value"
     );
 
     // The security invariant: neither the revealed value nor the master password
@@ -97,10 +117,147 @@ fn audit_log_records_unlock_and_reveal_without_plaintext() {
     );
 }
 
+/// The reviewer recovered the fixture PIN from the old unkeyed audit hash in
+/// under 10,000 tries. With a keyed fingerprint, hashing every candidate
+/// without the key matches nothing: the logged value differs from every
+/// unkeyed digest of every 4-digit PIN, including the real one, while the
+/// verifier holding the vault still reproduces it.
+#[test]
+fn the_fixture_pin_cannot_be_recovered_from_the_log_without_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let vault = fixture_path("flat.kdbx");
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", vault.to_str().unwrap()),
+        ("KDBX_LOG_FILE", log_path.to_str().unwrap()),
+    ]);
+    server.unlock_with_fixture_password();
+    let pin = server.call_ok(
+        "kdbx_reveal_protected",
+        json!({ "path": "/Bank", "field_name": "PIN" }),
+    );
+    assert_eq!(pin["value"], json!("4321"));
+
+    let events = read_audit_lines(&log_path);
+    let reveal = events
+        .iter()
+        .find(|e| e["event"] == json!("reveal_protected"))
+        .expect("reveal_protected event present");
+    let logged = reveal["details"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(logged.len(), 64);
+
+    let hex = |digest: &[u8]| -> String { digest.iter().map(|b| format!("{b:02x}")).collect() };
+    for n in 0..10_000u32 {
+        let candidate = format!("{n:04}");
+        let plain = hex(&Sha256::digest(candidate.as_bytes()));
+        let old_scheme = hex(&Sha256::new()
+            .chain_update(b"kdbx-reveal-v1\0")
+            .chain_update(candidate.as_bytes())
+            .finalize());
+        let domain_only = hex(&Sha256::new()
+            .chain_update(Domain::Field.label().as_bytes())
+            .chain_update(candidate.as_bytes())
+            .finalize());
+        for unkeyed in [plain, old_scheme, domain_only] {
+            assert_ne!(
+                logged, unkeyed,
+                "candidate {candidate} matched without the key"
+            );
+        }
+    }
+
+    let key = audit_key_from_log(&events);
+    assert_eq!(logged, fingerprint_hex(&key, Domain::Field, b"4321"));
+}
+
+/// The audit fingerprint is keyed by the stable, Argon2-derived key: the same
+/// value revealed in two sessions logs the same fingerprint, which the
+/// verifier recomputes. Its derivation parameters and salt reach only the
+/// audit file, never stderr, and no audit-key field does either.
+#[test]
+fn audit_fingerprints_are_stable_across_unlocks_and_stay_off_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let stderr_path = dir.path().join("stderr.txt");
+    let vault = fixture_path("flat.kdbx");
+    let mut server = McpServer::spawn_with_stderr(
+        &[
+            ("KDBX_VAULT_PATH", vault.to_str().unwrap()),
+            ("KDBX_LOG_FILE", log_path.to_str().unwrap()),
+        ],
+        std::fs::File::create(&stderr_path).unwrap(),
+    );
+    for _ in 0..2 {
+        server.unlock_with_fixture_password();
+        server.call_ok("kdbx_reveal_password", json!({ "path": "/Bank" }));
+        server.call_ok("kdbx_lock", json!({}));
+    }
+    drop(server);
+
+    let events = read_audit_lines(&log_path);
+    let reveals: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["event"] == json!("reveal_password"))
+        .collect();
+    assert_eq!(reveals.len(), 2);
+    assert_eq!(
+        reveals[0]["details"]["fingerprint"], reveals[1]["details"]["fingerprint"],
+        "the audit key is stable across unlocks"
+    );
+    let key = audit_key_from_log(&events);
+    assert_eq!(
+        reveals[0]["details"]["fingerprint"],
+        json!(fingerprint_hex(&key, Domain::Field, b"bank-secret-456"))
+    );
+
+    let unlocked = events
+        .iter()
+        .find(|e| e["event"] == json!("vault_unlocked"))
+        .unwrap();
+    let params = unlocked["details"]["fingerprint_params"].as_str().unwrap();
+    let salt = unlocked["details"]["fingerprint_salt"].as_str().unwrap();
+    let logged_fp = reveals[0]["details"]["fingerprint"].as_str().unwrap();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        stderr.contains("reveal_password"),
+        "events still reach stderr"
+    );
+    for secretish in [params, salt, logged_fp, "fingerprint"] {
+        assert!(
+            !stderr.contains(secretish),
+            "{secretish} reached stderr: {stderr}"
+        );
+    }
+}
+
+/// Without an audit log file there is no stable key at all (no Argon2 run):
+/// stderr events carry no fingerprint and no derivation parameters.
+#[test]
+fn without_an_audit_file_no_stable_key_is_derived() {
+    let dir = tempfile::tempdir().unwrap();
+    let stderr_path = dir.path().join("stderr.txt");
+    let vault = fixture_path("flat.kdbx");
+    let mut server = McpServer::spawn_with_stderr(
+        &[("KDBX_VAULT_PATH", vault.to_str().unwrap())],
+        std::fs::File::create(&stderr_path).unwrap(),
+    );
+    server.unlock_with_fixture_password();
+    server.call_ok("kdbx_reveal_password", json!({ "path": "/Bank" }));
+    drop(server);
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    assert!(stderr.contains("reveal_password"));
+    assert!(!stderr.contains("fingerprint"), "{stderr}");
+    assert!(!stderr.contains("argon2id"), "{stderr}");
+}
+
 /// A protected standard field (KeePassXC's per-attribute "Protect" toggle on
 /// UserName or Notes) must behave like any other protected value: bulk reads
 /// return it as null and mark it protected, search never matches it, and the
-/// only way out is `kdbx_reveal_protected`, which audits a sha256 of the value.
+/// only way out is `kdbx_reveal_protected`, which audits a keyed fingerprint of
+/// the value.
 #[test]
 fn protected_standard_fields_are_hidden_from_reads_and_search_but_revealable() {
     let dir = tempfile::tempdir().unwrap();
@@ -183,8 +340,9 @@ fn protected_standard_fields_are_hidden_from_reads_and_search_but_revealable() {
     );
     assert_eq!(notes["value"], json!("primary dev account"));
 
-    // Each reveal is audited with the domain-separated hash, never the value.
+    // Each reveal is audited with the keyed fingerprint, never the value.
     let events = read_audit_lines(&log_path);
+    let key = audit_key_from_log(&events);
     for (field, value) in [("UserName", "octocat"), ("Notes", "primary dev account")] {
         let reveal = events
             .iter()
@@ -194,7 +352,10 @@ fn protected_standard_fields_are_hidden_from_reads_and_search_but_revealable() {
             })
             .unwrap_or_else(|| panic!("reveal_protected event for {field} present"));
         assert_eq!(reveal["details"]["target_path"], json!("/GitHub"));
-        assert_eq!(reveal["details"]["sha256"], json!(hash_revealed(value)));
+        assert_eq!(
+            reveal["details"]["fingerprint"],
+            json!(fingerprint_hex(&key, Domain::Field, value.as_bytes()))
+        );
     }
     let raw = std::fs::read_to_string(&log_path).unwrap();
     assert!(
@@ -559,4 +720,76 @@ fn unreadable_vault_unlock_is_audited_with_its_reason() {
     assert_eq!(failed["details"]["unlock_source"], json!("input"));
     // It is not an authentication failure, so no auth_failed event.
     assert!(!lines.iter().any(|l| l["event"] == json!("auth_failed")));
+}
+
+/// A coarse performance guard over the real binary: a vault of a few thousand
+/// entries (with attachments, so every capture fingerprints bytes) must list,
+/// search, write and diff well inside a generous bound. It catches a
+/// regression to per-match tree walks or to several snapshot captures per
+/// write, not small slowdowns: the bound is far above the measured time.
+#[test]
+fn a_few_thousand_entries_search_write_and_diff_quickly() {
+    use keepass::db::{Value as KpValue, fields};
+    use keepass::{Database, DatabaseKey};
+    use std::time::Instant;
+
+    const GROUPS: usize = 40;
+    const PER_GROUP: usize = 75; // 3,000 entries
+
+    let mut db = Database::new();
+    for g in 0..GROUPS {
+        let mut root = db.root_mut();
+        let mut group = root.add_group();
+        group.name = format!("Group {g:02}");
+        for e in 0..PER_GROUP {
+            group.add_entry().edit(|entry| {
+                entry.set_unprotected(fields::TITLE, format!("Account {g:02}-{e:03}"));
+                entry.set_unprotected(fields::USERNAME, format!("user{e}@example.com"));
+                entry.set_unprotected(fields::URL, format!("https://site{e}.example"));
+                entry.set_protected(fields::PASSWORD, format!("secret-{g}-{e}"));
+                if e % 10 == 0 {
+                    entry.add_attachment("note.txt", KpValue::protected(vec![b'x'; 4096]));
+                }
+            });
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.kdbx");
+    let mut bytes = Vec::new();
+    db.save(
+        &mut bytes,
+        DatabaseKey::new().with_password(FIXTURE_PASSWORD),
+    )
+    .unwrap();
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut server = McpServer::spawn(&[
+        ("KDBX_VAULT_PATH", path.to_str().unwrap()),
+        ("KDBX_ALLOW_WRITES", "true"),
+    ]);
+    server.unlock_with_fixture_password();
+
+    let started = Instant::now();
+    let listed = server.call_ok("kdbx_list_entries", json!({ "group_path": "/Group 07/" }));
+    assert_eq!(listed["entries"].as_array().unwrap().len(), PER_GROUP);
+    // A query that matches every entry: the search caps its results, but it
+    // still visits and orders all 3,000 matches.
+    let found = server.call_ok("kdbx_find_entry", json!({ "query": "example" }));
+    assert_eq!(found["matched_count"], json!(GROUPS * PER_GROUP));
+    assert_eq!(found["truncated"], json!(true));
+    for i in 0..5 {
+        server.call_ok(
+            "kdbx_update_field",
+            json!({ "path": format!("/Group 0{i}/Account 0{i}-001"), "field_name": "URL", "value": "https://changed.example" }),
+        );
+        let after = server.call_ok("kdbx_find_entry", json!({ "query": "changed.example" }));
+        assert_eq!(after["matched_count"], json!(i + 1));
+    }
+    let diff = server.call_ok("kdbx_diff_pending", json!({}));
+    assert_eq!(diff["modified"].as_array().unwrap().len(), 5);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "list, 6 searches, 5 writes and a diff over 3,000 entries took {elapsed:?}"
+    );
 }

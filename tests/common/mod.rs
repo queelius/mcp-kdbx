@@ -58,6 +58,14 @@ impl McpServer {
     /// from the developer's shell cannot leak into a test), then `PATH` is
     /// restored so the unlock-command shell-out path can still find `/bin/sh`.
     pub fn spawn(envs: &[(&str, &str)]) -> Self {
+        // Inherit stderr so server diagnostics surface in a failing test's
+        // captured output; cargo hides it on success.
+        Self::spawn_with_stderr(envs, Stdio::inherit())
+    }
+
+    /// [`spawn`](Self::spawn), with the server's stderr sent to `stderr` (for
+    /// tests that inspect what the server writes there).
+    pub fn spawn_with_stderr(envs: &[(&str, &str)], stderr: impl Into<Stdio>) -> Self {
         let bin = env!("CARGO_BIN_EXE_mcp-kdbx");
         let mut cmd = Command::new(bin);
         cmd.env_clear();
@@ -69,9 +77,7 @@ impl McpServer {
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Inherit stderr so server diagnostics surface in a failing test's
-            // captured output; cargo hides it on success.
-            .stderr(Stdio::inherit());
+            .stderr(stderr);
 
         let mut child = cmd.spawn().expect("spawn mcp-kdbx binary");
         let stdin = child.stdin.take().expect("child stdin handle");
@@ -268,4 +274,41 @@ pub fn temp_copy_of(fixture: &str) -> (tempfile::TempDir, PathBuf) {
     let dest = dir.path().join(fixture);
     std::fs::copy(fixture_path(fixture), &dest).expect("copy fixture into temp dir");
     (dir, dest)
+}
+
+/// The audit fingerprint key a verifier derives from a log: the fixture
+/// password, and the `fingerprint_params` and `fingerprint_salt` the
+/// `vault_unlocked` event recorded. This is what `diff-kdbx fingerprint
+/// --params .. --salt ..` does with the vault in hand.
+pub fn audit_key_from_log(events: &[Value]) -> kdbx_core::fingerprint::FingerprintKey {
+    use kdbx_core::fingerprint::{DeriveParams, FingerprintKey, KeyMaterial};
+    let unlocked = events
+        .iter()
+        .find(|e| e["event"] == json!("vault_unlocked"))
+        .expect("vault_unlocked event present");
+    let params: DeriveParams = unlocked["details"]["fingerprint_params"]
+        .as_str()
+        .expect("fingerprint_params recorded")
+        .parse()
+        .expect("fingerprint_params parse");
+    let salt: uuid::Uuid = unlocked["details"]["fingerprint_salt"]
+        .as_str()
+        .expect("fingerprint_salt recorded")
+        .parse()
+        .expect("fingerprint_salt is a uuid");
+    FingerprintKey::derive(
+        &KeyMaterial::new(Some(FIXTURE_PASSWORD.as_bytes()), None),
+        salt,
+        &params,
+    )
+    .expect("derive the audit key")
+}
+
+/// The 64-hex keyed fingerprint of `bytes` in `domain` under `key`.
+pub fn fingerprint_hex(
+    key: &kdbx_core::fingerprint::FingerprintKey,
+    domain: kdbx_core::fingerprint::Domain,
+    bytes: &[u8],
+) -> String {
+    key.fingerprint(domain, bytes).to_hex()
 }

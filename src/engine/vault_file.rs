@@ -25,7 +25,7 @@
 //! that program landing between the re-read and the rename (a window of one
 //! write and one rename) is not detected. Everything outside that window is.
 
-use crate::kdbx_core::error::{CoreError, CoreResult, ErrorCode};
+use crate::engine::error::{CoreError, CoreResult, ErrorCode};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
