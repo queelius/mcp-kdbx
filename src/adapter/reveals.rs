@@ -101,7 +101,13 @@ impl KdbxServer {
     /// Reveal: return an entry's `Password` field. Consent-gated; logs a keyed
     /// fingerprint of the value, never the value.
     #[tool(
-        description = "Reveal the Password field of an entry. This is a consent-gated secret access: it returns the plaintext password and records an audit event with a keyed fingerprint of the value (never the value itself). Requires an unlocked vault."
+        description = "Reveal the Password field of an entry. This is a consent-gated secret access: it returns the plaintext password (with the entry's path, uuid and field_name, so several reveals can be told apart) and records an audit event with a keyed fingerprint of the value (never the value itself). Requires an unlocked vault.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_reveal_password(
         &self,
@@ -145,20 +151,33 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
+        // The response echoes its target, so several reveals can be told apart.
+        let echo = serde_json::json!({
+            "password": password,
+            "path": target_path,
+            "uuid": target_uuid,
+            "field_name": StandardField::Password.kdbx_name(),
+        });
         self.emit(AuditEvent::RevealPassword {
             target_path,
             target_uuid,
             fingerprint,
         });
 
-        responses::ok(serde_json::json!({ "password": password }))
+        responses::ok(echo)
     }
 
     /// Reveal: return a named protected field's value. A non-protected field is
     /// refused with `FIELD_NOT_PROTECTED`; the agent should read it with a list
     /// or get tool instead. Consent-gated; logs a keyed fingerprint of the value.
     #[tool(
-        description = "Reveal the value of a named secret field on an entry (a protected field, or the Password). Refuses fields that are not secret with FIELD_NOT_PROTECTED (read those with a list or get tool instead). Records an audit event with a keyed fingerprint of the value, never the value. Requires an unlocked vault."
+        description = "Reveal the value of a named secret field on an entry (a protected field, or the Password). Returns value plus the entry's path, uuid and field_name. Refuses fields that are not secret with FIELD_NOT_PROTECTED (read those with a list or get tool instead). Records an audit event with a keyed fingerprint of the value, never the value. Requires an unlocked vault.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_reveal_protected(
         &self,
@@ -214,6 +233,12 @@ impl KdbxServer {
             Err(e) => return responses::err(&e),
         };
 
+        let echo = serde_json::json!({
+            "value": value,
+            "path": target_path,
+            "uuid": target_uuid,
+            "field_name": params.field_name,
+        });
         self.emit(AuditEvent::RevealProtected {
             target_path,
             target_uuid,
@@ -221,13 +246,19 @@ impl KdbxServer {
             fingerprint,
         });
 
-        responses::ok(serde_json::json!({ "value": value }))
+        responses::ok(echo)
     }
 
     /// Reveal: return an attachment's bytes, base64-encoded, with its size and
     /// its keyed fingerprint. Consent-gated; logs the same fingerprint.
     #[tool(
-        description = "Download an entry's attachment by name: returns the bytes base64-encoded, plus size_bytes and the content fingerprint (keyed per session: the value kdbx_list_attachments reports until the next unlock, not stable across unlocks). There is no size cap; attachments over 10 MB are logged at warn but still returned. Records an audit event with the fingerprint. Requires an unlocked vault."
+        description = "Download an entry's attachment by name: returns the bytes base64-encoded, plus size_bytes and the content fingerprint (keyed per session: the value kdbx_list_attachments reports until the next unlock, not stable across unlocks). There is no size cap; attachments over 10 MB are logged at warn but still returned. Records an audit event with the fingerprint. Requires an unlocked vault.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_download_attachment(
         &self,
@@ -314,7 +345,13 @@ impl KdbxServer {
     /// `TimeOtp-*` fields, or the legacy pair). The secret never leaves the process;
     /// only the code crosses out, and the audit event logs no code.
     #[tool(
-        description = "Compute the current TOTP code for an entry. Reads the otp field (otpauth URI), the KeePass 2 TimeOtp-* fields, or the legacy TOTP Seed and TOTP Settings pair, in that order; Steam Guard codes are supported. A configuration that is present but malformed is OTP_INVALID (details name the source and reason); none at all is NO_OTP_CONFIGURED. Returns the code with its remaining validity, period, and the time_unix it was computed at (an optional time_unix is clamped to now plus or minus one period). The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault."
+        description = "Compute the current TOTP code for an entry. Reads the otp field (otpauth URI), the KeePass 2 TimeOtp-* fields, or the legacy TOTP Seed and TOTP Settings pair, in that order; Steam Guard codes are supported. A configuration that is present but malformed is OTP_INVALID (details name the source and reason); none at all is NO_OTP_CONFIGURED. Returns the code with its remaining validity, period, and the time_unix it was computed at (an optional time_unix is clamped to now plus or minus one period). The TOTP secret never leaves the process and is never logged; the audit event records no code. Requires an unlocked vault.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_get_otp(&self, Parameters(params): Parameters<GetOtpParams>) -> String {
         let mut vault = self.vault().await;

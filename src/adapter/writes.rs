@@ -100,7 +100,13 @@ impl KdbxServer {
     /// and an unlocked vault. The entry is added to the working db only; it
     /// reaches disk on `kdbx_save_pending`.
     #[tool(
-        description = "Stage a new entry under a group, named by group_path or group_uuid. Requires writes to be enabled and the vault unlocked. The entry is staged in memory, not written to disk: commit it with kdbx_save_pending. Fields and attachments are optional maps keyed by name."
+        description = "Stage a new entry under a group, named by group_path or group_uuid. Requires writes to be enabled and the vault unlocked. The entry is staged in memory, not written to disk: commit it with kdbx_save_pending. Fields and attachments are optional maps keyed by name.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_add_entry(&self, Parameters(params): Parameters<AddEntryParams>) -> String {
         if !self.writes_allowed() {
@@ -211,7 +217,13 @@ impl KdbxServer {
     /// Write: set or change a single field on an existing entry. Requires
     /// `KDBX_ALLOW_WRITES=true` and an unlocked vault. Staged in memory.
     #[tool(
-        description = "Set or change a single field on an existing entry. Requires writes to be enabled and the vault unlocked. The change is staged in memory: commit it with kdbx_save_pending. An empty value clears the field. Omit protected to keep an existing field's protection state."
+        description = "Set or change a single field on an existing entry. Requires writes to be enabled and the vault unlocked. The change is staged in memory: commit it with kdbx_save_pending. An empty value clears the field. Omit protected to keep an existing field's protection state.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_update_field(&self, Parameters(params): Parameters<UpdateFieldParams>) -> String {
         if !self.writes_allowed() {
@@ -283,7 +295,13 @@ impl KdbxServer {
     /// This is a read of the stage, so it emits no audit event. Protected field
     /// values are redacted.
     #[tool(
-        description = "Show the pending changes staged in memory: added and modified entries with a per-field diff. Requires writes to be enabled and the vault unlocked. Each field change reports secret (values withheld: a protected field or any Password), protected (the stored flag), value_changed and protection_changed; before and after appear only when secret is false. This does not write anything."
+        description = "Show the pending changes staged in memory: added and modified entries with a per-field diff. Requires writes to be enabled and the vault unlocked. Each field change reports secret (values withheld: a protected field or any Password), protected (the stored flag), value_changed and protection_changed; before and after appear only when secret is false. This does not write anything.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_diff_pending(&self) -> String {
         if !self.writes_allowed() {
@@ -311,7 +329,13 @@ impl KdbxServer {
     /// staged (`NO_PENDING_CHANGES`) or when the file changed on disk since
     /// unlock (`VAULT_FILE_MODIFIED`).
     #[tool(
-        description = "Commit the staged changes to the vault file atomically. Requires writes to be enabled and the vault unlocked. Refuses when nothing is staged, or when the file content changed on disk since it was unlocked (VAULT_FILE_MODIFIED: discard and re-unlock to pick up the other change). On success the stage settles and the working copy becomes the new baseline."
+        description = "Commit the staged changes to the vault file atomically. Requires writes to be enabled and the vault unlocked. Refuses when nothing is staged, or when the file content changed on disk since it was unlocked (VAULT_FILE_MODIFIED: discard and re-unlock to pick up the other change). On success the stage settles and the working copy becomes the new baseline.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_save_pending(&self) -> String {
         if !self.writes_allowed() {
@@ -400,7 +424,13 @@ impl KdbxServer {
     /// baseline. Requires `KDBX_ALLOW_WRITES=true` and an unlocked vault.
     /// Discarding with nothing staged is a no-op success.
     #[tool(
-        description = "Discard the staged changes and reset the working copy to the on-disk baseline. Requires writes to be enabled and the vault unlocked. Discarding with nothing staged is a no-op success. Reports how many changes were dropped."
+        description = "Discard the staged changes and reset the working copy to the on-disk baseline. Requires writes to be enabled and the vault unlocked. Discarding with nothing staged is a no-op success. Reports how many changes were dropped.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_discard_pending(&self) -> String {
         if !self.writes_allowed() {

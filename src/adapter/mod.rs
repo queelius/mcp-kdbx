@@ -197,6 +197,23 @@ Unlocking: call kdbx_unlock with no arguments; the server reads the master passw
 its configured KDBX_PASSWORD or KDBX_UNLOCK_CMD. Do not ask the user to type the master \
 password into the chat.";
 
+impl KdbxServer {
+    /// [`SERVER_INSTRUCTIONS`] plus whether this process allows writes, so an
+    /// agent knows before its first write call (the write tools stay listed
+    /// either way, so a request to write can be answered with the reason).
+    fn instructions(&self) -> String {
+        let writes = if self.config.allow_writes {
+            "Writes are enabled: kdbx_add_entry and kdbx_update_field stage changes, \
+kdbx_diff_pending shows them, and kdbx_save_pending writes the vault file."
+        } else {
+            "Writes are disabled on this server (KDBX_ALLOW_WRITES is not \"true\"): \
+kdbx_add_entry, kdbx_update_field, kdbx_diff_pending, kdbx_save_pending and \
+kdbx_discard_pending return WRITES_DISABLED. Tell the user writes need KDBX_ALLOW_WRITES=true in the server config."
+        };
+        format!("{SERVER_INSTRUCTIONS}\n\n{writes}")
+    }
+}
+
 /// The vault's cached [`View`] of the working db. When it must be captured
 /// first, the capture runs in `block_in_place`: it fingerprints every
 /// attachment, which takes a while for large ones, and must not stall the
@@ -273,7 +290,7 @@ where
 impl ServerHandler for KdbxServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(SERVER_INSTRUCTIONS);
+            .with_instructions(self.instructions());
         // Report mcp-kdbx as the server, not rmcp's default implementation name.
         // Implementation::from_build_env expands env!("CARGO_CRATE_NAME") inside
         // the rmcp crate, so it would report "rmcp" and rmcp's version, not ours.

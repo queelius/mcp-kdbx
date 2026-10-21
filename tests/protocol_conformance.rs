@@ -239,6 +239,74 @@ fn instructions_teach_the_path_grammar_and_unlock_avoids_chat_passwords() {
     );
 }
 
+/// MCP tool annotations per tool: (name, readOnlyHint, destructiveHint,
+/// idempotentHint). Every tool is closed-world (one vault file). Reads and
+/// reveals change nothing; unlock and lock change only the session, and lock
+/// discards a stage; the write tools stage changes, and save and discard are
+/// the destructive ones (save replaces the vault file).
+const EXPECTED_ANNOTATIONS: &[(&str, bool, bool, bool)] = &[
+    ("kdbx_add_entry", false, false, false),
+    ("kdbx_diff_pending", true, false, true),
+    ("kdbx_discard_pending", false, true, true),
+    ("kdbx_download_attachment", true, false, true),
+    ("kdbx_find_entry", true, false, true),
+    ("kdbx_get_entry", true, false, true),
+    ("kdbx_get_otp", true, false, true),
+    ("kdbx_list_attachments", true, false, true),
+    ("kdbx_list_entries", true, false, true),
+    ("kdbx_list_groups", true, false, true),
+    ("kdbx_lock", false, true, true),
+    ("kdbx_reveal_password", true, false, true),
+    ("kdbx_reveal_protected", true, false, true),
+    ("kdbx_save_pending", false, true, false),
+    ("kdbx_status", true, false, true),
+    ("kdbx_unlock", false, false, true),
+    ("kdbx_update_field", false, false, false),
+];
+
+#[test]
+fn tool_annotations_tell_reads_from_writes() {
+    let path = fixture_path("empty.kdbx");
+    let mut server = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    let listed = server.list_tools();
+    let tools = listed["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), EXPECTED_ANNOTATIONS.len());
+    for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == json!(name))
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        let a = &tool["annotations"];
+        assert_eq!(a["readOnlyHint"], json!(read_only), "{name} readOnlyHint");
+        assert_eq!(
+            a["destructiveHint"],
+            json!(destructive),
+            "{name} destructiveHint"
+        );
+        assert_eq!(
+            a["idempotentHint"],
+            json!(idempotent),
+            "{name} idempotentHint"
+        );
+        assert_eq!(a["openWorldHint"], json!(false), "{name} openWorldHint");
+    }
+}
+
+#[test]
+fn instructions_say_whether_writes_are_enabled() {
+    let (_dir, path) = temp_copy_of("empty.kdbx");
+    let vault = path.to_str().unwrap();
+    let off = McpServer::initialize_result(&[("KDBX_VAULT_PATH", vault)]);
+    let off = off["instructions"].as_str().unwrap();
+    assert!(off.contains("Writes are disabled"), "{off}");
+    assert!(off.contains("WRITES_DISABLED"), "{off}");
+    let on =
+        McpServer::initialize_result(&[("KDBX_VAULT_PATH", vault), ("KDBX_ALLOW_WRITES", "true")]);
+    let on = on["instructions"].as_str().unwrap();
+    assert!(on.contains("Writes are enabled"), "{on}");
+    assert!(!on.contains("WRITES_DISABLED"), "{on}");
+}
+
 // ---------------------------------------------------------------------------
 // 2. Happy-path envelope shapes (every tool)
 // ---------------------------------------------------------------------------
@@ -253,6 +321,10 @@ fn lifecycle_tools_happy_path() {
     assert_eq!(status["locked"], json!(true));
     assert_eq!(status["writes_allowed"], json!(false));
     assert_eq!(status["server_version"], json!(env!("CARGO_PKG_VERSION")));
+    // The configured idle window is reported even while locked (900 by
+    // default), so an agent can tell "locked" from "no idle lock".
+    assert_eq!(status["idle_timeout_seconds"], json!(900));
+    assert!(status["idle_timeout_remaining_seconds"].is_null());
     assert!(
         status["vault_path"]
             .as_str()
@@ -291,6 +363,16 @@ fn read_tools_happy_path() {
         names.contains(&"Personal"),
         "root should contain Personal: {names:?}"
     );
+
+    // The listed group itself is reported, which is how an agent gets the
+    // root group's uuid; listing by that uuid gives the same children.
+    let root = server.call_ok("kdbx_list_groups", json!({}))["parent"].clone();
+    assert_eq!(root["path"], json!("/"));
+    let by_uuid = server.call_ok("kdbx_list_groups", json!({ "uuid": root["uuid"] }));
+    assert_eq!(by_uuid["parent"], root);
+    assert_eq!(by_uuid["groups"].as_array().unwrap().len(), groups.len());
+    let personal = server.call_ok("kdbx_list_groups", json!({ "parent_path": "/Personal/" }));
+    assert_eq!(personal["parent"]["path"], json!("/Personal/"));
 
     // list_entries in the deepest group: Checking Account.
     let entries = server.call_ok(
@@ -386,6 +468,17 @@ fn reveal_tools_happy_path() {
         json!({ "path": "/Bank", "field_name": "PIN" }),
     );
     assert_eq!(pin["value"], json!("4321"));
+
+    // Both echo what they answer for (canonical path, uuid, field name), so
+    // an agent can correlate several reveals from the payloads alone.
+    let bank = server.call_ok("kdbx_get_entry", json!({ "path": "/Bank" }));
+    for (reveal, field) in [(&pw, "Password"), (&pin, "PIN")] {
+        assert_eq!(reveal["path"], json!("/Bank"));
+        assert_eq!(reveal["uuid"], bank["uuid"]);
+        assert_eq!(reveal["field_name"], json!(field));
+    }
+    let by_uuid = server.call_ok("kdbx_reveal_password", json!({ "uuid": bank["uuid"] }));
+    assert_eq!(by_uuid["path"], json!("/Bank"));
 }
 
 #[test]

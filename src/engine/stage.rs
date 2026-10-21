@@ -99,6 +99,11 @@ pub struct DiffPending {
 /// `path` and `group_path` are `None` (JSON `null`) when the record has no
 /// addressable path (an empty title or group name, see
 /// `kdbx_core::path::PathIndex`); `uuid` always identifies it.
+///
+/// `field_changes` lists every field in the shape a modified entry uses, each
+/// with an absent before side: plain values are shown (so an agent can check
+/// what it staged) and secrets withheld, by the same rule. `field_count` is
+/// its length.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AddedEntry {
     pub path: Option<String>,
@@ -106,6 +111,7 @@ pub struct AddedEntry {
     pub title: String,
     pub group_path: Option<String>,
     pub field_count: usize,
+    pub field_changes: Vec<FieldChangeOut>,
     pub has_attachments: bool,
     pub has_otp: bool,
 }
@@ -625,7 +631,7 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
         };
         match &node.status {
             NodeStatus::Added => {
-                if let Some(entry) = map_added_entry(&after, &nodes, node.uuid) {
+                if let Some(entry) = map_added_entry(&after, &nodes, &key, node.uuid) {
                     added.push(entry);
                 }
             }
@@ -672,8 +678,24 @@ pub fn diff_pending(canonical: &Database, working: &Database) -> DiffPending {
 /// Build an [`AddedEntry`] for the entry `uuid` from the working db's
 /// [`View`], `after` (the same source the read views use, so the two agree on
 /// paths and on `has_otp`).
-fn map_added_entry(after: &View, nodes: &NodeIndex<'_>, uuid: uuid::Uuid) -> Option<AddedEntry> {
+fn map_added_entry(
+    after: &View,
+    nodes: &NodeIndex<'_>,
+    key: &FingerprintKey,
+    uuid: uuid::Uuid,
+) -> Option<AddedEntry> {
     let entry = nodes.entry(uuid)?;
+    let field_changes = entry
+        .fields
+        .iter()
+        .map(|(name, field)| {
+            let added = Side {
+                protected: field.protected,
+                value: &field.value,
+            };
+            map_field_sides(key, name, None, Some(added))
+        })
+        .collect();
     Some(AddedEntry {
         // Both paths are None for a record with no addressable path. There is
         // no fallback string: a placeholder like "/" would alias the root.
@@ -682,6 +704,7 @@ fn map_added_entry(after: &View, nodes: &NodeIndex<'_>, uuid: uuid::Uuid) -> Opt
         title: entry.title().unwrap_or("").to_string(),
         group_path: after.parent_path_string(nodes, uuid),
         field_count: entry.fields.len(),
+        field_changes,
         has_attachments: !entry.attachments.is_empty(),
         has_otp: after.has_otp(uuid),
     })
@@ -764,21 +787,30 @@ fn map_field_change(
     before: Option<&Shown>,
     after: Option<&Shown>,
 ) -> FieldChangeOut {
-    let (before, after) = match (side(before), side(after)) {
-        (Ok(before), Ok(after)) => (before, after),
+    match (side(before), side(after)) {
+        (Ok(before), Ok(after)) => map_field_sides(key, name, before, after),
         // An unknown kind of value: report only that the field changed.
-        _ => {
-            return FieldChangeOut {
-                field_name: name.to_string(),
-                secret: true,
-                protected: true,
-                protection_changed: false,
-                value_changed: true,
-                before: None,
-                after: None,
-            };
-        }
-    };
+        _ => FieldChangeOut {
+            field_name: name.to_string(),
+            secret: true,
+            protected: true,
+            protection_changed: false,
+            value_changed: true,
+            before: None,
+            after: None,
+        },
+    }
+}
+
+/// [`map_field_change`] once both sides are read: the one place that decides
+/// what a field change shows. An added entry's fields come here directly, as
+/// changes with no before side.
+fn map_field_sides(
+    key: &FingerprintKey,
+    name: &str,
+    before: Option<Side<'_>>,
+    after: Option<Side<'_>>,
+) -> FieldChangeOut {
     let is_secret_side = |side: &Option<Side<'_>>| {
         side.as_ref().is_some_and(|s| {
             is_secret(name, s.protected) || !matches!(s.value, SnapValue::Plain(_))
@@ -1556,6 +1588,66 @@ mod tests {
         assert_eq!(a.field_count, 3);
         assert!(!a.has_attachments);
         assert!(!a.has_otp);
+    }
+
+    /// An added entry lists its fields in the same shape as a modified entry's
+    /// field changes (absent before, present after), under the same secret rule:
+    /// plain values are shown so an agent can check what it staged, and secrets
+    /// (a Password, a protected field) are withheld.
+    #[test]
+    fn diff_added_entry_lists_its_fields_with_secrets_withheld() {
+        let canonical = build_db();
+        let mut working = canonical.clone();
+        let input = EntryInput {
+            title: "Brand New".to_string(),
+            fields: vec![
+                FieldInput {
+                    name: "UserName".to_string(),
+                    value: "bob".to_string().into(),
+                    protected: false,
+                },
+                FieldInput {
+                    name: "Password".to_string(),
+                    value: "added-secret-1".to_string().into(),
+                    protected: false,
+                },
+                FieldInput {
+                    name: "PIN".to_string(),
+                    value: "2468".to_string().into(),
+                    protected: true,
+                },
+            ],
+            attachments: Vec::new(),
+        };
+        add_entry(&mut working, &gaddr("/Web/"), &input).expect("add");
+
+        let d = diff_pending(&canonical, &working);
+        let a = &d.added[0];
+        let by_name = |n: &str| {
+            a.field_changes
+                .iter()
+                .find(|f| f.field_name == n)
+                .unwrap_or_else(|| panic!("{n} listed"))
+        };
+        assert_eq!(a.field_changes.len(), a.field_count);
+        for name in ["Title", "UserName"] {
+            let f = by_name(name);
+            assert!(!f.secret && f.value_changed && !f.protection_changed);
+            assert_eq!(f.before, Some(serde_json::Value::Null));
+        }
+        assert_eq!(by_name("Title").after, Some(serde_json::json!("Brand New")));
+        assert_eq!(by_name("UserName").after, Some(serde_json::json!("bob")));
+        for name in ["Password", "PIN"] {
+            let f = by_name(name);
+            assert!(f.secret, "{name} is withheld");
+            assert_eq!((&f.before, &f.after), (&None, &None));
+        }
+        assert!(by_name("PIN").protected);
+        let wire = serde_json::to_string(&d).expect("serialize");
+        assert!(
+            !wire.contains("added-secret-1") && !wire.contains("2468"),
+            "{wire}"
+        );
     }
 
     #[test]

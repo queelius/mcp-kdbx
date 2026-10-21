@@ -85,7 +85,13 @@ pub struct FindEntryParams {
 impl KdbxServer {
     /// Read: list the direct child groups of a parent group.
     #[tool(
-        description = "List the direct child groups of a group. Provide parent_path or the parent's uuid (with neither, the root '/'). Returns each child group's name, path, uuid, entry and subgroup counts, and notes. Metadata only."
+        description = "List the direct child groups of a group. Provide parent_path or the parent's uuid (with neither, the root '/'). Returns the listed group's path and uuid as parent (the only way to get the root group's uuid), and each child group's name, path, uuid, entry and subgroup counts, and notes. Metadata only.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_list_groups(&self, Parameters(params): Parameters<ListGroupsParams>) -> String {
         let mut vault = self.vault().await;
@@ -112,12 +118,23 @@ impl KdbxServer {
             .iter()
             .map(|group| views::group_summary(view, group))
             .collect();
-        responses::ok(serde_json::json!({ "groups": groups }))
+        // The listed group itself, so the root's uuid is reachable too.
+        let listed = serde_json::json!({
+            "path": view.path_string(parent.uuid),
+            "uuid": parent.uuid.hyphenated().to_string(),
+        });
+        responses::ok(serde_json::json!({ "parent": listed, "groups": groups }))
     }
 
     /// Read: list the direct entries of a group.
     #[tool(
-        description = "List the direct entries of a group. Provide group_path or the group's uuid. Returns each entry's title, path, uuid, username, url, a notes preview, standard and custom field names (each with protected, the stored flag, and secret, true when the value is withheld), attachment and otp flags, and the modified timestamp. Metadata only: no secret values. A username, url, or notes field marked protected is returned as null and flagged secret in standard_field_names; read it with kdbx_reveal_protected."
+        description = "List the direct entries of a group. Provide group_path or the group's uuid. Returns each entry's title, path, uuid, username, url, a notes preview, standard and custom field names (each with protected, the stored flag, and secret, true when the value is withheld), attachment and otp flags, and the modified timestamp. Metadata only: no secret values. A username, url, or notes field marked protected is returned as null and flagged secret in standard_field_names; read it with kdbx_reveal_protected.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_list_entries(&self, Parameters(params): Parameters<ListEntriesParams>) -> String {
         let mut vault = self.vault().await;
@@ -149,7 +166,13 @@ impl KdbxServer {
 
     /// Read: list the attachments of an entry (names, sizes, fingerprints).
     #[tool(
-        description = "List the attachments of an entry. Provide entry_path. Returns each attachment's name, size in bytes, and a fingerprint of its content keyed per session (equal to what kdbx_download_attachment returns for the same bytes until the next unlock; not stable across unlocks). No attachment bytes: downloading bytes is a separate consent-gated tool."
+        description = "List the attachments of an entry. Provide entry_path. Returns each attachment's name, size in bytes, and a fingerprint of its content keyed per session (equal to what kdbx_download_attachment returns for the same bytes until the next unlock; not stable across unlocks). No attachment bytes: downloading bytes is a separate consent-gated tool.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_list_attachments(
         &self,
@@ -178,7 +201,13 @@ impl KdbxServer {
 
     /// Read: fetch the full detail view of one entry.
     #[tool(
-        description = "Fetch the full detail of an entry. Provide path. Returns title, path, uuid, username, url, full notes, standard and custom field names (each with protected, the stored flag, and secret, true when the value is withheld), attachment and otp flags, and the created, modified, and accessed timestamps. No secret values or attachment bytes. A username, url, or notes field marked protected is returned as null and flagged secret in standard_field_names; read it with kdbx_reveal_protected."
+        description = "Fetch the full detail of an entry. Provide path. Returns title, path, uuid, username, url, full notes, standard and custom field names (each with protected, the stored flag, and secret, true when the value is withheld), attachment and otp flags, and the created, modified, and accessed timestamps. No secret values or attachment bytes. A username, url, or notes field marked protected is returned as null and flagged secret in standard_field_names; read it with kdbx_reveal_protected.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_get_entry(&self, Parameters(params): Parameters<GetEntryParams>) -> String {
         let mut vault = self.vault().await;
@@ -200,7 +229,13 @@ impl KdbxServer {
     /// Read: find entries whose requested fields contain the query as a
     /// substring.
     #[tool(
-        description = "Find entries whose fields contain a substring. Provide query and optionally fields (a subset of title, username, url, notes; default title, username, url). Returns matching entries in list-entry shape, the total matched_count, and a truncated flag set when more than 100 entries matched. Metadata only. Protected field values are never searched."
+        description = "Find entries whose fields contain a substring. Provide query and optionally fields (a subset of title, username, url, notes; default title, username, url). Returns matching entries in list-entry shape, the total matched_count, and a truncated flag set when more than 100 entries matched. Metadata only. Protected field values are never searched.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn kdbx_find_entry(&self, Parameters(params): Parameters<FindEntryParams>) -> String {
         let mut vault = self.vault().await;

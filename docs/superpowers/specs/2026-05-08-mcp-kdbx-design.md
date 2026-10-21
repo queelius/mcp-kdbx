@@ -160,6 +160,7 @@ output: {
     locked: boolean,
     vault_name: string | null,
     vault_path: string,                                  // absolute
+    idle_timeout_seconds: number,                         // configured window; 0 = no idle lock
     idle_timeout_remaining_seconds: number | null,        // null if locked
     has_pending_changes: boolean | null,                  // null if locked
     writes_allowed: boolean,
@@ -177,6 +178,7 @@ input:  { parent_path?: string }                         // default "/"
 output: {
   ok: true,
   data: {
+    parent: { path: string, uuid: string },              // the listed group (root: "/")
     groups: [{
       name: string,
       path: string,
@@ -255,11 +257,11 @@ output: {
 ```ts
 // kdbx_reveal_password
 input:  { path: string }
-output: { ok: true, data: { password: string } }
+output: { ok: true, data: { password: string, path: string | null, uuid: string, field_name: "Password" } }
 
 // kdbx_reveal_protected
 input:  { path: string, field_name: string }
-output: { ok: true, data: { value: string } }
+output: { ok: true, data: { value: string, path: string | null, uuid: string, field_name: string } }
 
 // kdbx_download_attachment
 input:  { entry_path: string, name: string }
@@ -297,7 +299,7 @@ input:  {}
 output: {
   ok: true,
   data: {
-    added: [{ path, uuid, title, group_path, field_count, has_attachments, has_otp }],
+    added: [{ path, uuid, title, group_path, field_count, field_changes, has_attachments, has_otp }],
     modified: [{
       path, uuid, title,
       field_changes: [
@@ -486,7 +488,7 @@ At save:      re-stat the file, compare to stored mtime
 
 ## Idle timer mechanics
 
-Periodic check (interval = idle_timeout / 10, min 5s, max 60s) of `now - last_activity`. Any tool call in Unlocked state updates `last_activity`, including `kdbx_status` (legitimate keep-alive).
+Periodic check (interval = idle_timeout / 10, min 5s, max 60s) of `now - last_activity`. Any tool call in Unlocked state updates `last_activity`, including `kdbx_status` (legitimate keep-alive). Every tool call first applies the deadline itself (`Vault::lock_if_idle`), so a call that arrives after the deadline but before the next tick finds the vault locked (`VAULT_LOCKED`, `lock_reason: idle_timeout`) instead of extending the session; the periodic check only makes the lock, and the key wipe, happen on time when no call arrives.
 
 ---
 
@@ -616,7 +618,7 @@ If steps 4-7 fail: temp file unlinked, no changes to vault, working_db preserved
 {
   "ok": true,
   "data": {
-    "added": [{ "path", "uuid", "title", "group_path", "field_count", "has_attachments", "has_otp" }],
+    "added": [{ "path", "uuid", "title", "group_path", "field_count", "field_changes", "has_attachments", "has_otp" }],
     "modified": [{
       "path", "uuid", "title",
       "field_changes": [
@@ -1486,3 +1488,49 @@ audit and threat model, amended as follows.
   stable and verifiable, and that stderr carries no audit-key material.
   `scripts/ci-audit.sh` check C requires keyed fingerprints in the reveal
   handlers, and check G allows SHA-256 only for the vault-file identity hash.
+
+# Implementation notes (host smoke and agent ergonomics, 2026-10-21)
+
+A host smoke in Claude Code (headless, two servers) and 54 black-box probes over
+stdio passed the `docs/manual-testing.md` checklist and found one bug; the agent
+that drove the host run also reported where the surface was harder to use than it
+needed to be. All changes below are additive, so existing clients keep working.
+
+- **Idle deadline.** A call between the idle deadline and the timer's next tick
+  (up to 60 s at the default window) was served and reset the idle clock, so the
+  vault never locked. Every tool call now applies the deadline before it counts
+  as activity (see "Idle timer mechanics").
+- **Reveals echo their target.** `kdbx_reveal_password` and
+  `kdbx_reveal_protected` add `path`, `uuid` and `field_name` next to the value,
+  so an agent can correlate several reveals from the payloads alone. Plain
+  metadata only; the audit event is unchanged.
+- **Added entries list their fields.** `kdbx_diff_pending`'s `added[]` gains
+  `field_changes` in the modified entries' `FieldChangeOut` shape, each with an
+  absent before side (`before: null`), decided by the same `is_secret` rule: plain
+  values are shown so an agent can check what it staged, and secrets carry
+  `secret: true` with no values. `field_count` stays (its length).
+- **Status reports the configured window.** `idle_timeout_seconds` (0: no idle
+  lock) is present even while locked, when the remaining time is null.
+- **`kdbx_list_groups` reports the listed group** as `parent: { path, uuid }`,
+  which is the only way to learn the root group's uuid.
+- **Whether writes are on is said up front.** The initialize instructions end
+  with one line that depends on `KDBX_ALLOW_WRITES`: enabled, or disabled with
+  the five tools that return `WRITES_DISABLED` and what to tell the user. The
+  write tools stay listed in both cases, so an agent asked to write can explain
+  why it cannot rather than conclude the server has no such tool.
+- **Tool annotations.** Every tool carries MCP annotations, all closed-world.
+  Reads, reveals, status and `kdbx_diff_pending` are read-only and idempotent;
+  `kdbx_unlock` changes only the session; `kdbx_lock` and
+  `kdbx_discard_pending` are destructive (they drop a stage); `kdbx_add_entry`
+  and `kdbx_update_field` stage, non-destructive and not idempotent;
+  `kdbx_save_pending` is destructive (it replaces the vault file). The
+  conformance suite pins the table (`EXPECTED_ANNOTATIONS`).
+- **Descriptions match behavior.** `kdbx_status` shows `last_lock` without
+  clearing it, the first `VAULT_LOCKED` or `kdbx_unlock` consumes it, and a lock
+  that discarded nothing is still reported (it was described as "until
+  reported" and as reporting only discards).
+
+A bare name with same-named siblings (`/Duplicate`) resolves to the first, by
+the published kdbx-core grammar (`:1` is canonical-bare); outputs always carry
+the canonical path and the uuid, which are what an agent should pass back.
+
