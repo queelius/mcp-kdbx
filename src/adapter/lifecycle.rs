@@ -39,7 +39,7 @@ impl KdbxServer {
     /// Lifecycle: report vault and server status. Available locked or not, and
     /// it counts as activity, so it doubles as an idle-timer keep-alive.
     #[tool(
-        description = "Report vault and server status: locked state, vault name and path, idle-timeout remaining, pending changes, whether writes are allowed, last_lock (what the most recent lock discarded, until reported), and version info."
+        description = "Report vault and server status: locked state, vault name and path, idle-timeout remaining, pending changes, whether writes are allowed, last_lock (the most recent lock's reason and what it discarded, possibly nothing; status shows it without clearing it, and it clears once a VAULT_LOCKED error or kdbx_unlock has reported it), and version info."
     )]
     async fn kdbx_status(&self) -> String {
         let vault = self.vault().await;
@@ -85,7 +85,7 @@ impl KdbxServer {
     /// Lifecycle: unlock the vault. Resolves the password from the tool input,
     /// `KDBX_PASSWORD`, or `KDBX_UNLOCK_CMD`, in that order.
     #[tool(
-        description = "Unlock the vault so its contents can be read. Call it with no arguments: the server reads the master password from its configured source (KDBX_PASSWORD or KDBX_UNLOCK_CMD, for example a password manager command). Do not ask the user to type the master password into the chat; if no source is configured the call returns UNLOCK_SOURCE_MISSING, and the user should configure one. The password and keyfile_bytes arguments exist for scripted use. If a previous lock discarded staged changes, previous_lock reports them."
+        description = "Unlock the vault so its contents can be read. Call it with no arguments: the server reads the master password from its configured source (KDBX_PASSWORD or KDBX_UNLOCK_CMD, for example a password manager command). Do not ask the user to type the master password into the chat; if no source is configured the call returns UNLOCK_SOURCE_MISSING, and the user should configure one. The password and keyfile_bytes arguments exist for scripted use. previous_lock reports the lock before this unlock (its reason and what it discarded, possibly nothing) unless a VAULT_LOCKED error already reported it, and is null otherwise."
     )]
     async fn kdbx_unlock(&self, Parameters(params): Parameters<UnlockParams>) -> String {
         let mut vault = self.vault().await;

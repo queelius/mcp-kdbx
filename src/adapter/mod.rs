@@ -97,11 +97,24 @@ impl KdbxServer {
 
     /// Lock the vault mutex and mark activity. Every tool call goes through here
     /// so the idle timer measures from the last real interaction (spec section
-    /// 2: any tool call, including status, is a keep-alive).
+    /// 2: any tool call, including status, is a keep-alive). The idle deadline
+    /// is applied first: the timer only ticks every few seconds, and a call past
+    /// the deadline must find the vault locked rather than reset the clock.
     pub(crate) async fn vault(&self) -> MutexGuard<'_, Vault> {
         let mut guard = self.state.lock().await;
+        let timeout = std::time::Duration::from_secs(self.config.idle_timeout_seconds);
+        if let Some(dropped) = guard.lock_if_idle(std::time::Instant::now(), timeout) {
+            self.emit_idle_lock(dropped);
+        }
         guard.touch();
         guard
+    }
+
+    fn emit_idle_lock(&self, dropped: usize) {
+        self.emit(AuditEvent::VaultLocked {
+            reason: crate::engine::vault::LockReason::IdleTimeout,
+            pending_discarded_count: dropped as u64,
+        });
     }
 
     /// Emit an audit event, subject to the configured log level. An event whose
@@ -151,17 +164,14 @@ impl KdbxServer {
         let interval = (timeout / 10).clamp(Duration::from_secs(5), Duration::from_secs(60));
         loop {
             tokio::time::sleep(interval).await;
-            let mut vault = self.state.lock().await;
-            if vault.should_lock(Instant::now(), timeout) {
-                let reason = crate::engine::vault::LockReason::IdleTimeout;
-                let dropped = vault.lock(reason);
-                // Drop the guard before emitting so the audit write is off the
-                // lock.
-                drop(vault);
-                self.emit(AuditEvent::VaultLocked {
-                    reason,
-                    pending_discarded_count: dropped as u64,
-                });
+            let dropped = self
+                .state
+                .lock()
+                .await
+                .lock_if_idle(Instant::now(), timeout);
+            // The guard is a temporary, so the audit write is off the lock.
+            if let Some(dropped) = dropped {
+                self.emit_idle_lock(dropped);
             }
         }
     }

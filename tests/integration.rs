@@ -592,6 +592,27 @@ fn idle_timeout_locks_untouched_vault_and_discards_stage() {
     assert_eq!(err["details"]["pending_discarded_count"], json!(1));
 }
 
+/// A call that arrives after the idle deadline but before the timer's next
+/// tick must find the vault locked. Otherwise it is served and, as a
+/// keep-alive, resets the idle clock, so the vault never locks. With a
+/// 2-second TTL the timer ticks at its 5-second floor, so a call at 3 seconds
+/// falls inside that window.
+#[test]
+fn call_after_idle_deadline_is_refused_before_the_timer_ticks() {
+    let (_dir, _path, mut server) = writable("flat.kdbx", &[("KDBX_IDLE_TIMEOUT_SECONDS", "2")]);
+    server.call_ok(
+        "kdbx_update_field",
+        json!({ "path": "/GitHub", "field_name": "URL", "value": "https://will-be-dropped.example" }),
+    );
+
+    std::thread::sleep(Duration::from_secs(3));
+
+    let err = server.call_error("kdbx_list_entries", json!({ "group_path": "/" }));
+    assert_eq!(err["code"], json!("VAULT_LOCKED"));
+    assert_eq!(err["details"]["lock_reason"], json!("idle_timeout"));
+    assert_eq!(err["details"]["pending_discarded_count"], json!(1));
+}
+
 /// Build a vault on disk holding a root entry titled "Email" and a group
 /// "Email" that holds an entry with no Title. Returns the tempdir guard, the
 /// vault path, and the untitled entry's uuid.

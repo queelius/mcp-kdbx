@@ -603,10 +603,8 @@ impl Vault {
     /// `idle_timeout` has elapsed since the last [`touch`](Self::touch). A zero
     /// timeout means "never idle-lock" (spec: `KDBX_IDLE_TIMEOUT_SECONDS=0`).
     ///
-    /// This is a pure predicate so it is testable without a running clock. The
-    /// Phase 3 server owns the actual tokio timer task: it periodically calls
-    /// this with `Instant::now()` and the configured timeout, and calls
-    /// [`lock`](Self::lock) with [`LockReason::IdleTimeout`] when it returns true.
+    /// This is a pure predicate so it is testable without a running clock;
+    /// [`lock_if_idle`](Self::lock_if_idle) acts on it.
     pub fn should_lock(&self, now: Instant, idle_timeout: Duration) -> bool {
         if idle_timeout.is_zero() {
             return false;
@@ -617,6 +615,17 @@ impl Vault {
             }
             VaultState::Locked => false,
         }
+    }
+
+    /// Lock with [`LockReason::IdleTimeout`] when [`should_lock`](Self::should_lock)
+    /// says the idle deadline has passed, returning the discarded count, or
+    /// `None` when the vault stays as it is. The idle timer calls this on each
+    /// tick, and every tool call calls it before [`touch`](Self::touch), so a
+    /// call that arrives after the deadline but before the next tick finds the
+    /// vault locked instead of extending the session.
+    pub fn lock_if_idle(&mut self, now: Instant, idle_timeout: Duration) -> Option<usize> {
+        self.should_lock(now, idle_timeout)
+            .then(|| self.lock(LockReason::IdleTimeout))
     }
 
     /// Whole seconds remaining before the idle timer would lock, for
@@ -1339,6 +1348,47 @@ mod tests {
             .idle_remaining(halfway, Duration::from_secs(900))
             .expect("still unlocked");
         assert!((449..=450).contains(&remaining));
+    }
+
+    #[test]
+    fn lock_if_idle_locks_only_past_the_deadline() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        let now = Instant::now();
+        let timeout = Duration::from_secs(900);
+
+        assert_eq!(
+            vault.lock_if_idle(now + Duration::from_secs(899), timeout),
+            None
+        );
+        assert!(vault.is_unlocked());
+
+        assert_eq!(
+            vault.lock_if_idle(now + Duration::from_secs(900), timeout),
+            Some(0)
+        );
+        assert!(!vault.is_unlocked());
+        assert_eq!(
+            vault.last_lock().map(|l| l.reason),
+            Some(LockReason::IdleTimeout)
+        );
+
+        // Already locked: nothing more to do.
+        assert_eq!(
+            vault.lock_if_idle(now + Duration::from_secs(2_000), timeout),
+            None
+        );
+    }
+
+    #[test]
+    fn lock_if_idle_never_locks_with_a_zero_timeout() {
+        let (_tmp, path) = write_fixture();
+        let mut vault = Vault::new(path);
+        vault.unlock(TEST_PASSWORD, None).expect("unlock");
+        let later = Instant::now() + Duration::from_secs(1_000_000);
+        assert_eq!(vault.lock_if_idle(later, Duration::ZERO), None);
+        assert!(vault.is_unlocked());
     }
 
     #[test]
