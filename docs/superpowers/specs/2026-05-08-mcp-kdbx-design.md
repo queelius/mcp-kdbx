@@ -164,6 +164,8 @@ output: {
     idle_timeout_remaining_seconds: number | null,        // null if locked
     has_pending_changes: boolean | null,                  // null if locked
     writes_allowed: boolean,
+    format: string | null,                                // KDBX format, "4.0"; null if locked
+    save_support: "lossless" | "lossy" | "unsupported" | null, // null if locked
     server_version: string,
     keepass_rs_version: string
   }
@@ -340,6 +342,7 @@ output: { ok: true, data: { discarded: true, num_dropped: number } }
 | `ATTACHMENT_NOT_FOUND` | Entry has no attachment by that name |
 | `NO_OTP_CONFIGURED` | Entry has no OTP source at all (no `otp` URI, no KeePass 2 `TimeOtp-*` fields, no legacy `TOTP Seed`) |
 | `OTP_INVALID` | An OTP source is present but does not resolve to a usable configuration. `details.source` is `uri`, `keepass_native` or `legacy`; `details.reason` is kdbx-core's `MalformedReason` (for example `invalid_secret`, `unsupported_algorithm`, or `{"missing_field": "TOTP Seed"}`) (implementation notes, kdbx-core adoption) |
+| `FORMAT_READ_ONLY` | The vault's KDBX format can be read but not saved by this server without losing data (kdbx-core's `save_support` for keepass 0.12): KDBX 4.1 is `lossy` (keepass 0.12 drops an entry's previous parent, QualityCheck and custom icon name and time), anything but 4.0 and 4.1 is `unsupported`. `kdbx_add_entry` and `kdbx_update_field` refuse before staging; `kdbx_save_pending` checks again. `details.format` ("4.1"), `details.save_support` (`lossy` or `unsupported`) (implementation notes, 2026-10-21) |
 | `WRITES_DISABLED` | Write tool called when `KDBX_ALLOW_WRITES != true` |
 | `NO_PENDING_CHANGES` | `kdbx_save_pending` called with empty stage |
 | `WRITE_FAILED` | Disk write failed |
@@ -1533,4 +1536,25 @@ needed to be. All changes below are additive, so existing clients keep working.
 A bare name with same-named siblings (`/Duplicate`) resolves to the first, by
 the published kdbx-core grammar (`:1` is canonical-bare); outputs always carry
 the canonical path and the uuid, which are what an agent should pass back.
+
+# Implementation notes (KDBX 4.1 read-only, 2026-10-21)
+
+Measured on 2026-10-21: keepass 0.12 opens a KDBX 4.1 file unless it has
+group-level 4.1 elements, and saving it keeps the 4.1 header but silently drops
+the entry-level 4.1 data (an entry's previous parent group, QualityCheck false,
+custom icon name and modification time). The owner chose lossless-or-refuse:
+a vault this server cannot save without loss is open read-only.
+
+- The rule is kdbx-core's (`capture::keepass_0_12::save_support`, 0.1.1), not
+  this crate's: the same rule web-kdbx uses, and it changes when the server
+  moves to another keepass adapter feature (with keepass 0.15, 4.1 becomes
+  lossless and 4.0 unsupported until upstream #373).
+- `FORMAT_READ_ONLY` from `kdbx_add_entry` and `kdbx_update_field`, before
+  anything is staged, so a read-only vault never collects a stage it cannot
+  save; `kdbx_save_pending` checks again (the step that would lose the data).
+  Reads, reveals and OTP are unaffected.
+- `kdbx_status` reports `format` and `save_support` (null while locked).
+- Fixture `tests/fixtures/kdbx41.kdbx`: written by keepass 0.12 with a 4.1
+  header and no 4.1 data. The header version alone decides, as it must: by the
+  time the server could look for 4.1 data, keepass 0.12 has dropped it.
 

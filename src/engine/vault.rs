@@ -431,6 +431,17 @@ impl Vault {
         matches!(self.state, VaultState::Unlocked { .. })
     }
 
+    /// Whether this server's keepass version (0.12) can save the vault
+    /// without losing data: kdbx-core's one rule, decided by the file's
+    /// format version.
+    ///
+    /// [`ErrorCode::VaultLocked`] when locked.
+    pub fn save_support(&self) -> CoreResult<kdbx_core::model::SaveSupport> {
+        Ok(kdbx_core::capture::keepass_0_12::save_support(
+            self.working_db()?,
+        ))
+    }
+
     /// Borrow the working db (what read and write tools operate on).
     ///
     /// [`ErrorCode::VaultLocked`] when locked.

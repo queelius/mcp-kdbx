@@ -41,6 +41,7 @@ fn main() {
     write_fixture(&dir.join("with_attachments.kdbx"), build_with_attachments());
     write_fixture(&dir.join("with_otp.kdbx"), build_with_otp());
     write_fixture(&dir.join("duplicates.kdbx"), build_duplicates());
+    write_fixture(&dir.join("kdbx41.kdbx"), build_kdbx41());
 
     println!("done. fixtures written to {}", dir.display());
 }
@@ -61,6 +62,23 @@ fn write_fixture(path: &Path, db: Database) {
         .expect("encrypt and serialize fixture");
     std::fs::write(path, &buf).expect("write fixture file");
     println!("wrote {} ({} bytes)", path.display(), buf.len());
+}
+
+/// `kdbx41.kdbx`: one entry in a file whose header says KDBX 4.1. keepass 0.12
+/// saves KDBX 4.1 lossily (it drops entry-level 4.1 data it reads), so the
+/// server opens this vault read-only: reads work, writes return
+/// FORMAT_READ_ONLY. Written by keepass 0.12 itself, so it holds no 4.1 data;
+/// the header version alone decides, as it must (0.12 has already dropped
+/// any 4.1 data by the time the server could look).
+fn build_kdbx41() -> Database {
+    let mut db = Database::new();
+    db.config.version = keepass::config::DatabaseVersion::KDB4(1);
+    db.root_mut().add_entry().edit(|e| {
+        e.set_unprotected(fields::TITLE, "Note");
+        e.set_unprotected(fields::USERNAME, "carol");
+        e.set_protected(fields::PASSWORD, "kdbx41-secret-ghi");
+    });
+    db
 }
 
 /// `empty.kdbx`: a valid vault with no entries and no subgroups (root only).

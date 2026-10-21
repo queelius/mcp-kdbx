@@ -100,7 +100,7 @@ impl KdbxServer {
     /// and an unlocked vault. The entry is added to the working db only; it
     /// reaches disk on `kdbx_save_pending`.
     #[tool(
-        description = "Stage a new entry under a group, named by group_path or group_uuid. Requires writes to be enabled and the vault unlocked. The entry is staged in memory, not written to disk: commit it with kdbx_save_pending. Fields and attachments are optional maps keyed by name.",
+        description = "Stage a new entry under a group, named by group_path or group_uuid. Requires writes to be enabled and the vault unlocked, and a vault this server can save without loss (kdbx_status save_support lossless; otherwise FORMAT_READ_ONLY). The entry is staged in memory, not written to disk: commit it with kdbx_save_pending. Fields and attachments are optional maps keyed by name.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -116,6 +116,9 @@ impl KdbxServer {
         let mut vault = self.vault().await;
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
+        }
+        if let Err(e) = stage::ensure_lossless_save(&vault) {
+            return responses::err(&e);
         }
 
         let group = match GroupAddress::from_parts(
@@ -217,7 +220,7 @@ impl KdbxServer {
     /// Write: set or change a single field on an existing entry. Requires
     /// `KDBX_ALLOW_WRITES=true` and an unlocked vault. Staged in memory.
     #[tool(
-        description = "Set or change a single field on an existing entry. Requires writes to be enabled and the vault unlocked. The change is staged in memory: commit it with kdbx_save_pending. An empty value clears the field. Omit protected to keep an existing field's protection state.",
+        description = "Set or change a single field on an existing entry. Requires writes to be enabled and the vault unlocked, and a vault this server can save without loss (kdbx_status save_support lossless; otherwise FORMAT_READ_ONLY). The change is staged in memory: commit it with kdbx_save_pending. An empty value clears the field. Omit protected to keep an existing field's protection state.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -233,6 +236,9 @@ impl KdbxServer {
         let mut vault = self.vault().await;
         if !vault.is_unlocked() {
             return responses::err(&responses::locked_error(vault.take_last_lock()));
+        }
+        if let Err(e) = stage::ensure_lossless_save(&vault) {
+            return responses::err(&e);
         }
 
         let target = match EntryAddress::from_parts(

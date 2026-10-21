@@ -24,7 +24,7 @@ keepass = { version = "0.12.9", features = ["serialization", "save_kdbx4"] }
 # from this crate's keepass version; the default `kdf` feature adds the
 # Argon2id-derived fingerprint key the audit log uses. When mcp-kdbx bumps
 # keepass, it switches this feature, not diff-kdbx.
-kdbx-core = { version = "0.1.0", features = ["keepass-0_12"] }
+kdbx-core = { version = "0.1.1", features = ["keepass-0_12"] }
 # Sibling ecosystem member, used as a library (no `cli`) for the semantic
 # stage diff (kdbx_diff_pending). Its API is a pure function of two kdbx-core
 # snapshots and names no keepass type, so it no longer constrains this crate's

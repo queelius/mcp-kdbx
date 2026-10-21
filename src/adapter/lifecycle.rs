@@ -11,6 +11,7 @@ use crate::adapter::{KEEPASS_RS_VERSION, KdbxServer, responses};
 use crate::engine::audit::AuditEvent;
 use crate::engine::error::{CoreError, ErrorCode};
 use crate::engine::secret::Secret;
+use crate::engine::stage;
 use crate::engine::unlock::resolve_unlock_source;
 use crate::engine::vault::{LockReason, UnreadableReason};
 use base64::Engine;
@@ -39,7 +40,7 @@ impl KdbxServer {
     /// Lifecycle: report vault and server status. Available locked or not, and
     /// it counts as activity, so it doubles as an idle-timer keep-alive.
     #[tool(
-        description = "Report vault and server status: locked state, vault name and path, the configured idle_timeout_seconds (0 means no idle lock) and the time remaining, pending changes, whether writes are allowed, last_lock (the most recent lock's reason and what it discarded, possibly nothing; status shows it without clearing it, and it clears once a VAULT_LOCKED error or kdbx_unlock has reported it), and version info.",
+        description = "Report vault and server status: locked state, vault name and path, the configured idle_timeout_seconds (0 means no idle lock) and the time remaining, pending changes, whether writes are allowed, the vault's KDBX format and save_support (lossless, or lossy / unsupported: the vault is open read-only and the write tools return FORMAT_READ_ONLY), last_lock (the most recent lock's reason and what it discarded, possibly nothing; status shows it without clearing it, and it clears once a VAULT_LOCKED error or kdbx_unlock has reported it), and version info.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -57,6 +58,15 @@ impl KdbxServer {
                 .working_db()
                 .ok()
                 .and_then(|db| db.meta.database_name.clone())
+        };
+        // The file's format and whether this server can save it without loss
+        // (null while locked).
+        let (format, save_support) = match (super::view_of(&vault), vault.save_support()) {
+            (Ok(view), Ok(support)) => (
+                Some(view.snapshot().format.to_string()),
+                Some(stage::save_support_name(support)),
+            ),
+            _ => (None, None),
         };
         let has_pending = if locked {
             None
@@ -83,6 +93,8 @@ impl KdbxServer {
             "idle_timeout_remaining_seconds": idle_remaining,
             "has_pending_changes": has_pending,
             "writes_allowed": self.config.allow_writes,
+            "format": format,
+            "save_support": save_support,
             // What the most recent lock discarded, until an unlock or a
             // VAULT_LOCKED error reports it. Peeked, not consumed.
             "last_lock": vault.last_lock(),

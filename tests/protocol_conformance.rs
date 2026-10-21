@@ -588,6 +588,54 @@ fn write_and_stage_tools_happy_path() {
 //   - WRITE_FAILED: requires a filesystem write failure mid-save, which is not
 //     reproducible deterministically over the protocol.
 
+/// A KDBX 4.1 vault opens read-only: keepass 0.12 would save it without its
+/// entry-level 4.1 data, so the write tools refuse before staging anything
+/// (kdbx-core's save_support). Reads and reveals work as usual, and status
+/// says why.
+#[test]
+fn error_format_read_only_on_a_kdbx41_vault() {
+    let (_dir, mut server) = unlocked_writable("kdbx41.kdbx");
+    let status = server.call_ok("kdbx_status", json!({}));
+    assert_eq!(status["format"], json!("4.1"));
+    assert_eq!(status["save_support"], json!("lossy"));
+
+    let note = server.call_ok("kdbx_get_entry", json!({ "path": "/Note" }));
+    assert_eq!(note["title"], json!("Note"));
+    let pw = server.call_ok("kdbx_reveal_password", json!({ "path": "/Note" }));
+    assert_eq!(pw["password"], json!("kdbx41-secret-ghi"));
+
+    for (tool, args) in [
+        (
+            "kdbx_add_entry",
+            json!({ "group_path": "/", "title": "New" }),
+        ),
+        (
+            "kdbx_update_field",
+            json!({ "path": "/Note", "field_name": "UserName", "value": "dave" }),
+        ),
+    ] {
+        let err = server.call_error(tool, args);
+        assert_eq!(err["code"], json!("FORMAT_READ_ONLY"), "{tool}");
+        assert_eq!(err["details"]["format"], json!("4.1"), "{tool}");
+        assert_eq!(err["details"]["save_support"], json!("lossy"), "{tool}");
+    }
+    // Nothing was staged.
+    let err = server.call_error("kdbx_save_pending", json!({}));
+    assert_eq!(err["code"], json!("NO_PENDING_CHANGES"));
+}
+
+#[test]
+fn status_reports_format_and_save_support() {
+    let path = fixture_path("flat.kdbx");
+    let mut server = McpServer::spawn(&[("KDBX_VAULT_PATH", path.to_str().unwrap())]);
+    let locked = server.call_ok("kdbx_status", json!({}));
+    assert!(locked["format"].is_null() && locked["save_support"].is_null());
+    server.unlock_with_fixture_password();
+    let status = server.call_ok("kdbx_status", json!({}));
+    assert_eq!(status["format"], json!("4.0"));
+    assert_eq!(status["save_support"], json!("lossless"));
+}
+
 #[test]
 fn error_vault_locked() {
     let path = fixture_path("flat.kdbx");

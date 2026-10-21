@@ -72,3 +72,11 @@ digits, SHA1). A code can always be produced, for the `kdbx_get_otp` happy path.
 Two entries in the root, both titled `Duplicate`, distinguished only by username
 (`first-account`, `second-account`). The path resolver must address them by the
 `:1` / `:2` ordinal suffix.
+
+## `kdbx41.kdbx`
+
+One entry, `Note` (UserName `carol`, protected Password `kdbx41-secret-ghi`), in
+a file whose header says KDBX 4.1 (written by keepass 0.12 with its config
+version set to 4.1, so it holds no 4.1-only data). keepass 0.12 would save a
+4.1 file lossily, so the server opens it read-only: reads and reveals work, and
+the write tools return `FORMAT_READ_ONLY`. Covers the save-support gate.

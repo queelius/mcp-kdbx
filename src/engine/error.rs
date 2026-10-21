@@ -54,6 +54,12 @@ pub enum ErrorCode {
     /// `details.reason` are kdbx-core's typed forms. Distinct from
     /// `NO_OTP_CONFIGURED`, which means no source is present at all.
     OtpInvalid,
+    /// The vault's KDBX format can be read but not saved without losing data
+    /// (kdbx-core's `save_support` for the keepass version this server uses),
+    /// so it is open read-only: the write tools refuse before staging.
+    /// `details.format` is the file's format ("4.1"), `details.save_support`
+    /// is `lossy` or `unsupported`.
+    FormatReadOnly,
 }
 
 impl ErrorCode {
@@ -81,6 +87,7 @@ impl ErrorCode {
             ErrorCode::PathInvalid => "PATH_INVALID",
             ErrorCode::VaultUnreadable => "VAULT_UNREADABLE",
             ErrorCode::OtpInvalid => "OTP_INVALID",
+            ErrorCode::FormatReadOnly => "FORMAT_READ_ONLY",
         }
     }
 
@@ -120,6 +127,9 @@ impl ErrorCode {
             }
             ErrorCode::OtpInvalid => {
                 "The entry's TOTP configuration is malformed (see details.source and details.reason)."
+            }
+            ErrorCode::FormatReadOnly => {
+                "This vault's format can be read but not saved by this server without losing data, so it is open read-only (see details.format and details.save_support)."
             }
         }
     }
@@ -241,6 +251,7 @@ mod tests {
         (ErrorCode::PathInvalid, "PATH_INVALID"),
         (ErrorCode::VaultUnreadable, "VAULT_UNREADABLE"),
         (ErrorCode::OtpInvalid, "OTP_INVALID"),
+        (ErrorCode::FormatReadOnly, "FORMAT_READ_ONLY"),
     ];
 
     #[test]

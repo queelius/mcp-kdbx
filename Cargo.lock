@@ -848,9 +848,9 @@ dependencies = [
 
 [[package]]
 name = "kdbx-core"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "614a082d5e4c6ffaa6b9f28bac346c5dd43f77e03aa5b481a56bab1c3c9b578e"
+checksum = "d2e1e7a8b594f1ef92f2ae6dd1c99963f862b41835385c4cfa2bdef85975e298"
 dependencies = [
  "argon2",
  "chrono",

@@ -36,7 +36,7 @@ use crate::engine::view::{View, ephemeral_key};
 use diff_kdbx::{Change, DiffOptions, NodeStatus, Property, PropertyChange, Shown};
 use kdbx_core::fields::StandardField;
 use kdbx_core::fingerprint::{Domain, FingerprintKey};
-use kdbx_core::model::{NodeIndex, Value as SnapValue};
+use kdbx_core::model::{NodeIndex, SaveSupport, Value as SnapValue};
 use kdbx_core::visibility::{is_address, is_secret};
 use keepass::Database;
 use keepass::db::{EntryId, GroupId, Value};
@@ -859,6 +859,54 @@ fn map_field_sides(
 }
 
 // ---------------------------------------------------------------------------
+// Save support: which vaults this server may write.
+
+/// The wire name of a [`SaveSupport`]: `lossless`, `lossy` or `unsupported`.
+/// A kind a later kdbx-core adds counts as unsupported, since only
+/// `Lossless` permits writes.
+pub fn save_support_name(support: SaveSupport) -> &'static str {
+    match support {
+        SaveSupport::Lossless => "lossless",
+        SaveSupport::Lossy { .. } => "lossy",
+        _ => "unsupported",
+    }
+}
+
+/// Refuse with `FORMAT_READ_ONLY` unless the vault saves losslessly
+/// (kdbx-core's `save_support`). The write tools call this before staging,
+/// so a vault opened read-only never collects a stage it cannot save.
+pub fn ensure_lossless_save(vault: &Vault) -> CoreResult<()> {
+    let support = vault.save_support()?;
+    if support.is_lossless() {
+        return Ok(());
+    }
+    let (format, lossy) = match support {
+        SaveSupport::Lossy { format } => (format, true),
+        SaveSupport::Unsupported { format } => (format, false),
+        // A kind a later kdbx-core adds: read the format from the snapshot.
+        _ => (vault.view()?.snapshot().format, false),
+    };
+    let message = if lossy {
+        format!(
+            "This vault is KDBX {format}. mcp-kdbx reads it, but saving would drop data only \
+             KDBX {format} holds (an entry's previous group, its exclusion from reports, custom \
+             icon names), so the vault is open read-only. Edit it in KeePassXC for now."
+        )
+    } else {
+        format!(
+            "This vault is KDBX {format}, which mcp-kdbx can read but not write, so the vault is \
+             open read-only. To edit it here, open it in KeePassXC and save it as KDBX 4.0."
+        )
+    };
+    Err(CoreError::new(ErrorCode::FormatReadOnly)
+        .with_message(message)
+        .with_details(serde_json::json!({
+            "format": format.to_string(),
+            "save_support": save_support_name(support),
+        })))
+}
+
+// ---------------------------------------------------------------------------
 // Save and discard.
 // ---------------------------------------------------------------------------
 
@@ -886,6 +934,9 @@ pub fn save_pending(vault: &mut Vault) -> CoreResult<SaveOutcome> {
     if !vault.has_pending_changes() {
         return Err(ErrorCode::NoPendingChanges.into());
     }
+    // The write tools refuse first, so a stage cannot exist here; checked
+    // again because this is the step that would lose the data.
+    ensure_lossless_save(vault)?;
 
     let path = vault.path().to_path_buf();
     let baseline = vault.file_baseline()?;
@@ -1990,6 +2041,30 @@ mod tests {
     }
 
     // -- save_pending -----------------------------------------------------
+
+    /// Defense in depth: even a stage that bypassed the write tools' check is
+    /// not saved over a KDBX 4.1 file (keepass 0.12 would drop its 4.1 data),
+    /// and the file is left as it was.
+    #[test]
+    fn save_pending_refuses_a_vault_that_would_lose_data() {
+        let mut db = build_db();
+        db.config.version = keepass::config::DatabaseVersion::KDB4(1);
+        let (_tmp, mut vault) = unlocked_vault(&db);
+        let before = std::fs::read(vault.path()).expect("read vault");
+        {
+            let working = vault.working_db_mut().expect("working");
+            add_entry(working, &gaddr("/"), &simple_input("Bypassed")).expect("stage add");
+        }
+        let err = save_pending(&mut vault).expect_err("refused");
+        assert_eq!(err.code(), "FORMAT_READ_ONLY");
+        assert_eq!(err.details().unwrap()["format"], serde_json::json!("4.1"));
+        assert_eq!(
+            err.details().unwrap()["save_support"],
+            serde_json::json!("lossy")
+        );
+        assert_eq!(std::fs::read(vault.path()).expect("read vault"), before);
+        assert!(ensure_lossless_save(&vault).is_err());
+    }
 
     #[test]
     fn save_pending_persists_and_settles() {
